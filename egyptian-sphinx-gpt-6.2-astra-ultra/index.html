@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf8f2">
+  <title>The Great Sphinx · Voxel Atlas</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23ad532f' d='m16 1 14 8v15l-14 8L2 24V9z'/%3E%3Cpath fill='none' stroke='%23f8d4a8' d='m2 9 14 8 14-8M16 17v15'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="vendor/three.min.js" defer></script>
+  <script src="sphinx.js" defer></script>
+  <script src="terrain.js" defer></script>
+  <script src="fallback.js" defer></script>
+  <script src="scene.js" defer></script>
+  <script src="ui.js" defer></script>
+</head>
+<body>
+  <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M12 6.5C9.4 4.6 6 4.5 2.6 5.4v13.1c3.5-.9 6.7-.8 9.4 1 2.7-1.8 5.9-1.9 9.4-1V5.4c-3.4-.9-6.8-.8-9.4 1.1Zm0 0v13"/></symbol>
+    <symbol id="i-views" viewBox="0 0 24 24"><path d="m12 2.8 8.3 4.7v9L12 21.2l-8.3-4.7v-9zM3.9 7.8l8.1 4.7 8.1-4.7M12 12.5v8.3"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6.5 9.5 5.5 5 5.5-5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 7"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 10a8 8 0 1 1 .5 6.2M4 4.5v5.7h5.7"/></symbol>
+    <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8.5 12.2V5.4a1.3 1.3 0 0 1 2.6 0v5.4-7a1.3 1.3 0 1 1 2.6 0v7.1-5.4a1.3 1.3 0 0 1 2.6 0v6.1-3.8a1.3 1.3 0 0 1 2.6 0V14c0 4.6-2.3 7.2-6.4 7.2-2.1 0-3.4-1-4.7-2.7l-4-5.1a1.5 1.5 0 0 1 2.2-2l2.5 2.4z"/></symbol>
+    <symbol id="i-mouse" viewBox="0 0 24 24"><rect x="5.9" y="2.4" width="12.2" height="19.2" rx="6.1"/><path d="M12 6v4"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-out" viewBox="0 0 24 24"><path d="M6 18 18 6M7 6h11v11"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="identity">
+      <span class="brand">
+        <svg class="brand-mark" viewBox="0 0 40 38" aria-hidden="true">
+          <g stroke="#faf8f2" stroke-width="1.1" stroke-linejoin="round">
+            <path fill="#ae5d36" d="m3 16 8.5-4.9L20 16v9.8l-8.5 4.9L3 25.8z"/><path fill="#d58c60" d="m3 16 8.5-4.9L20 16l-8.5 4.9z"/><path fill="none" d="M11.5 20.9v9.8"/>
+            <path fill="#9e4c2d" d="m20 16 8.5-4.9L37 16v9.8l-8.5 4.9-8.5-4.9z"/><path fill="#d58c60" d="m20 16 8.5-4.9L37 16l-8.5 4.9z"/><path fill="none" d="M28.5 20.9v9.8"/>
+            <path fill="#b15e37" d="m11.5 20.9 8.5-4.9 8.5 4.9v9.8L20 35.6l-8.5-4.9z"/><path fill="#d58c60" d="m11.5 20.9 8.5-4.9 8.5 4.9-8.5 4.9z"/><path fill="none" d="M20 25.8v9.8"/>
+            <path fill="#b05b36" d="M11.5 7.4 20 2.5l8.5 4.9v9.8L20 22.1l-8.5-4.9z"/><path fill="#da9366" d="M11.5 7.4 20 2.5l8.5 4.9-8.5 4.9z"/><path fill="none" d="M20 12.3v9.8"/>
+          </g>
+        </svg>
+        <span>Voxel Atlas</span>
+      </span>
+      <span class="product-name">Monument explorer</span>
+    </div>
+    <button class="notes-button" id="notes-open" aria-haspopup="dialog"><svg class="icon"><use href="#i-book"/></svg>Field notes</button>
+  </header>
+
+  <main class="stage" id="stage" aria-label="The Great Sphinx interactive exhibit">
+    <canvas id="scene" tabindex="0" aria-label="Interactive voxel sculpture of the Great Sphinx. Drag to orbit and scroll or pinch to zoom."></canvas>
+    <section class="title-group" aria-labelledby="exhibit-title">
+      <p class="eyebrow"><span></span>Ancient Egypt</p>
+      <h1 id="exhibit-title">The Great<em>Sphinx</em></h1>
+      <p class="era">Fourth Dynasty <span>·</span> c. 2500 BCE</p>
+    </section>
+    <div class="view-controls">
+      <button id="views-toggle" class="views-button panel" aria-expanded="false" aria-controls="views-menu" aria-haspopup="menu"><svg class="icon"><use href="#i-views"/></svg><span>Viewpoints</span><svg class="icon chevron"><use href="#i-chevron"/></svg></button>
+      <div class="view-menu panel" id="views-menu" role="menu" aria-label="Choose a viewpoint" hidden>
+        <button role="menuitemradio" data-view="standard" aria-checked="true">Three-quarter<svg class="icon"><use href="#i-check"/></svg></button>
+        <button role="menuitemradio" data-view="front" aria-checked="false">Face-on<svg class="icon"><use href="#i-check"/></svg></button>
+        <button role="menuitemradio" data-view="side" aria-checked="false">Profile<svg class="icon"><use href="#i-check"/></svg></button>
+      </div>
+    </div>
+
+    <div class="location">
+      <svg class="compass" viewBox="0 0 68 68" aria-hidden="true">
+        <text x="34" y="9.5" text-anchor="middle">N</text>
+        <g fill="none" stroke="currentColor" stroke-width=".7">
+          <circle cx="34" cy="36.5" r="21.3"/>
+          <path d="M34 13.5v5m0 36v5M11 36.5h5m36 0h5m-39.6-16.6 2.8 2.8m27.6 27.6 2.8 2.8m0-33.2-2.8 2.8M17.4 53.1l2.8-2.8"/>
+        </g>
+        <g id="needle">
+          <path fill="#a75536" d="m34 18.5 4.5 18-4.5-1.3-4.5 1.3z"/>
+          <path fill="#756758" d="m34 54.5 4.5-18-4.5 1.3-4.5-1.3z"/>
+          <circle cx="34" cy="36.5" r="1.8" fill="#f4e6c9"/>
+        </g>
+      </svg>
+      <div class="place"><strong>Giza Plateau</strong><span>29.9753° N, 31.1376° E</span></div>
+    </div>
+
+    <div class="camera-tools" aria-label="Camera controls">
+      <div class="zoom-cluster panel">
+        <button class="icon-button" id="zoom-out" title="Zoom out" aria-label="Zoom out"><svg class="icon"><use href="#i-minus"/></svg></button>
+        <output id="zoom-value" aria-label="Zoom level">100%</output>
+        <button class="icon-button" id="zoom-in" title="Zoom in" aria-label="Zoom in"><svg class="icon"><use href="#i-plus"/></svg></button>
+      </div>
+      <button class="icon-button panel" id="reset" title="Reset view" aria-label="Reset view"><svg class="icon"><use href="#i-reset"/></svg></button>
+      <button class="icon-button panel" id="fullscreen" title="Fullscreen" aria-label="Fullscreen"><svg class="icon"><use href="#i-fullscreen"/></svg></button>
+    </div>
+  </main>
+
+  <footer class="statusbar">
+    <div class="viewport-label"><span></span>3D viewport</div>
+    <div class="interaction-cues">
+      <span><svg class="icon"><use href="#i-hand"/></svg>Drag to orbit</span>
+      <i></i>
+      <span><svg class="icon"><use href="#i-mouse"/></svg><span class="scroll-hint">Scroll to zoom</span><span class="pinch-hint">Pinch to zoom</span></span>
+    </div>
+    <button id="auto-orbit" aria-pressed="false"><span class="switch" aria-hidden="true"></span>Auto-orbit</button>
+  </footer>
+
+  <dialog id="notes" aria-labelledby="notes-title">
+    <div class="notes-top"><span><svg class="icon"><use href="#i-book"/></svg>Field notes</span><button class="icon-button" id="notes-close" aria-label="Close field notes"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <h2 id="notes-title">The Great <em>Sphinx</em></h2>
+    <p>Ancient sculptors carved the Sphinx directly into the limestone bedrock of the Giza Plateau. Its lion’s body and royal human head face east toward the rising sun.</p>
+    <p>Archaeological evidence places its carving in the Fourth Dynasty, likely during the reign of Khafre.</p>
+    <dl><div><dt>Length</dt><dd>≈ 73.5 m</dd></div><div><dt>Height</dt><dd>≈ 20 m</dd></div></dl>
+    <div class="sources"><a href="https://egymonuments.gov.eg/monuments/the-great-sphinx/" target="_blank" rel="noopener noreferrer">Ministry of Tourism and Antiquities<svg class="icon"><use href="#i-out"/></svg></a><a href="https://sis.gov.eg/en/egypt/tourism/landmarks/sphinx/" target="_blank" rel="noopener noreferrer">Egypt State Information Service<svg class="icon"><use href="#i-out"/></svg></a></div>
+  </dialog>
+</body>
+</html>

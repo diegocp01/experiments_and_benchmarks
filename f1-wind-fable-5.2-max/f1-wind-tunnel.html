@@ -1,0 +1,2453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Wind Tunnel — Aero Study</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; color: #cdd5dc;
+         -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; outline: none; }
+  #c.drag { cursor: grabbing; }
+  #veil { position: fixed; inset: 0; background: #000; pointer-events: none; opacity: 1; transition: opacity 2.2s cubic-bezier(.4,0,.2,1); }
+  #veil.off { opacity: 0; }
+  #load { position: fixed; left: 0; right: 0; top: 50%; transform: translateY(-50%); text-align: center; pointer-events: none;
+          font-size: 11px; letter-spacing: .42em; text-transform: uppercase; color: #8d99a5; transition: opacity .8s ease; }
+  #load b { display: block; margin: 14px auto 0; width: 180px; height: 1px; background: #1c2228; position: relative; overflow: hidden; }
+  #load b i { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: #e9eef2; transition: width .25s linear; }
+  #load.off { opacity: 0; }
+  #hint { position: fixed; left: 0; right: 0; bottom: max(22px, env(safe-area-inset-bottom)); text-align: center; pointer-events: none;
+          font-size: 10.5px; letter-spacing: .34em; text-transform: uppercase; color: rgba(214,224,232,.62);
+          text-shadow: 0 1px 8px rgba(0,0,0,.8); opacity: 0; transition: opacity 1.6s ease; }
+  #hint.on { opacity: 1; }
+  #hint .t { display: none; }
+  @media (pointer: coarse) { #hint .m { display: none; } #hint .t { display: inline; } }
+  @media (max-width: 520px) { #hint { letter-spacing: .2em; font-size: 10px; } }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 32px;
+         font-size: 14px; line-height: 1.6; color: #aab4bd; background: #05070a; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="Formula car in a wind tunnel. Drag to orbit, scroll or pinch to zoom."></canvas>
+<div id="veil"></div>
+<div id="load"><span id="loadtxt">Spinning up tunnel</span><b><i id="loadbar"></i></b></div>
+<div id="hint">Drag to look around &nbsp;·&nbsp; <span class="m">Scroll to zoom</span><span class="t">Pinch to zoom</span></div>
+<div id="err"></div>
+<script>
+(() => {
+'use strict';
+// =====================================================================================
+//  Wind tunnel aero study — everything on this page is generated in code: geometry,
+//  materials, lighting, the flow field and the smoke. No images, models or libraries.
+// =====================================================================================
+
+// ------------------------------------------------------------------ small utilities
+const $ = (id) => document.getElementById(id);
+const QS = new URLSearchParams(location.search);
+const PI = Math.PI, TAU = Math.PI * 2;
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const fract = (x) => x - Math.floor(x);
+// ?timer drives frames from a timer instead of requestAnimationFrame (useful when the page is rendered off-screen)
+const USE_TIMER = QS.has('timer');
+const raf = (fn) => (USE_TIMER ? setTimeout(() => fn(performance.now()), 16) : requestAnimationFrame(fn));
+const nextFrame = () => new Promise((r) => raf(r));
+
+const V = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: (a) => Math.hypot(a[0], a[1], a[2]),
+  norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  lerp: (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t],
+  mad: (a, b, s) => [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s],
+};
+
+// column-major 4x4 matrices
+const M4 = {
+  ident: () => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+  mul: (a, b) => {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+      o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    return o;
+  },
+  persp: (fovy, aspect, n, f) => {
+    const t = 1 / Math.tan(fovy / 2), o = new Float32Array(16);
+    o[0] = t / aspect; o[5] = t; o[10] = (f + n) / (n - f); o[11] = -1; o[14] = (2 * f * n) / (n - f);
+    return o;
+  },
+  ortho: (l, r, b, t, n, f) => {
+    const o = new Float32Array(16);
+    o[0] = 2 / (r - l); o[5] = 2 / (t - b); o[10] = -2 / (f - n);
+    o[12] = -(r + l) / (r - l); o[13] = -(t + b) / (t - b); o[14] = -(f + n) / (f - n); o[15] = 1;
+    return o;
+  },
+  lookAt: (eye, tgt, up) => {
+    const z = V.norm(V.sub(eye, tgt)), x = V.norm(V.cross(up, z)), y = V.cross(z, x);
+    return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0,
+      -V.dot(x, eye), -V.dot(y, eye), -V.dot(z, eye), 1]);
+  },
+  translate: (x, y, z) => { const o = M4.ident(); o[12] = x; o[13] = y; o[14] = z; return o; },
+  scale: (x, y, z) => { const o = M4.ident(); o[0] = x; o[5] = y; o[10] = z; return o; },
+  rotY: (a) => { const c = Math.cos(a), s = Math.sin(a), o = M4.ident(); o[0] = c; o[2] = -s; o[8] = s; o[10] = c; return o; },
+  rotX: (a) => { const c = Math.cos(a), s = Math.sin(a), o = M4.ident(); o[5] = c; o[6] = s; o[9] = -s; o[10] = c; return o; },
+  rotZ: (a) => { const c = Math.cos(a), s = Math.sin(a), o = M4.ident(); o[0] = c; o[1] = s; o[4] = -s; o[5] = c; return o; },
+  tp: (m, p) => [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]],
+  td: (m, p) => [m[0] * p[0] + m[4] * p[1] + m[8] * p[2], m[1] * p[0] + m[5] * p[1] + m[9] * p[2], m[2] * p[0] + m[6] * p[1] + m[10] * p[2]],
+  invert: (m) => {
+    const o = new Float32Array(16);
+    const a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3], a10 = m[4], a11 = m[5], a12 = m[6], a13 = m[7];
+    const a20 = m[8], a21 = m[9], a22 = m[10], a23 = m[11], a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
+    const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11;
+    const b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12, b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30;
+    const b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    det = det ? 1 / det : 0;
+    o[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det; o[1] = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+    o[2] = (a31 * b05 - a32 * b04 + a33 * b03) * det; o[3] = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+    o[4] = (a12 * b08 - a10 * b11 - a13 * b07) * det; o[5] = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+    o[6] = (a32 * b02 - a30 * b05 - a33 * b01) * det; o[7] = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+    o[8] = (a10 * b10 - a11 * b08 + a13 * b06) * det; o[9] = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+    o[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det; o[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+    o[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det; o[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+    o[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det; o[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+    return o;
+  },
+};
+
+// deterministic PRNG (so the scene is identical on every load)
+function mulberry32(a) {
+  return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+
+// ------------------------------------------------------------------ WebGL bootstrap
+const canvas = $('c');
+function fatal(msg) {
+  const e = $('err'); e.style.display = 'flex'; e.textContent = msg;
+  $('load').style.display = 'none'; $('veil').style.display = 'none';
+  throw new Error(msg);
+}
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance' });
+if (!gl) fatal('This scene needs WebGL 2, which is not available in this browser.');
+const EXT = {
+  cbf: gl.getExtension('EXT_color_buffer_float'),
+  cbhf: gl.getExtension('EXT_color_buffer_half_float'),
+  tfl: gl.getExtension('OES_texture_float_linear'),
+  fblend: gl.getExtension('EXT_float_blend'),
+};
+if (!EXT.cbf && !EXT.cbhf) fatal('This scene needs floating-point render targets, which this device does not support.');
+const CAN32 = !!EXT.cbf;                       // 32-bit float targets (used for the smoke state)
+const MAX_SAMPLES = gl.getParameter(gl.MAX_SAMPLES);
+
+const GLSL_HEAD = `#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2D; precision highp sampler3D; precision highp samplerCube; precision highp sampler2DShadow;
+#define PI 3.14159265359
+#define TAU 6.28318530718
+#define sat(x) clamp(x, 0.0, 1.0)
+`;
+
+function compileShader(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s) || '';
+    const m = /ERROR:\s*\d+:(\d+)/.exec(log); const ln = m ? +m[1] : -1;
+    const lines = src.split('\n'); let ctx = '';
+    if (ln > 0) for (let i = Math.max(0, ln - 4); i < Math.min(lines.length, ln + 3); i++) ctx += (i + 1) + (i + 1 === ln ? ' >> ' : '    ') + lines[i] + '\n';
+    console.error('[shader ' + label + '] ' + log + '\n' + ctx);
+    throw new Error('shader compile failed: ' + label + ' :: ' + log.split('\n')[0]);
+  }
+  return s;
+}
+function makeProgram(label, vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, GLSL_HEAD + vs, label + '.vs'));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, GLSL_HEAD + fs, label + '.fs'));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { const l = gl.getProgramInfoLog(p); console.error('[link ' + label + '] ' + l); throw new Error('link failed: ' + label + ' :: ' + l); }
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    u[info.name.replace(/\[0\]$/, '')] = { loc: gl.getUniformLocation(p, info.name), type: info.type, size: info.size };
+  }
+  return { p, u, label };
+}
+let curProg = null, texUnit = 0;
+function use(P) { gl.useProgram(P.p); curProg = P; texUnit = 0; }
+// set a uniform by name on the current program (silently ignores uniforms the compiler optimised away)
+function U(name, v) {
+  const d = curProg.u[name]; if (!d) return;
+  const l = d.loc;
+  switch (d.type) {
+    case gl.FLOAT: if (typeof v === 'number') gl.uniform1f(l, v); else gl.uniform1fv(l, v); break;
+    case gl.FLOAT_VEC2: gl.uniform2fv(l, v); break;
+    case gl.FLOAT_VEC3: gl.uniform3fv(l, v); break;
+    case gl.FLOAT_VEC4: gl.uniform4fv(l, v); break;
+    case gl.INT: case gl.BOOL: if (typeof v === 'number' || typeof v === 'boolean') gl.uniform1i(l, v); else gl.uniform1iv(l, v); break;
+    case gl.INT_VEC2: gl.uniform2iv(l, v); break;
+    case gl.FLOAT_MAT4: gl.uniformMatrix4fv(l, false, v); break;
+    case gl.FLOAT_MAT3: gl.uniformMatrix3fv(l, false, v); break;
+    default: gl.uniform1i(l, v);
+  }
+}
+// bind a texture to the next free unit and point the sampler at it
+function UT(name, target, tex) {
+  const d = curProg.u[name];
+  gl.activeTexture(gl.TEXTURE0 + texUnit); gl.bindTexture(target, tex);
+  if (d) gl.uniform1i(d.loc, texUnit);
+  texUnit++;
+}
+
+function tex2D(w, h, ifmt, fmt, type, o = {}) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  if (o.levels) gl.texStorage2D(gl.TEXTURE_2D, o.levels, ifmt, w, h);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, o.data || null);
+  const f = o.filter === undefined ? gl.LINEAR : o.filter;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, o.min || f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  const wr = o.wrap || gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, o.wrapS || wr);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, o.wrapT || wr);
+  t.w = w; t.h = h;
+  return t;
+}
+function tex3D(w, h, d, ifmt, fmt, type, data, filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, t);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage3D(gl.TEXTURE_3D, 0, ifmt, w, h, d, 0, fmt, type, data);
+  const f = filter === undefined ? gl.LINEAR : filter;
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFBO(colors, depth) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  const bufs = [];
+  colors.forEach((c, i) => {
+    const a = gl.COLOR_ATTACHMENT0 + i; bufs.push(a);
+    if (c.rb) gl.framebufferRenderbuffer(gl.FRAMEBUFFER, a, gl.RENDERBUFFER, c.rb);
+    else gl.framebufferTexture2D(gl.FRAMEBUFFER, a, c.target || gl.TEXTURE_2D, c.tex || c, c.level || 0);
+  });
+  if (depth) {
+    if (depth.rb) gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth.rb);
+    else gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+  }
+  if (bufs.length) gl.drawBuffers(bufs); else { gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE); }
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) console.error('incomplete framebuffer 0x' + st.toString(16));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+function renderbuffer(w, h, fmt, samples) {
+  const rb = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+  if (samples > 0) gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, fmt, w, h);
+  else gl.renderbufferStorage(gl.RENDERBUFFER, fmt, w, h);
+  return rb;
+}
+const emptyVAO = gl.createVertexArray();
+function drawFS() { gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+const VS_FS = `out vec2 vUV;
+void main(){ vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); vUV = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+// ------------------------------------------------------------------ procedural geometry toolkit
+// Every surface in the scene is built from parametric grids (lofts, sweeps, shells, revolves).
+class Mesh {
+  constructor() { this.p = []; this.n = []; this.t = []; this.i = []; }
+  get nv() { return this.p.length / 3; }
+}
+
+// cubic Hermite interpolation through (x, y) keys. mono=true avoids overshoot (used where a profile steps).
+function spline1(keys, mono) {
+  const n = keys.length, xs = keys.map((k) => k[0]), ys = keys.map((k) => k[1]), m = new Array(n), d = [];
+  for (let i = 0; i < n - 1; i++) d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
+  for (let i = 0; i < n; i++) {
+    if (i === 0) m[i] = d[0];
+    else if (i === n - 1) m[i] = d[n - 2];
+    else if (mono) {
+      if (d[i - 1] * d[i] <= 0) m[i] = 0;
+      else { const h0 = xs[i] - xs[i - 1], h1 = xs[i + 1] - xs[i], w1 = 2 * h1 + h0, w2 = h1 + 2 * h0; m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]); }
+    } else m[i] = (ys[i + 1] - ys[i - 1]) / (xs[i + 1] - xs[i - 1]);
+  }
+  return (x) => {
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= x) lo = mid; else hi = mid; }
+    const h = xs[lo + 1] - xs[lo], t = (x - xs[lo]) / h, t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ys[lo] + (t3 - 2 * t2 + t) * h * m[lo] + (-2 * t3 + 3 * t2) * ys[lo + 1] + (t3 - t2) * h * m[lo + 1];
+  };
+}
+
+// Catmull-Rom through points of any dimension
+function crPath(pts, per) {
+  const out = [], n = pts.length, dim = pts[0].length;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[Math.max(i - 1, 0)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(i + 2, n - 1)];
+    for (let k = 0; k < per; k++) {
+      const t = k / per, t2 = t * t, t3 = t2 * t, q = new Array(dim);
+      for (let c = 0; c < dim; c++) q[c] = 0.5 * (2 * p1[c] + (-p0[c] + p2[c]) * t + (2 * p0[c] - 5 * p1[c] + 4 * p2[c] - p3[c]) * t2 + (-p0[c] + 3 * p1[c] - 3 * p2[c] + p3[c]) * t3);
+      out.push(q);
+    }
+  }
+  out.push(pts[n - 1].slice());
+  return out;
+}
+
+// arc-length uniform resampling of a polyline (any dimension)
+function resample(pts, n, closed) {
+  const src = closed ? pts.concat([pts[0]]) : pts, m = src.length, dim = src[0].length, cum = [0];
+  for (let i = 1; i < m; i++) { let s = 0; for (let c = 0; c < dim; c++) { const d = src[i][c] - src[i - 1][c]; s += d * d; } cum.push(cum[i - 1] + Math.sqrt(s)); }
+  const total = cum[m - 1], out = [];
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    const target = total * (closed ? i / n : i / (n - 1));
+    while (k < m - 2 && cum[k + 1] < target) k++;
+    const seg = cum[k + 1] - cum[k], t = seg > 1e-12 ? clamp((target - cum[k]) / seg, 0, 1) : 0, q = new Array(dim);
+    for (let c = 0; c < dim; c++) q[c] = src[k][c] + (src[k + 1][c] - src[k][c]) * t;
+    out.push(q);
+  }
+  return out;
+}
+
+function gridNormals(P, closeU, closeV) {
+  const nu = P.length, nv = P[0].length, N = [];
+  for (let i = 0; i < nu; i++) {
+    const row = [];
+    const i0 = closeU ? (i - 1 + nu) % nu : Math.max(i - 1, 0), i1 = closeU ? (i + 1) % nu : Math.min(i + 1, nu - 1);
+    for (let j = 0; j < nv; j++) {
+      const j0 = closeV ? (j - 1 + nv) % nv : Math.max(j - 1, 0), j1 = closeV ? (j + 1) % nv : Math.min(j + 1, nv - 1);
+      let du = V.sub(P[i1][j], P[i0][j]), dv = V.sub(P[i][j1], P[i][j0]);
+      let n = V.cross(du, dv), l = V.len(n);
+      if (l < 1e-11) {                       // collapsed ring or column: borrow the tangent from a neighbour row / column
+        const ia = i1 !== i ? i1 : i0, ja = j1 !== j ? j1 : j0;
+        if (V.len(dv) < 1e-7) dv = V.sub(P[ia][j1], P[ia][j0]);
+        if (V.len(du) < 1e-7) du = V.sub(P[i1][ja], P[i0][ja]);
+        n = V.cross(du, dv); l = V.len(n);
+      }
+      row.push(l < 1e-11 ? null : [n[0] / l, n[1] / l, n[2] / l]);
+    }
+    N.push(row);
+  }
+  // rows that collapse to a single point share one averaged normal (poles, tips)
+  for (let i = 0; i < nu; i++) {
+    let collapsed = true;
+    for (let j = 1; j < nv && collapsed; j++) if (V.len(V.sub(P[i][j], P[i][0])) > 1e-7) collapsed = false;
+    if (collapsed) {
+      let a = [0, 0, 0]; for (let j = 0; j < nv; j++) if (N[i][j]) a = V.add(a, N[i][j]);
+      const an = V.len(a) > 1e-9 ? V.norm(a) : null;
+      for (let j = 0; j < nv; j++) N[i][j] = an;
+    }
+  }
+  for (let pass = 0; pass < 4; pass++) {
+    let bad = 0;
+    for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) if (!N[i][j]) {
+      let a = [0, 0, 0];
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const r = N[clamp(i + di, 0, nu - 1)][clamp(j + dj, 0, nv - 1)]; if (r) a = V.add(a, r); }
+      if (V.len(a) > 1e-9) N[i][j] = V.norm(a); else bad++;
+    }
+    if (!bad) break;
+  }
+  for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) if (!N[i][j]) N[i][j] = [0, 1, 0];
+  return N;
+}
+
+// add a grid of points P[i][j] as a smooth surface.
+//  o.closeU / o.closeV : wrap; o.tag : [a,b,c,d] | (i,j,p)=>[..]; o.flip; o.awayFrom:[x,y,z]; o.orient:[x,y,z];
+//  o.ref:[i,j,nx,ny,nz] (normal at that vertex must agree with the hint); o.mirrorZ; o.symZ
+function addGrid(mesh, P, o = {}) {
+  const nu = P.length, nv = P[0].length, N = gridNormals(P, o.closeU, o.closeV);
+  let flip = !!o.flip;
+  if (o.ref) {
+    const n = N[o.ref[0]][o.ref[1]];
+    if (n[0] * o.ref[2] + n[1] * o.ref[3] + n[2] * o.ref[4] < 0) flip = !flip;
+  } else if (o.awayFrom || o.orient) {
+    let s = 0;
+    for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) s += o.orient ? V.dot(N[i][j], o.orient) : V.dot(N[i][j], V.sub(P[i][j], o.awayFrom));
+    if (s < 0) flip = !flip;
+  }
+  const tagOf = typeof o.tag === 'function' ? o.tag : () => o.tag || [0, 0, 0, 0];
+  const emit = (mz) => {
+    const base = mesh.nv, sg = flip ? -1 : 1;
+    for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) {
+      const p = P[i][j], n = N[i][j], t = tagOf(i, j, p);
+      let nx = n[0] * sg, ny = n[1] * sg, nz = n[2] * sg;
+      if (o.symZ && Math.abs(p[2]) < 1e-6) { nz = 0; const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l; }
+      mesh.p.push(p[0], p[1], mz ? -p[2] : p[2]);
+      mesh.n.push(nx, ny, mz ? -nz : nz);
+      mesh.t.push(t[0], t[1], t[2], t[3]);
+    }
+    const iu = o.closeU ? nu : nu - 1, jv = o.closeV ? nv : nv - 1, rev = flip !== !!mz;
+    for (let i = 0; i < iu; i++) for (let j = 0; j < jv; j++) {
+      const i1 = (i + 1) % nu, j1 = (j + 1) % nv;
+      const a = i * nv + j, b = i1 * nv + j, c = i1 * nv + j1, d = i * nv + j1;
+      const pa = P[i][j], pb = P[i1][j], pc = P[i1][j1], pd = P[i][j1];
+      if (V.len(V.cross(V.sub(pb, pa), V.sub(pc, pa))) > 1e-12) { if (rev) mesh.i.push(base + a, base + c, base + b); else mesh.i.push(base + a, base + b, base + c); }
+      if (V.len(V.cross(V.sub(pc, pa), V.sub(pd, pa))) > 1e-12) { if (rev) mesh.i.push(base + a, base + d, base + c); else mesh.i.push(base + a, base + c, base + d); }
+    }
+  };
+  emit(false);
+  if (o.mirrorZ) emit(true);
+}
+
+// swept tube with an elliptical section. path: points; ra along the 'side' axis, rb along the other.
+//  o.side: preferred direction of the wide axis | o.up: derive side = up x tangent; o.capStart/o.capEnd; o.scale(t)
+function addTube(mesh, path, ra, rb, o = {}) {
+  const n = path.length, sides = o.sides || 14, frames = [];
+  let prev = null;
+  for (let i = 0; i < n; i++) {
+    const t = V.norm(V.sub(path[Math.min(i + 1, n - 1)], path[Math.max(i - 1, 0)]));
+    let side;
+    if (o.up) side = V.cross(o.up, t);
+    else { const h = o.side || [1, 0, 0]; side = V.sub(h, V.mul(t, V.dot(h, t))); }
+    if (V.len(side) < 1e-4) side = prev || [0, 0, 1];
+    side = V.norm(side);
+    if (prev && V.dot(side, prev) < 0) side = V.mul(side, -1);
+    prev = side;
+    frames.push({ p: path[i], t, side, up: V.cross(side, t) });
+  }
+  const ring = (f, s, shift) => {
+    const r = [];
+    for (let k = 0; k < sides; k++) { const a = (TAU * k) / sides; r.push(V.add(V.mad(V.mad(f.p, f.t, shift), f.side, Math.cos(a) * ra * s), V.mul(f.up, Math.sin(a) * rb * s))); }
+    return r;
+  };
+  const sc = (i) => (o.scale ? o.scale(i / (n - 1)) : 1), rows = [], rc = Math.min(ra, rb) * (o.capLen || 1);
+  if (o.capStart) for (let k = 3; k >= 1; k--) { const a = (k * PI) / 6; rows.push(ring(frames[0], Math.cos(a) * sc(0), -Math.sin(a) * rc * sc(0))); }
+  for (let i = 0; i < n; i++) rows.push(ring(frames[i], sc(i), 0));
+  if (o.capEnd) for (let k = 1; k <= 3; k++) { const a = (k * PI) / 6; rows.push(ring(frames[n - 1], Math.cos(a) * sc(n - 1), Math.sin(a) * rc * sc(n - 1))); }
+  const mid = rows.length >> 1, c = frames[clamp(mid - (o.capStart ? 3 : 0), 0, n - 1)].p, pm = rows[mid][0];
+  const hint = V.sub(pm, c);
+  addGrid(mesh, rows, { closeV: true, tag: o.tag, ref: [mid, 0, hint[0], hint[1], hint[2]], mirrorZ: o.mirrorZ });
+}
+
+function paramSamples(n, e) {
+  const out = [0];
+  for (let k = 0; k <= n; k++) out.push(lerp(e, 1 - e, k / n));
+  out.push(1);
+  return out;
+}
+// thin shell around a parametric mid-surface fn(u,v) -> [x,y,z]; both faces, wrapped long edges, capped ends
+function addShell(mesh, fn, nu, nv, thick, o = {}) {
+  const edge = o.edge === undefined ? 0.005 : o.edge;
+  const lu = V.len(V.sub(fn(1, 0.5), fn(0, 0.5))) || 1, lv = V.len(V.sub(fn(0.5, 1), fn(0.5, 0))) || 1;
+  const us = paramSamples(nu, Math.min(0.2, edge / lu)), vs = paramSamples(nv, Math.min(0.2, edge / lv));
+  const P = us.map((u) => vs.map((v) => fn(u, v))), N = gridNormals(P), h = thick / 2, rows = [], L = us.length - 1, J = vs.length;
+  for (let i = 0; i <= L; i++) {
+    const row = [];
+    for (let j = 0; j < J; j++) row.push(V.mad(P[i][j], N[i][j], h));
+    for (let j = J - 1; j >= 0; j--) row.push(V.mad(P[i][j], N[i][j], -h));
+    rows.push(row);
+  }
+  const im = L >> 1, jm = J >> 1, nr = N[im][jm];
+  addGrid(mesh, rows, { closeV: true, tag: o.tag, ref: [im, jm, nr[0], nr[1], nr[2]], mirrorZ: o.mirrorZ });
+  const cap = (i) => [vs.map((_, j) => V.mad(P[i][j], N[i][j], h)), vs.map((_, j) => V.mad(P[i][j], N[i][j], -h))];
+  addGrid(mesh, cap(0), { tag: o.tag, orient: V.sub(P[0][jm], P[1][jm]), mirrorZ: o.mirrorZ });
+  addGrid(mesh, cap(L), { tag: o.tag, orient: V.sub(P[L][jm], P[L - 1][jm]), mirrorZ: o.mirrorZ });
+}
+
+// closed airfoil loop (chord 0..1), upper surface from TE to LE then lower from LE to TE.
+// camber is "downforce" camber: the section is concave on top.
+function airfoil(n, thick, camber) {
+  const up = [], lo = [];
+  for (let i = 0; i <= n; i++) {
+    const x = 0.5 * (1 - Math.cos((PI * i) / n));
+    const yt = 5 * thick * (0.2969 * Math.sqrt(x) - 0.126 * x - 0.3516 * x * x + 0.2843 * x * x * x - 0.1036 * x * x * x * x) + 0.004 * x;
+    const yc = -4 * camber * x * (1 - x);
+    up.push([x, yc + yt]); lo.push([x, yc - yt]);
+  }
+  return up.slice().reverse().concat(lo.slice(1));
+}
+// wing: stations {z, le:[x,y], chord, aoa, thick, camber} lofted along the span
+function addWing(mesh, st, o = {}) {
+  const nc = o.nc || 16;
+  const rows = st.map((s) => {
+    const ca = Math.cos(s.aoa), sa = Math.sin(s.aoa);
+    return airfoil(nc, s.thick, s.camber).map((q) => [s.le[0] + s.chord * (q[0] * ca - q[1] * sa), s.le[1] + s.chord * (q[0] * sa + q[1] * ca), s.z]);
+  });
+  const mid = rows.length >> 1;
+  addGrid(mesh, rows, { closeV: true, tag: o.tag, ref: [mid, nc >> 1, 0, 1, 0], mirrorZ: o.mirrorZ });
+  const cap = (r, dz) => {
+    const upper = r.slice(0, nc + 1).reverse(), lower = [r[nc]].concat(r.slice(nc + 1));
+    addGrid(mesh, [upper, lower], { tag: o.tag, orient: [0, 0, dz], mirrorZ: o.mirrorZ });
+  };
+  if (!o.noCapA) cap(rows[0], st[0].z < st[st.length - 1].z ? -1 : 1);
+  if (!o.noCapB) cap(rows[rows.length - 1], st[0].z < st[st.length - 1].z ? 1 : -1);
+}
+
+// surface of revolution about local Z. profile: [[axial, radius], ...]; o.n: [nr, na] hint for the outward side
+function addRevolve(mesh, profile, segs, o = {}) {
+  const rows = profile.map((q) => {
+    const r = [];
+    for (let k = 0; k < segs; k++) { const a = (TAU * k) / segs; let p = [q[1] * Math.cos(a), q[1] * Math.sin(a), q[0]]; if (o.deform) p = o.deform(p); r.push(p); }
+    return r;
+  });
+  const mid = profile.length >> 1, h = o.n || [1, 0];
+  addGrid(mesh, rows, { closeV: true, tag: o.tag, ref: [mid, 0, h[0], 0, h[1]] });
+}
+
+function addEllipsoid(mesh, c, r, o = {}) {
+  const nu = o.nu || 12, nv = o.nv || 20, e = 2 / (o.e || 2), rows = [];
+  const sp = (x) => Math.sign(x) * Math.pow(Math.abs(x), e);
+  for (let i = 0; i <= nu; i++) {
+    const ph = -PI / 2 + (PI * i) / nu, row = [];
+    for (let j = 0; j < nv; j++) { const th = (TAU * j) / nv; row.push([c[0] + r[0] * sp(Math.cos(ph)) * sp(Math.cos(th)), c[1] + r[1] * sp(Math.sin(ph)), c[2] + r[2] * sp(Math.cos(ph)) * sp(Math.sin(th))]); }
+    rows.push(row);
+  }
+  addGrid(mesh, rows, { closeV: true, tag: o.tag, awayFrom: c, mirrorZ: o.mirrorZ });
+}
+
+// bilinear patch
+function addPatch(mesh, a, b, c, d, nu, nv, o = {}) {
+  const rows = [];
+  for (let i = 0; i <= nu; i++) { const row = []; for (let j = 0; j <= nv; j++) row.push(V.lerp(V.lerp(a, b, i / nu), V.lerp(d, c, i / nu), j / nv)); rows.push(row); }
+  addGrid(mesh, rows, o);
+}
+function addBox(mesh, c, h, o = {}) {
+  const s = o.seg || 1, f = (ax, sg) => {
+    const u = (ax + 1) % 3, v = (ax + 2) % 3, q = (a, b) => { const p = [0, 0, 0]; p[ax] = c[ax] + sg * h[ax]; p[u] = c[u] + a * h[u]; p[v] = c[v] + b * h[v]; return p; };
+    const n = [0, 0, 0]; n[ax] = sg;
+    addPatch(mesh, q(-1, -1), q(1, -1), q(1, 1), q(-1, 1), s, s, { tag: o.tag, orient: n, mirrorZ: o.mirrorZ });
+  };
+  for (let ax = 0; ax < 3; ax++) { f(ax, 1); f(ax, -1); }
+}
+// flat cap closing a ring towards a centre point
+function addCap(mesh, ring, center, normal, o = {}) {
+  addGrid(mesh, [ring, ring.map((p) => V.lerp(p, center, 0.5)), ring.map(() => center.slice())], { closeV: true, tag: o.tag, orient: normal, mirrorZ: o.mirrorZ });
+}
+
+// upload a Mesh to the GPU
+function uploadMesh(m) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = (data, loc, size) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); };
+  buf(m.p, 0, 3); buf(m.n, 1, 3); buf(m.t, 2, 4);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(m.i), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: m.i.length, nv: m.nv };
+}
+// ------------------------------------------------------------------ the car (an original ground-effect single-seater)
+// Axes: +X is downstream (the nose points to -X), +Y up, Z across. Units are metres.
+const CAR = { frontAxle: -1.75, rearAxle: 1.85, R: 0.36, patch: 0.007, wF: 0.305, wR: 0.405, zF: 0.8475, zR: 0.7975, noseX: -2.93, tailX: 2.56 };
+
+function buildCar() {
+  const paint = new Mesh(), carbon = new Mesh(), matte = new Mesh(), metal = new Mesh(), helmet = new Mesh(), emis = new Mesh();
+  const NOSE_X = CAR.noseX, TAIL_X = CAR.tailX;
+
+  // ============================ fuselage: nose, survival cell, airbox, engine cover
+  const yTop = spline1([[-2.93, 0.172], [-2.87, 0.198], [-2.72, 0.236], [-2.5, 0.292], [-2.2, 0.372], [-1.9, 0.455], [-1.6, 0.53], [-1.3, 0.592], [-1.05, 0.628], [-0.7, 0.652], [-0.4, 0.668], [-0.15, 0.69], [-0.05, 0.705], [0.0, 0.76], [0.05, 0.9], [0.1, 0.955], [0.2, 0.972], [0.4, 0.965], [0.7, 0.925], [1.0, 0.87], [1.3, 0.8], [1.6, 0.715], [1.9, 0.62], [2.2, 0.53], [2.45, 0.455], [2.6, 0.42]], true);
+  const yBot = spline1([[-2.93, 0.152], [-2.84, 0.128], [-2.65, 0.118], [-2.35, 0.14], [-2.05, 0.185], [-1.75, 0.232], [-1.45, 0.262], [-1.2, 0.255], [-1.02, 0.205], [-0.9, 0.135], [-0.8, 0.088], [-0.62, 0.07], [1.5, 0.07], [1.8, 0.11], [2.1, 0.19], [2.4, 0.27], [2.6, 0.31]], true);
+  const halfW = spline1([[-2.93, 0.06], [-2.84, 0.09], [-2.65, 0.114], [-2.35, 0.138], [-2.05, 0.162], [-1.75, 0.188], [-1.45, 0.22], [-1.2, 0.262], [-1.0, 0.296], [-0.75, 0.326], [-0.45, 0.34], [-0.1, 0.338], [0.3, 0.325], [0.8, 0.295], [1.3, 0.235], [1.7, 0.17], [2.1, 0.118], [2.4, 0.09], [2.6, 0.075]], true);
+  const waist = spline1([[-2.93, 0.5], [-1.6, 0.48], [-0.8, 0.42], [-0.2, 0.36], [0.2, 0.25], [1.2, 0.25], [2.0, 0.36], [2.6, 0.5]]);
+  const nUp = spline1([[-2.93, 2.2], [-2.2, 2.5], [-1.4, 3.0], [-0.6, 3.3], [0.0, 2.9], [0.25, 2.4], [2.6, 2.2]]);
+  const nLo = spline1([[-2.93, 2.2], [-2.2, 2.8], [-1.2, 3.2], [-0.7, 4.0], [1.5, 4.0], [2.2, 2.6], [2.6, 2.2]]);
+  const taper = spline1([[-0.3, 1], [-0.05, 0.92], [0.06, 0.52], [0.2, 0.43], [0.8, 0.35], [1.4, 0.3], [2.0, 0.36], [2.4, 0.62], [2.6, 0.85]], true);
+  const ySh = spline1([[-0.3, 0.665], [0.3, 0.66], [0.8, 0.56], [1.3, 0.45], [1.8, 0.37], [2.3, 0.34], [2.6, 0.34]]);
+  const tipScale = (x) => {
+    const a = clamp((x - NOSE_X) / 0.1, 0, 1), b = clamp((TAIL_X - x) / 0.09, 0, 1);
+    return Math.sqrt(1 - (1 - a) * (1 - a)) * Math.sqrt(1 - (1 - b) * (1 - b));
+  };
+  // half cross-section at station x, from bottom centre up the side to top centre: [[z, y], ...]
+  const fusRing = (x) => {
+    const s = tipScale(x);
+    let yt = yTop(x), yb = yBot(x);
+    const yc = (yt + yb) / 2; yt = yc + (yt - yc) * s; yb = yc + (yb - yc) * s;
+    const w = halfW(x) * s, ym = yb + (yt - yb) * waist(x), nu = nUp(x), nl = nLo(x), tp = taper(x), ys = ySh(x), pts = [], M = 96;
+    for (let k = 0; k <= M; k++) {
+      const ph = -PI / 2 + (PI * k) / M, c = Math.max(Math.cos(ph), 0), sn = Math.sin(ph);
+      let z, y;
+      if (sn < 0) { z = w * Math.pow(c, 2 / nl); y = ym - (ym - yb) * Math.pow(-sn, 2 / nl); }
+      else { z = w * Math.pow(c, 2 / nu); y = ym + (yt - ym) * Math.pow(sn, 2 / nu); z *= lerp(1, tp, smoothstep(ys, ys + 0.15, y)); }
+      pts.push([z, y]);
+    }
+    pts[0][0] = 0; pts[M][0] = 0;
+    return pts;
+  };
+  // cockpit opening outline (half width at station x)
+  const CK0 = -1.03, CK1 = -0.075;
+  const cockpitW = (x) => {
+    if (x <= CK0 || x >= CK1) return 0;
+    const u = Math.abs((2 * (x - (CK0 + CK1) / 2)) / (CK1 - CK0));
+    return lerp(0.185, 0.245, smoothstep(-0.85, -0.35, x)) * Math.pow(1 - Math.pow(u, 3.2), 1 / 3.2);
+  };
+  const xs = [];
+  for (let x = NOSE_X; x <= TAIL_X + 1e-6; x += 0.03) xs.push(x);
+  for (let k = 1; k < 8; k++) { xs.push(NOSE_X + 0.1 * (1 - Math.cos((k * PI) / 16))); xs.push(TAIL_X - 0.09 * (1 - Math.cos((k * PI) / 16))); }
+  for (let x = -0.07; x <= 0.13; x += 0.008) xs.push(x);
+  for (let k = 1; k < 6; k++) { xs.push(CK0 + 0.004 * k * k); xs.push(CK1 - 0.004 * k * k); }
+  xs.push(TAIL_X);
+  xs.sort((a, b) => a - b);
+  const fx = xs.filter((x, i) => i === 0 || x - xs[i - 1] > 0.0025);
+  const NVH = 52, shell = [], tub = [];
+  for (const x of fx) {
+    let ring = fusRing(x);
+    const wc = cockpitW(x);
+    if (wc > 0.004) {
+      // cut the top of the section at the cockpit rim
+      let k = ring.length - 1;
+      while (k > 0 && ring[k - 1][0] < wc) k--;
+      const a = ring[k - 1], b = ring[k], t = (a[0] - wc) / Math.max(a[0] - b[0], 1e-9), rim = [wc, a[1] + (b[1] - a[1]) * t];
+      ring = ring.slice(0, k).concat([rim]);
+      // the tub: rim -> inner wall -> floor -> centre
+      const e = Math.pow(1 - Math.pow(Math.abs((2 * (x - (CK0 + CK1) / 2)) / (CK1 - CK0)), 3.2), 1 / 3.2);
+      const dep = 0.33 * Math.sqrt(e) * lerp(1, 0.2, smoothstep(-0.36, -0.2, x)), yr = rim[1];
+      const wall = [[wc, yr], [wc - 0.005, yr - 0.01], [wc - 0.012, yr - 0.03], [wc - 0.018, yr - dep * 0.6], [wc - 0.03, yr - dep * 0.92], [Math.max(wc - 0.07, 0), yr - dep], [0, yr - dep]];
+      tub.push(resample(crPath(wall, 5), 18).map((p) => [x, p[1], Math.max(p[0], 0)]));
+    }
+    shell.push(resample(ring, NVH).map((p) => [x, p[1], p[0]]));
+  }
+  addGrid(paint, shell, { tag: [0, 0, 0, 0], awayFrom: [0, 0.42, 0], mirrorZ: true, symZ: true });
+  tub.unshift(tub[0].map(() => [tub[0][0][0] - 0.004, tub[0][0][1], 0])); tub.push(tub[tub.length - 1].map((_, i, r) => [r[0][0] + 0.004, r[0][1], 0]));
+  addGrid(matte, tub, { tag: [2, 0, 0, 0], orient: [0, 1, 0], mirrorZ: true, symZ: true });
+
+  // shark fin on the engine cover spine
+  addShell(carbon, (u, v) => { const x = lerp(0.95, 2.28, u), yb = yTop(x) - 0.02, yt = Math.max(lerp(0.9, 0.665, u), yb + 0.012); return [x, lerp(yb, yt, v), 0]; }, 44, 5, 0.009, { tag: [0.15, 1, 1, 0] });
+
+  // ============================ sidepods (right side built, left mirrored)
+  const PX0 = -0.42, PX1 = 1.8;
+  const pOut = spline1([[-0.42, 0.7], [-0.2, 0.755], [0.1, 0.775], [0.5, 0.765], [0.9, 0.715], [1.2, 0.64], [1.5, 0.52], [1.8, 0.36]]);
+  const pTop = spline1([[-0.42, 0.56], [-0.25, 0.598], [0.0, 0.61], [0.3, 0.59], [0.6, 0.535], [0.9, 0.455], [1.2, 0.365], [1.5, 0.27], [1.8, 0.185]]);
+  const pBot = spline1([[-0.42, 0.3], [-0.2, 0.255], [0.1, 0.2], [0.5, 0.14], [0.9, 0.105], [1.3, 0.09], [1.8, 0.085]]);
+  const pCut = spline1([[-0.42, 0.15], [0.0, 0.2], [0.5, 0.14], [1.0, 0.06], [1.5, 0.0], [1.8, 0.0]]);
+  const pExp = spline1([[-0.42, 3.4], [0.4, 3.6], [1.2, 3.0], [1.8, 2.4]]);
+  const podRing = (x, scale) => {
+    const xc = clamp(x, PX0, PX1), zin = 0.2, zo = pOut(xc), yt = pTop(xc), yb = pBot(xc), zc = (zin + zo) / 2, a = (zo - zin) / 2, yc = (yt + yb) / 2, b = (yt - yb) / 2, n = pExp(xc), cut = pCut(xc), pts = [], M = 120;
+    for (let k = 0; k < M; k++) {
+      const ph = (TAU * k) / M, c = Math.cos(ph), s = Math.sin(ph);
+      let z = zc + a * Math.sign(c) * Math.pow(Math.abs(c), 2 / n), y = yc + b * Math.sign(s) * Math.pow(Math.abs(s), 2 / n);
+      const outer = smoothstep(0, 1, (z - zc) / a);
+      if (y < yc) z -= cut * Math.pow((yc - y) / b, 1.3) * outer;        // undercut
+      else y -= 0.04 * outer * outer * ((y - yc) / b);                    // shoulder falls away outboard
+      pts.push([zc + 0.05 + (z - zc - 0.05) * scale, yc + 0.015 + (y - yc - 0.015) * scale]);
+    }
+    return resample(pts, 60, true);
+  };
+  const pst = [[-0.26, 0.6, 1], [-0.33, 0.7, 1], [-0.395, 0.8, 1], [-0.428, 0.86, 0.6], [-0.443, 0.925, 0], [-0.436, 0.975, 0], [-0.41, 1, 0]];
+  for (let x = -0.38; x < 1.74; x += 0.03) pst.push([x, 1, 0]);
+  pst.push([1.75, 0.82, 0], [1.78, 0.55, 0], [1.795, 0.28, 0], [1.8, 0.0, 0]);
+  const podRows = pst.map((s) => podRing(s[0], s[1]).map((p) => [s[0], p[1], p[0]]));
+  addGrid(paint, podRows, { closeV: true, tag: (i) => [1, pst[i][2], 0, 0], ref: [40, 0, 0, 0, 1], mirrorZ: true });
+  { const r0 = podRows[0]; let c = [0, 0, 0]; for (const p of r0) c = V.add(c, p); c = V.mul(c, 1 / r0.length); addCap(paint, r0, c, [-1, 0, 0], { tag: [1, 1, 0, 0], mirrorZ: true }); }
+
+  // ============================ floor, diffuser, fences
+  const fW = spline1([[-0.92, 0.3], [-0.8, 0.52], [-0.62, 0.7], [-0.4, 0.775], [-0.1, 0.8], [1.0, 0.8], [1.3, 0.785], [1.4, 0.74], [1.46, 0.6], [1.52, 0.515], [1.6, 0.5], [2.28, 0.5]], true);
+  const dRise = (x) => 0.215 * Math.pow(smoothstep(1.62, 2.28, x), 1.2);
+  addShell(carbon, (u, v) => { const x = lerp(-0.92, 2.28, u); return [x, 0.079 + dRise(x), (2 * v - 1) * fW(x)]; }, 120, 44, 0.014, { tag: [0.75, 0, 0, 1] });
+  for (const z of [0.5, 0.24]) addShell(carbon, (u, v) => { const x = lerp(1.6, 2.28, u); return [x, lerp(0.04, 0.072 + dRise(x), v), z]; }, 20, 5, 0.008, { tag: [0.85, 0, 0, 0], mirrorZ: true });
+  // floor edge wing
+  addShell(carbon, (u, v) => { const x = lerp(-0.05, 1.28, u), k = Math.sin(PI * u); return [x, 0.108 + 0.03 * v * v + 0.012 * k, 0.792 + 0.075 * v * (0.6 + 0.4 * k)]; }, 44, 3, 0.006, { tag: [0.2, 1, 1, 0], mirrorZ: true });
+  // leading-edge fences
+  for (let k = 0; k < 3; k++) addShell(carbon, (u, v) => { const x = lerp(-0.9, -0.5, u); return [x, lerp(0.086, 0.086 + (0.21 - 0.035 * k) * (1 - 0.45 * u), v), 0.34 + 0.115 * k + 0.17 * u * u + 0.02 * k * u]; }, 14, 5, 0.006, { tag: [0.3, 1, 0, 0], mirrorZ: true });
+  // bib / splitter under the chassis
+  addShell(carbon, (u, v) => { const x = lerp(-1.3, -0.86, u), w = 0.17 * Math.sqrt(clamp(u / 0.3, 0.02, 1)); return [x, 0.079, (2 * v - 1) * w]; }, 14, 10, 0.014, { tag: [0.75, 0, 0, 0] });
+
+  // ============================ front wing
+  const fwSt = (z) => {
+    const t = Math.abs(z) / 0.955, wash = 1 - 0.45 * smoothstep(0.55, 1.0, t);
+    const chords = [0.265 - 0.06 * t, 0.165 - 0.03 * t, 0.145 - 0.035 * t, 0.125 - 0.04 * t], aoas = [3, 14, 25, 36].map((d) => (d * wash * PI) / 180), out = [];
+    let le = [-2.885 + 0.19 * Math.pow(t, 1.7), 0.118 + 0.045 * Math.exp(-(z * z) / (0.26 * 0.26))];
+    for (let e = 0; e < 4; e++) {
+      out.push({ z, le: le.slice(), chord: chords[e], aoa: aoas[e], thick: e === 0 ? 0.1 : 0.085, camber: e === 0 ? 0.07 : 0.09 });
+      le = [le[0] + chords[e] * Math.cos(aoas[e]) - 0.022, le[1] + chords[e] * Math.sin(aoas[e]) + 0.02];
+    }
+    return out;
+  };
+  { const zs = []; for (let k = 0; k <= 60; k++) zs.push(lerp(-0.955, 0.955, k / 60)); addWing(carbon, zs.map((z) => fwSt(z)[0]), { tag: [0.12, 1, 1, 1], nc: 14 }); }
+  for (let e = 1; e < 4; e++) { const zs = []; for (let k = 0; k <= 28; k++) zs.push(lerp(0.07, 0.955, k / 28)); addWing(carbon, zs.map((z) => fwSt(z)[e]), { tag: [0.12, 1, 1, 1 + e], nc: 12, mirrorZ: true }); }
+  // endplates + dive plane
+  addShell(carbon, (u, v) => { const x = lerp(-2.74, -2.2, u); return [x, lerp(0.05, 0.2 + 0.135 * Math.pow(u, 1.4), v), 0.962 + 0.02 * Math.sin(PI * u * 0.9) + 0.012 * u * u]; }, 20, 9, 0.008, { tag: [0.12, 1, 2, 0], mirrorZ: true });
+  addShell(carbon, (u, v) => { const x = lerp(-2.62, -2.24, u); return [x, 0.082 + 0.05 * u * u + 0.01 * v, 0.972 + 0.03 * v * Math.sin(PI * clamp(u * 1.1, 0, 1))]; }, 12, 2, 0.005, { tag: [0.12, 1, 0, 0], mirrorZ: true });
+
+  // ============================ rear wing, beam wing, pylon
+  { const zs = []; for (let k = 0; k <= 32; k++) zs.push(lerp(-0.491, 0.491, k / 32));
+    const main = (z) => { const c = Math.cos((PI * z) / 0.974); return { z, le: [2.265, 0.83 - 0.028 * c], chord: 0.3 + 0.035 * c, aoa: ((5 + 3 * c) * PI) / 180, thick: 0.1, camber: 0.12 }; };
+    const flap = (z) => { const m = main(z), te = [m.le[0] + m.chord * Math.cos(m.aoa), m.le[1] + m.chord * Math.sin(m.aoa)]; return { z, le: [te[0] - 0.02, te[1] + 0.034], chord: 0.152, aoa: (34 * PI) / 180, thick: 0.09, camber: 0.08 }; };
+    addWing(carbon, zs.map(main), { tag: [0.12, 1, 1, 5], nc: 16 });
+    addWing(carbon, zs.map(flap), { tag: [0.12, 1, 1, 6], nc: 12 });
+    addWing(carbon, zs.map((z) => ({ z, le: [2.4, 0.475], chord: 0.2, aoa: (16 * PI) / 180, thick: 0.09, camber: 0.1 })), { tag: [0.2, 1, 0, 7], nc: 12 });
+    addWing(carbon, zs.map((z) => ({ z, le: [2.565, 0.548], chord: 0.118, aoa: (30 * PI) / 180, thick: 0.09, camber: 0.08 })), { tag: [0.2, 1, 0, 8], nc: 10 }); }
+  addShell(carbon, (u, v) => {
+    const xf = lerp(2.34, 2.19, smoothstep(0.12, 0.72, v)), xr = lerp(2.6, 2.745, smoothstep(0.08, 0.68, v)), yt = 0.905 + 0.087 * smoothstep(0, 0.85, u);
+    return [lerp(xf, xr, u), lerp(0.335, yt, v), 0.496];
+  }, 20, 24, 0.01, { tag: [0.12, 1, 2, 0], mirrorZ: true });
+  addShell(carbon, (u, v) => { const w = Math.pow(v, 0.8); return [lerp(lerp(2.03, 2.31, w), lerp(2.3, 2.49, w), u), lerp(0.46, 0.815, v), 0]; }, 8, 14, 0.022, { tag: [0.2, 1, 0, 0], edge: 0.01 });
+  addEllipsoid(carbon, [2.5, 0.905, 0], [0.1, 0.022, 0.024], { tag: [0.2, 1, 0, 0], nu: 8, nv: 14 });
+
+  // ============================ tail: crash structure, rain light, exhaust
+  addBox(carbon, [2.6, 0.3, 0], [0.145, 0.04, 0.045], { tag: [0.6, 0, 0, 0], seg: 4 });
+  addBox(emis, [2.7475, 0.3, 0], [0.003, 0.028, 0.034], { tag: [1, 0.05, 0.03, 1], seg: 1 });
+  addTube(metal, [[2.3, 0.405, 0], [2.4, 0.41, 0], [2.52, 0.416, 0], [2.61, 0.42, 0]], 0.058, 0.058, { tag: [0, 0, 0, 0], sides: 24, side: [0, 0, 1] });
+  { const ring = [], inner = []; for (let k = 0; k < 24; k++) { const a = (TAU * k) / 24; ring.push([2.61, 0.42 + 0.058 * Math.sin(a), 0.058 * Math.cos(a)]); inner.push([2.61, 0.42 + 0.05 * Math.sin(a), 0.05 * Math.cos(a)]); }
+    addGrid(metal, [ring, inner], { closeV: true, tag: [0, 0, 0, 0], orient: [1, 0, 0] });
+    addGrid(matte, [inner, inner.map((p) => [p[0] - 0.12, p[1], p[2]])], { closeV: true, tag: [1, 0, 0, 0], ref: [0, 0, 0, 0, -1] });
+    addCap(matte, inner.map((p) => [p[0] - 0.12, p[1], p[2]]), [2.49, 0.42, 0], [1, 0, 0], { tag: [1, 0, 0, 0] }); }
+
+  // ============================ halo
+  { const R = [[0.16, 0.63, 0.25], [0.1, 0.672, 0.262], [-0.0, 0.735, 0.276], [-0.2, 0.832, 0.292], [-0.45, 0.893, 0.286], [-0.68, 0.914, 0.226], [-0.84, 0.912, 0.118], [-0.9, 0.908, 0.0]];
+    const full = R.concat(R.slice(0, -1).reverse().map((p) => [p[0], p[1], -p[2]]));
+    addTube(paint, resample(crPath(full, 10), 96), 0.03, 0.022, { tag: [2, 0, 0, 0], up: [0, 1, 0], sides: 16, capStart: true, capEnd: true });
+    addTube(paint, resample(crPath([[-0.9, 0.9, 0], [-0.95, 0.82, 0], [-1.0, 0.73, 0], [-1.045, 0.64, 0]], 6), 16), 0.017, 0.042, { tag: [2, 0, 0, 0], side: [0, 0, 1], sides: 14 }); }
+
+  // ============================ driver's helmet
+  addEllipsoid(helmet, [-0.37, 0.79, 0], [0.136, 0.122, 0.114], { tag: [0, 0, 0, 0], nu: 24, nv: 40 });
+
+  // ============================ mirrors, camera pod, pitot
+  addEllipsoid(paint, [-0.74, 0.742, 0.6], [0.04, 0.036, 0.085], { tag: [3, 0, 0, 0], nu: 12, nv: 20, e: 3.2, mirrorZ: true });
+  const arm = (a, b, chord, thick, tag, extra) => addTube(carbon, [a, V.lerp(a, b, 0.25), V.lerp(a, b, 0.5), V.lerp(a, b, 0.75), b], chord, thick, Object.assign({ tag: tag || [0.55, 0, 0, 0], side: [1, 0, 0], sides: 12, mirrorZ: true, capStart: true, capEnd: true }, extra || {}));
+  arm([-0.74, 0.722, 0.53], [-0.7, 0.662, 0.31], 0.03, 0.007);
+  arm([-0.735, 0.712, 0.6], [-0.425, 0.575, 0.58], 0.016, 0.006, null, { side: [0, 0, 1] });
+  addEllipsoid(matte, [0.24, 1.004, 0], [0.065, 0.016, 0.06], { tag: [0, 0, 0, 0], nu: 8, nv: 16, e: 2.6 });
+  addBox(matte, [0.24, 0.985, 0], [0.03, 0.02, 0.012], { tag: [0, 0, 0, 0] });
+  addTube(metal, [[-1.25, 0.598, 0], [-1.25, 0.66, 0], [-1.262, 0.672, 0], [-1.33, 0.672, 0]], 0.0045, 0.0045, { tag: [2, 0, 0, 0], sides: 8, side: [0, 0, 1], capEnd: true });
+
+  // ============================ suspension
+  const fa = CAR.frontAxle, ra = CAR.rearAxle;
+  arm([fa, 0.55, 0.71], [-1.92, 0.42, 0.15], 0.028, 0.008); arm([fa, 0.55, 0.71], [-1.38, 0.555, 0.215], 0.028, 0.008);
+  arm([fa, 0.19, 0.72], [-1.95, 0.225, 0.135], 0.03, 0.008); arm([fa, 0.19, 0.72], [-1.36, 0.268, 0.2], 0.03, 0.008);
+  arm([fa, 0.225, 0.7], [-1.62, 0.535, 0.185], 0.02, 0.008); arm([-1.6, 0.38, 0.71], [-1.52, 0.42, 0.21], 0.02, 0.007);
+  arm([ra, 0.545, 0.62], [1.5, 0.5, 0.185], 0.028, 0.008); arm([ra, 0.545, 0.62], [2.12, 0.47, 0.11], 0.028, 0.008);
+  arm([ra, 0.185, 0.64], [1.48, 0.17, 0.2], 0.03, 0.008); arm([ra, 0.185, 0.64], [2.15, 0.215, 0.105], 0.03, 0.008);
+  arm([ra, 0.355, 0.62], [ra, 0.34, 0.13], 0.045, 0.02); arm([ra, 0.52, 0.62], [1.72, 0.2, 0.2], 0.02, 0.008); arm([2.0, 0.36, 0.62], [2.1, 0.33, 0.115], 0.02, 0.007);
+
+  // ============================ wheels (local frame: axle along +Z, outboard = +Z)
+  const buildWheel = (w) => {
+    const m = new Mesh(), hw = w / 2, R = CAR.R, rr = 0.2405, lim = -R + CAR.patch;
+    const half = [[hw - 0.052, R - 0.0015], [hw - 0.026, R - 0.01], [hw - 0.006, R - 0.03], [hw + 0.006, R - 0.058], [hw + 0.008, rr + 0.056], [hw - 0.001, rr + 0.022], [hw - 0.014, rr + 0.002], [hw - 0.036, rr - 0.006]];
+    const ctrl = half.slice().reverse().map((p) => [-p[0], p[1]]).concat([[-hw * 0.5, R], [0, R], [hw * 0.5, R]], half);
+    const prof = resample(crPath(ctrl, 8), 72);
+    const deform = (p) => { const q = p.slice(), b = smoothstep(-R + 0.14, -R + 0.01, p[1]); if (Math.abs(p[2]) > hw * 0.8) q[2] += Math.sign(p[2]) * 0.007 * b; if (q[1] < lim) q[1] = lim; return q; };
+    addRevolve(m, prof, 120, { tag: [0, 0, 0, 0], n: [1, 0], deform });
+    const lip = [[hw - 0.036, rr - 0.006], [hw - 0.031, rr - 0.001], [hw - 0.025, rr - 0.005], [hw - 0.026, rr - 0.014], [hw - 0.034, rr - 0.02]];
+    addRevolve(m, lip, 96, { tag: [1, 0, 0, 0], n: [0.2, 1] });
+    addRevolve(m, resample([[hw - 0.034, rr - 0.02], [hw - 0.04, 0.19], [hw - 0.05, 0.13], [hw - 0.056, 0.075], [hw - 0.058, 0.048]], 12), 96, { tag: [2, 0, 0, 0], n: [0.1, 1] });
+    addRevolve(m, [[hw - 0.058, 0.048], [hw - 0.04, 0.046], [hw - 0.03, 0.04], [hw - 0.028, 0.03], [hw - 0.034, 0.022], [hw - 0.034, 0.0]], 48, { tag: [3, 0, 0, 0], n: [0.1, 1] });
+    addRevolve(m, lip.map((p) => [-p[0], p[1]]), 96, { tag: [1, 0, 0, 0], n: [0.2, -1] });
+    addRevolve(m, resample([[-hw + 0.034, rr - 0.02], [-hw + 0.02, 0.212], [-hw - 0.035, 0.208], [-hw - 0.05, 0.19], [-hw - 0.055, 0.12], [-hw - 0.055, 0.0]], 16), 64, { tag: [4, 0, 0, 0], n: [0.3, -1] });
+    return m;
+  };
+  const wy = CAR.R - CAR.patch;
+  const wheels = [
+    { mesh: 'wheelF', model: M4.translate(CAR.frontAxle, wy, CAR.zF), spin: 1, w: CAR.wF },
+    { mesh: 'wheelF', model: M4.mul(M4.translate(CAR.frontAxle, wy, -CAR.zF), M4.rotY(PI)), spin: -1, w: CAR.wF },
+    { mesh: 'wheelR', model: M4.translate(CAR.rearAxle, wy, CAR.zR), spin: 1, w: CAR.wR },
+    { mesh: 'wheelR', model: M4.mul(M4.translate(CAR.rearAxle, wy, -CAR.zR), M4.rotY(PI)), spin: -1, w: CAR.wR },
+  ];
+  return { meshes: { paint, carbon, matte, metal, helmet, emis, wheelF: buildWheel(CAR.wF), wheelR: buildWheel(CAR.wR) }, wheels };
+}
+// ------------------------------------------------------------------ the tunnel: an open-jet test section inside a plenum hall
+const HALL = { x0: -9.5, x1: 12.5, zw: 9.0, h: 6.2 };
+const NOZ = { x: -8.2, hw: 3.3, h: 3.7, back: -16.5, bhw: 5.2, bh: 6.0 };
+const COL = { x: 10.2, hw: 3.9, h: 4.3, mid: 13.4, back: 19.0, bhw: 3.3, bh: 3.8 };
+const BELT = { x0: -4.4, x1: 5.6, hw: 1.45 };
+const RAKE_X = -6.3;
+// smoke seeds: [z, y] of every nozzle on the rake
+const SEEDS = (() => {
+  const s = [];
+  const col = (z, ys) => { for (const y of ys) { s.push([z, y]); if (z > 0.01) s.push([-z, y]); } };
+  // two interleaved fans near the centre line (so they do not stack into one line when seen from above), then the flanks
+  col(0.004, [0.33, 0.585, 0.86, 1.18]);
+  col(0.13, [0.21, 0.455, 0.72, 1.01]);
+  col(0.36, [0.2, 0.47, 0.8]);
+  col(0.66, [0.16, 0.42]);
+  col(0.92, [0.27, 0.62]);
+  return s;
+})();
+
+// area lights: [center, halfU, halfV, radiance rgb]; the emitting side is cross(halfU, halfV)
+const LIGHT_CEIL = [0.95 * 17, 0.98 * 17, 1.0 * 17], LIGHT_WALL = [0.78 * 7, 0.89 * 7, 1.0 * 7];
+const CEIL_PITCH = 3.2, CEIL_ROWS = [-CEIL_PITCH, 0, CEIL_PITCH], CEIL_SEG = { x0: -7.9, n: 6, len: 2.95, gap: 0.25, hw: 0.42, y: 6.17 };
+const WALL_SEG = { x0: -7.4, n: 5, len: 3.3, gap: 0.3, y: 4.55, hh: 0.2 };
+const RECT_LIGHTS = (() => {
+  const L = [], cx = CEIL_SEG.x0 + (CEIL_SEG.n * (CEIL_SEG.len + CEIL_SEG.gap) - CEIL_SEG.gap) / 2, chl = (CEIL_SEG.n * (CEIL_SEG.len + CEIL_SEG.gap) - CEIL_SEG.gap) / 2;
+  const fill = (CEIL_SEG.n * CEIL_SEG.len) / (2 * chl);
+  for (const z of CEIL_ROWS) L.push({ c: [cx, CEIL_SEG.y, z], u: [chl, 0, 0], v: [0, 0, CEIL_SEG.hw], col: LIGHT_CEIL.map((x) => x * fill) });
+  const wl = (WALL_SEG.n * (WALL_SEG.len + WALL_SEG.gap) - WALL_SEG.gap) / 2, wx = WALL_SEG.x0 + wl, wfill = (WALL_SEG.n * WALL_SEG.len) / (2 * wl);
+  L.push({ c: [wx, WALL_SEG.y, HALL.zw - 0.03], u: [wl, 0, 0], v: [0, -WALL_SEG.hh, 0], col: LIGHT_WALL.map((x) => x * wfill) });
+  L.push({ c: [wx, WALL_SEG.y, -HALL.zw + 0.03], u: [wl, 0, 0], v: [0, WALL_SEG.hh, 0], col: LIGHT_WALL.map((x) => x * wfill) });
+  L.push({ c: [NOZ.back + 0.1, 3.0, 0], u: [0, 3.0, 0], v: [0, 0, 5.2], col: [0.34, 0.5, 0.72] });        // settling-chamber screen glow
+  L.push({ c: [1.4, 2.0, HALL.zw - 0.04], u: [4.0, 0, 0], v: [0, -0.8, 0], col: [0.75, 0.5, 0.3] });        // control room window
+  return L;
+})();
+
+function buildTunnel() {
+  const m = new Mesh();
+  const Q = (a, b, c, d, tag, n, nu = 1, nv = 1) => addPatch(m, a, b, c, d, nu, nv, { tag, orient: n });
+  const H = HALL;
+  // floor (the belt, markings and ducts' floors are resolved in the shader by position)
+  Q([NOZ.back - 0.5, 0, -H.zw], [COL.back + 0.5, 0, -H.zw], [COL.back + 0.5, 0, H.zw], [NOZ.back - 0.5, 0, H.zw], [0, 0, 0, 0], [0, 1, 0]);
+  // hall side walls, ceiling
+  Q([H.x0, 0, H.zw], [H.x1, 0, H.zw], [H.x1, H.h, H.zw], [H.x0, H.h, H.zw], [2, 1, 0, 0], [0, 0, -1]);
+  Q([H.x0, 0, -H.zw], [H.x1, 0, -H.zw], [H.x1, H.h, -H.zw], [H.x0, H.h, -H.zw], [2, 2, 0, 0], [0, 0, 1]);
+  Q([H.x0, H.h, -H.zw], [H.x1, H.h, -H.zw], [H.x1, H.h, H.zw], [H.x0, H.h, H.zw], [3, 0, 0, 0], [0, -1, 0]);
+  // end walls with openings for the nozzle and the collector
+  const endWall = (x, hw, hh, nx) => {
+    Q([x, 0, -H.zw], [x, 0, -hw], [x, H.h, -hw], [x, H.h, -H.zw], [2, 3, 0, 0], [nx, 0, 0]);
+    Q([x, 0, hw], [x, 0, H.zw], [x, H.h, H.zw], [x, H.h, hw], [2, 3, 0, 0], [nx, 0, 0]);
+    Q([x, hh, -hw], [x, hh, hw], [x, H.h, hw], [x, H.h, -hw], [2, 3, 0, 0], [nx, 0, 0]);
+  };
+  endWall(H.x0, NOZ.hw + 0.2, NOZ.h + 0.2, 1);
+  endWall(H.x1, COL.hw + 0.2, COL.h + 0.2, -1);
+  // rounded-rectangle duct section (open at the floor): [[z, y], ...]
+  const section = (hw, h, rc, n) => {
+    const p = [[-hw, 0], [-hw, h - rc]];
+    for (let k = 1; k <= 8; k++) { const a = PI - (k * PI) / 16; p.push([-hw + rc + rc * Math.cos(a), h - rc + rc * Math.sin(a)]); }
+    p.push([hw - rc, h]);
+    for (let k = 1; k <= 8; k++) { const a = PI / 2 - (k * PI) / 16; p.push([hw - rc + rc * Math.cos(a), h - rc + rc * Math.sin(a)]); }
+    p.push([hw, 0]);
+    return resample(p, n);
+  };
+  const duct = (stations, tag, inward) => {
+    const rows = stations.map((s) => section(s[1], s[2], s[3], 64).map((q) => [s[0], q[1], q[0]]));
+    const mid = rows.length >> 1;
+    addGrid(m, rows, { tag, ref: [mid, 32, 0, inward ? -1 : 1, 0] });
+  };
+  const sm = (t) => t * t * (3 - 2 * t);
+  // nozzle: contraction, outer shell, bullnose lip
+  { const st = []; for (let k = 0; k <= 16; k++) { const t = k / 16, c = sm(t); st.push([lerp(NOZ.x, NOZ.back, t), lerp(NOZ.hw, NOZ.bhw, c), lerp(NOZ.h, NOZ.bh, c), 0.35]); } duct(st, [5, 1, 0, 0], true);
+    duct([[NOZ.x, NOZ.hw + 0.5, NOZ.h + 0.5, 0.85], [H.x0 - 0.2, NOZ.hw + 0.5, NOZ.h + 0.5, 0.85]], [5, 2, 0, 0], false);
+    addTube(m, section(NOZ.hw + 0.25, NOZ.h + 0.25, 0.6, 96).map((q) => [NOZ.x, q[1], q[0]]), 0.25, 0.25, { tag: [5, 3, 0, 0], sides: 18, side: [1, 0, 0] });
+    Q([NOZ.back, 0, -5.4], [NOZ.back, 0, 5.4], [NOZ.back, 6.2, 5.4], [NOZ.back, 6.2, -5.4], [6, 0, 0, 0], [1, 0, 0]); }
+  // collector: bell mouth, duct, turning vanes
+  { const st = []; for (let k = 0; k <= 10; k++) { const t = k / 10, c = sm(t); st.push([lerp(COL.x, COL.mid, t), lerp(COL.hw, COL.bhw, c), lerp(COL.h, COL.bh, c), 0.35]); }
+    st.push([COL.back, COL.bhw, COL.bh, 0.35]); duct(st, [5, 4, 0, 0], true);
+    duct([[COL.x, COL.hw + 0.5, COL.h + 0.5, 0.85], [H.x1 + 0.2, COL.hw + 0.5, COL.h + 0.5, 0.85]], [5, 2, 0, 0], false);
+    addTube(m, section(COL.hw + 0.25, COL.h + 0.25, 0.6, 96).map((q) => [COL.x, q[1], q[0]]), 0.25, 0.25, { tag: [5, 3, 0, 0], sides: 18, side: [1, 0, 0] });
+    Q([COL.back, 0, -3.6], [COL.back, 0, 3.6], [COL.back, 4.2, 3.6], [COL.back, 4.2, -3.6], [10, 0, 0, 0], [-1, 0, 0]);
+    for (let k = 0; k < 11; k++) { const z0 = -3.2 + k * 0.6; addShell(m, (u, v) => { const a = (u * PI) / 2; return [COL.back - 2.2 + 0.85 * Math.sin(a), v * 3.9, z0 + 0.85 * (1 - Math.cos(a)) - 0.3]; }, 10, 2, 0.03, { tag: [9, 0, 0, 0] }); } }
+  // ceiling light panels and wall light strips
+  for (let r = 0; r < CEIL_ROWS.length; r++) for (let k = 0; k < CEIL_SEG.n; k++) {
+    const xa = CEIL_SEG.x0 + k * (CEIL_SEG.len + CEIL_SEG.gap), xb = xa + CEIL_SEG.len, z = CEIL_ROWS[r], w = CEIL_SEG.hw, y = CEIL_SEG.y;
+    Q([xa, y, z - w], [xb, y, z - w], [xb, y, z + w], [xa, y, z + w], [4, 1, 0, 0], [0, -1, 0]);
+    addBox(m, [(xa + xb) / 2, y + 0.037, z], [CEIL_SEG.len / 2 + 0.03, 0.035, w + 0.035], { tag: [10, 0, 0, 0] });
+  }
+  for (const sg of [1, -1]) for (let k = 0; k < WALL_SEG.n; k++) {
+    const xa = WALL_SEG.x0 + k * (WALL_SEG.len + WALL_SEG.gap), xb = xa + WALL_SEG.len, z = sg * (H.zw - 0.03), y = WALL_SEG.y, hh = WALL_SEG.hh;
+    Q([xa, y - hh, z], [xb, y - hh, z], [xb, y + hh, z], [xa, y + hh, z], [4, 2, 0, 0], [0, 0, -sg]);
+    addBox(m, [(xa + xb) / 2, y, sg * (H.zw - 0.012)], [WALL_SEG.len / 2 + 0.03, hh + 0.035, 0.012], { tag: [10, 0, 0, 0] });
+  }
+  // control room window on the +Z wall
+  { const z = H.zw - 0.04, x0 = -2.6, x1 = 5.4, y0 = 1.2, y1 = 2.8;
+    Q([x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z], [7, 0, 0, 0], [0, 0, -1]);
+    addBox(m, [(x0 + x1) / 2, y0 - 0.05, z], [(x1 - x0) / 2 + 0.1, 0.05, 0.06], { tag: [10, 1, 0, 0] });
+    addBox(m, [(x0 + x1) / 2, y1 + 0.05, z], [(x1 - x0) / 2 + 0.1, 0.05, 0.06], { tag: [10, 1, 0, 0] });
+    for (let k = 0; k <= 4; k++) addBox(m, [lerp(x0, x1, k / 4), (y0 + y1) / 2, z], [k === 0 || k === 4 ? 0.05 : 0.025, (y1 - y0) / 2, 0.06], { tag: [10, 1, 0, 0] }); }
+  // smoke rake: slender struts with one nozzle per stream
+  { const cols = {}; for (const s of SEEDS) { const k = s[0].toFixed(3); (cols[k] = cols[k] || []).push(s[1]); }
+    let zmin = 1e9, zmax = -1e9;
+    for (const k in cols) {
+      const z = +k, top = 1.62; zmin = Math.min(zmin, z); zmax = Math.max(zmax, z);
+      addTube(m, [[RAKE_X, 0, z], [RAKE_X, top * 0.5, z], [RAKE_X, top, z]], 0.026, 0.009, { tag: [8, 0, 0, 0], sides: 12, side: [1, 0, 0] });
+      for (const y of cols[k]) addTube(m, [[RAKE_X - 0.01, y, z], [RAKE_X + 0.08, y, z], [RAKE_X + 0.17, y, z]], 0.0065, 0.0065, { tag: [8, 1, 0, 0], sides: 8, side: [0, 0, 1], capEnd: true, scale: (t) => 1 - 0.35 * t });
+      addBox(m, [RAKE_X, 0.006, z], [0.09, 0.006, 0.05], { tag: [8, 0, 0, 0] });
+    }
+    addTube(m, [[RAKE_X, 1.62, zmin - 0.05], [RAKE_X, 1.62, 0], [RAKE_X, 1.62, zmax + 0.05]], 0.03, 0.012, { tag: [8, 0, 0, 0], sides: 12, side: [1, 0, 0], capStart: true, capEnd: true }); }
+  return m;
+}
+// ------------------------------------------------------------------ lettering atlas (drawn with the 2D canvas API; no image files)
+// All markings are invented test-vehicle stencils: there are no real team, tyre or sponsor marks anywhere.
+const ATLAS = { W: 2048, H: 1024, rects: {} };
+function buildAtlas() {
+  const cv = document.createElement('canvas'); cv.width = ATLAS.W; cv.height = ATLAS.H;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, ATLAS.W, ATLAS.H);
+  g.fillStyle = '#fff'; g.textBaseline = 'middle'; g.textAlign = 'center';
+  const sans = '"Helvetica Neue", Helvetica, Arial, "Segoe UI", sans-serif';
+  const put = (name, x, y, w, h, draw) => {
+    g.save(); g.beginPath(); g.rect(x, y, w, h); g.clip(); g.translate(x, y); draw(w, h); g.restore();
+    ATLAS.rects[name] = [x / ATLAS.W, 1 - (y + h) / ATLAS.H, w / ATLAS.W, h / ATLAS.H];
+  };
+  const fit = (txt, font, w, h, pad, spacing) => {
+    let px = h * 0.9; g.font = font.replace('%', px.toFixed(0));
+    try { g.letterSpacing = (spacing || 0) + 'px'; } catch (e) { /* older engines */ }
+    for (let it = 0; it < 5; it++) { const tw = g.measureText(txt).width; if (tw <= w - pad * 2) break; px *= ((w - pad * 2) / tw) * 0.985; g.font = font.replace('%', px.toFixed(0)); }
+    g.fillText(txt, w / 2, h / 2 + px * 0.04);
+    try { g.letterSpacing = '0px'; } catch (e) { /* ignore */ }
+  };
+  put('num', 0, 0, 640, 512, (w, h) => { g.transform(1, 0, -0.18, 1, 40, 0); fit('07', '900 %px ' + sans, w - 60, h, 30, -8); });
+  put('label', 640, 0, 640, 128, (w, h) => fit('WT–07', '800 %px ' + sans, w, h, 24, 6));
+  put('proto', 640, 128, 1280, 192, (w, h) => { g.transform(1, 0, -0.16, 1, 16, 0); fit('PROTOTYPE', '900 %px ' + sans, w - 30, h, 24, 14); });
+  put('aero', 640, 320, 1280, 128, (w, h) => fit('AERO DEVELOPMENT VEHICLE', '700 %px ' + sans, w, h, 24, 10));
+  put('hall', 0, 512, 1280, 160, (w, h) => fit('TEST SECTION 01', '800 %px ' + sans, w, h, 30, 16));
+  put('flow', 1280, 512, 768, 160, (w, h) => fit('AIRFLOW  ▶▶▶', '800 %px ' + sans, w, h, 30, 12));
+  put('tyre', 0, 704, 2048, 128, (w, h) => fit('RACING SLICK  •  TUNNEL SPEC  •  18 INCH  •', '900 %px ' + sans, w, h, 60, 18));
+  put('caution', 0, 864, 1536, 128, (w, h) => fit('CAUTION — HIGH VELOCITY AIRFLOW', '800 %px ' + sans, w, h, 30, 10));
+  ATLAS.cv = cv;
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+// ------------------------------------------------------------------ the airflow
+// The mean flow is an actual solution: the car is voxelised, and incompressible potential flow is solved around it
+// (with the ground as a symmetry plane). Lifting vortices for the wings and diffuser add the up-wash, a porous
+// "wake body" behind bluff parts slows and displaces the stream, and band-limited turbulence is layered on in the
+// wake when the smoke is advected.
+const FLOW = { U: 12.0, h: 1 / 240, dx: 0.04, nx: 224, ny: 48, nz: 88, x0: -4.2, y0: 0, z0: -1.76, wakeK: 0.5, ti0: 0.004, ti1: 0.3 };
+const WAKE = { dx: 0.1, nx: 184, ny: 32, nz: 48, x0: -4.2, y0: 0, z0: -2.4 };
+const VORT_CORE2 = 0.09 * 0.09;
+// horseshoe vortices (and their mirror images below the floor). g is circulation / U.
+const VORT = (() => {
+  const segs = [];
+  const shoe = (x, y, b, g, rise, spread) => {
+    const A = [x, y, -b], B = [x, y, b], xe = 45, Ae = [xe, y + rise, -b * spread], Be = [xe, y + rise, b * spread];
+    for (const [p, q] of [[Ae, A], [A, B], [B, Be]]) { segs.push({ a: p, b: q, g }); segs.push({ a: [p[0], -p[1], p[2]], b: [q[0], -q[1], q[2]], g: -g }); }
+  };
+  shoe(2.5, 0.87, 0.47, 0.5, 2.6, 1.15);     // rear wing
+  shoe(2.25, 0.2, 0.44, 0.28, 1.6, 1.3);     // diffuser
+  shoe(-2.5, 0.17, 0.9, 0.28, 0.2, 1.0);     // front wing
+  for (const s of segs) { s.r0 = V.sub(s.b, s.a); s.l2 = V.dot(s.r0, s.r0); s.k = s.g / (4 * PI); }
+  return segs;
+})();
+function vortexVel(px, py, pz, out) {
+  let vx = 0, vy = 0, vz = 0;
+  for (let n = 0; n < VORT.length; n++) {
+    const s = VORT[n], a = s.a, b = s.b, r0 = s.r0;
+    const r1x = px - a[0], r1y = py - a[1], r1z = pz - a[2], r2x = px - b[0], r2y = py - b[1], r2z = pz - b[2];
+    const cx = r1y * r2z - r1z * r2y, cy = r1z * r2x - r1x * r2z, cz = r1x * r2y - r1y * r2x;
+    const c2 = cx * cx + cy * cy + cz * cz + VORT_CORE2 * s.l2;
+    const l1 = Math.sqrt(r1x * r1x + r1y * r1y + r1z * r1z) + 1e-9, l2 = Math.sqrt(r2x * r2x + r2y * r2y + r2z * r2z) + 1e-9;
+    const k = (s.k * ((r0[0] * r1x + r0[1] * r1y + r0[2] * r1z) / l1 - (r0[0] * r2x + r0[1] * r2y + r0[2] * r2z) / l2)) / c2;
+    vx += cx * k; vy += cy * k; vz += cz * k;
+  }
+  out[0] = vx; out[1] = vy; out[2] = vz;
+}
+
+// one multigrid-style level: solve div(beta * (vbase + grad phi)) = 0 with SOR. Arrays carry a one-cell border.
+function makeLevel(nx, ny, nz, dx, beta, bx, by, bz) {
+  const px = nx + 2, py = ny + 2, pxy = px * py, N = pxy * (nz + 2);
+  const L = { nx, ny, nz, dx, px, py, pxy, phi: new Float32Array(N), wx: new Float32Array(N), wy: new Float32Array(N), wz: new Float32Array(N), fx: new Float32Array(N), fy: new Float32Array(N), fz: new Float32Array(N), inv: new Float32Array(N), rhs: new Float32Array(N) };
+  const B = (i, j, k) => (i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz ? -1 : (k * ny + j) * nx + i);
+  const hm = (a, b) => (a + b > 1e-6 ? (2 * a * b) / (a + b) : 0);
+  // face weights/velocities stored on the lower cell of each face (padded indexing)
+  for (let k = -1; k < nz; k++) for (let j = -1; j < ny; j++) for (let i = -1; i < nx; i++) {
+    const c = ((k + 1) * py + (j + 1)) * px + (i + 1), s = B(i, j, k);
+    if (j >= 0 && k >= 0) { const e = B(i + 1, j, k); if (s >= 0 && e >= 0) { L.wx[c] = hm(beta[s], beta[e]); L.fx[c] = 0.5 * (bx[s] + bx[e]); } else if (s >= 0) { L.wx[c] = beta[s]; L.fx[c] = bx[s]; } else if (e >= 0) { L.wx[c] = beta[e]; L.fx[c] = bx[e]; } }
+    if (i >= 0 && k >= 0) { const e = B(i, j + 1, k); if (s >= 0 && e >= 0) { L.wy[c] = hm(beta[s], beta[e]); L.fy[c] = 0.5 * (by[s] + by[e]); } else if (s >= 0) { L.wy[c] = beta[s]; L.fy[c] = by[s]; } /* the floor face stays closed */ }
+    if (i >= 0 && j >= 0) { const e = B(i, j, k + 1); if (s >= 0 && e >= 0) { L.wz[c] = hm(beta[s], beta[e]); L.fz[c] = 0.5 * (bz[s] + bz[e]); } else if (s >= 0) { L.wz[c] = beta[s]; L.fz[c] = bz[s]; } else if (e >= 0) { L.wz[c] = beta[e]; L.fz[c] = bz[e]; } }
+  }
+  for (let k = 1; k <= nz; k++) for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) {
+    const c = (k * py + j) * px + i, sum = L.wx[c] + L.wx[c - 1] + L.wy[c] + L.wy[c - px] + L.wz[c] + L.wz[c - pxy];
+    L.inv[c] = sum > 1e-5 ? 1 / sum : 0;
+    L.rhs[c] = dx * (L.wx[c] * L.fx[c] - L.wx[c - 1] * L.fx[c - 1] + L.wy[c] * L.fy[c] - L.wy[c - px] * L.fy[c - px] + L.wz[c] * L.fz[c] - L.wz[c - pxy] * L.fz[c - pxy]);
+  }
+  return L;
+}
+function relax(L, iters, omega) {
+  const { nx, ny, nz, px, py, pxy, phi, wx, wy, wz, inv, rhs } = L;
+  for (let it = 0; it < iters; it++) {
+    if ((it & 1) === 0) {
+      for (let k = 1; k <= nz; k++) for (let j = 1; j <= ny; j++) { let c = (k * py + j) * px + 1; for (let i = 1; i <= nx; i++, c++) { const iv = inv[c]; if (iv === 0) continue; const v = (wx[c] * phi[c + 1] + wx[c - 1] * phi[c - 1] + wy[c] * phi[c + px] + wy[c - px] * phi[c - px] + wz[c] * phi[c + pxy] + wz[c - pxy] * phi[c - pxy] + rhs[c]) * iv; phi[c] += omega * (v - phi[c]); } }
+    } else {
+      for (let k = nz; k >= 1; k--) for (let j = ny; j >= 1; j--) { let c = (k * py + j) * px + nx; for (let i = nx; i >= 1; i--, c--) { const iv = inv[c]; if (iv === 0) continue; const v = (wx[c] * phi[c + 1] + wx[c - 1] * phi[c - 1] + wy[c] * phi[c + px] + wy[c - px] * phi[c - px] + wz[c] * phi[c + pxy] + wz[c - pxy] * phi[c - pxy] + rhs[c]) * iv; phi[c] += omega * (v - phi[c]); } }
+    }
+  }
+}
+function restrict2(a, nx, ny, nz) {
+  const mx = nx >> 1, my = ny >> 1, mz = nz >> 1, o = new Float32Array(mx * my * mz);
+  for (let k = 0; k < mz; k++) for (let j = 0; j < my; j++) for (let i = 0; i < mx; i++) {
+    let s = 0;
+    for (let c = 0; c < 8; c++) s += a[((2 * k + (c >> 2)) * ny + 2 * j + ((c >> 1) & 1)) * nx + 2 * i + (c & 1)];
+    o[(k * my + j) * mx + i] = s * 0.125;
+  }
+  return o;
+}
+function prolong(C, F) {
+  const cp = (i, j, k) => C.phi[((clamp(k, 0, C.nz - 1) + 1) * C.py + clamp(j, 0, C.ny - 1) + 1) * C.px + clamp(i, 0, C.nx - 1) + 1];
+  for (let k = 0; k < F.nz; k++) for (let j = 0; j < F.ny; j++) for (let i = 0; i < F.nx; i++) {
+    const x = (i + 0.5) / 2 - 0.5, y = (j + 0.5) / 2 - 0.5, z = (k + 0.5) / 2 - 0.5, i0 = Math.floor(x), j0 = Math.floor(y), k0 = Math.floor(z), tx = x - i0, ty = y - j0, tz = z - k0;
+    const a = lerp(lerp(cp(i0, j0, k0), cp(i0 + 1, j0, k0), tx), lerp(cp(i0, j0 + 1, k0), cp(i0 + 1, j0 + 1, k0), tx), ty);
+    const b = lerp(lerp(cp(i0, j0, k0 + 1), cp(i0 + 1, j0, k0 + 1), tx), lerp(cp(i0, j0 + 1, k0 + 1), cp(i0 + 1, j0 + 1, k0 + 1), tx), ty);
+    F.phi[((k + 1) * F.py + j + 1) * F.px + i + 1] = lerp(a, b, tz);
+  }
+}
+
+async function setupFlow(step) {
+  const T0 = performance.now();
+  const { nx, ny, nz, dx, x0, y0, z0 } = FLOW, sxy = nx * ny, n3 = sxy * nz;
+  const solid = new Uint8Array(n3);
+  // ---------- voxelise every surface of the car
+  const mark = (x, y, z) => { const i = Math.floor((x - x0) / dx), j = Math.floor((y - y0) / dx), k = Math.floor((z - z0) / dx); if (i >= 0 && i < nx && j >= 0 && j < ny && k >= 0 && k < nz) solid[(k * ny + j) * nx + i] = 1; };
+  for (const it of S.items) {
+    const m = S.car.meshes[it.name], Pm = m.p, I = m.i, M = it.model, nvv = m.nv, W = new Float32Array(nvv * 3);
+    for (let v = 0; v < nvv; v++) { const x = Pm[v * 3], y = Pm[v * 3 + 1], z = Pm[v * 3 + 2]; W[v * 3] = M[0] * x + M[4] * y + M[8] * z + M[12]; W[v * 3 + 1] = M[1] * x + M[5] * y + M[9] * z + M[13]; W[v * 3 + 2] = M[2] * x + M[6] * y + M[10] * z + M[14]; }
+    for (let t = 0; t < I.length; t += 3) {
+      const a = I[t] * 3, b = I[t + 1] * 3, c = I[t + 2] * 3, ax = W[a], ay = W[a + 1], az = W[a + 2], bx = W[b], by = W[b + 1], bz = W[b + 2], cx = W[c], cy = W[c + 1], cz = W[c + 2];
+      const e = Math.max(Math.abs(bx - ax), Math.abs(by - ay), Math.abs(bz - az), Math.abs(cx - ax), Math.abs(cy - ay), Math.abs(cz - az), Math.abs(cx - bx), Math.abs(cy - by), Math.abs(cz - bz));
+      const n = Math.max(1, Math.ceil(e / (dx * 0.45)));
+      for (let u = 0; u <= n; u++) for (let v = 0; v <= n - u; v++) { const s = u / n, tt = v / n, w = 1 - s - tt; mark(ax * w + bx * s + cx * tt, ay * w + by * s + cy * tt, az * w + bz * s + cz * tt); }
+    }
+  }
+  // plug the openings air would otherwise stall in (cockpit, sidepod inlets) and the sliver under the floor
+  const box = (xa, xb, ya, yb, za, zb) => { for (let k = Math.max(0, Math.floor((za - z0) / dx)); k <= Math.min(nz - 1, Math.floor((zb - z0) / dx)); k++) for (let j = Math.max(0, Math.floor((ya - y0) / dx)); j <= Math.min(ny - 1, Math.floor((yb - y0) / dx)); j++) for (let i = Math.max(0, Math.floor((xa - x0) / dx)); i <= Math.min(nx - 1, Math.floor((xb - x0) / dx)); i++) solid[(k * ny + j) * nx + i] = 1; };
+  box(-0.98, -0.12, 0.42, 0.7, -0.19, 0.19); box(-0.44, -0.2, 0.33, 0.55, 0.31, 0.68); box(-0.44, -0.2, 0.33, 0.55, -0.68, -0.31);
+  for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) { let j0 = -1; for (let j = 0; j < ny; j++) if (solid[(k * ny + j) * nx + i]) { j0 = j; break; } if (j0 > 0 && (j0 + 0.5) * dx < 0.11) for (let j = 0; j < j0; j++) solid[(k * ny + j) * nx + i] = 1; }
+  // everything not reachable from outside is interior
+  { const seen = new Uint8Array(n3), q = new Int32Array(n3); let qh = 0, qt = 0;
+    const push = (c) => { if (!seen[c] && !solid[c]) { seen[c] = 1; q[qt++] = c; } };
+    for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) { push((k * ny + j) * nx); push((k * ny + j) * nx + nx - 1); }
+    for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) push((k * ny + ny - 1) * nx + i);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { push(j * nx + i); push(((nz - 1) * ny + j) * nx + i); }
+    while (qh < qt) { const c = q[qh++], i = c % nx, j = ((c / nx) | 0) % ny, k = (c / sxy) | 0; if (i > 0) push(c - 1); if (i < nx - 1) push(c + 1); if (j > 0) push(c - nx); if (j < ny - 1) push(c + nx); if (k > 0) push(c - sxy); if (k < nz - 1) push(c + sxy); }
+    for (let c = 0; c < n3; c++) if (!seen[c]) solid[c] = 1; }
+  await step('Solving the airflow', 49);
+  // ---------- porosity: an anti-aliased boundary from the blurred occupancy, so sloped surfaces do not act as staircases
+  const occ = new Float32Array(n3), tmpO = new Float32Array(n3);
+  for (let c = 0; c < n3; c++) occ[c] = solid[c];
+  const blurAxis = (src, dst, stride, len, lines, mirrorLow) => {
+    for (let l = 0; l < lines.length; l++) {
+      const base = lines[l];
+      for (let q = 0; q < len; q++) {
+        const c = base + q * stride, lo = q > 0 ? src[c - stride] : (mirrorLow ? src[c] : 0), hi = q < len - 1 ? src[c + stride] : 0;
+        dst[c] = 0.25 * lo + 0.5 * src[c] + 0.25 * hi;
+      }
+    }
+  };
+  const linesX = [], linesY = [], linesZ = [];
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) linesX.push((k * ny + j) * nx);
+  for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) linesY.push(k * sxy + i);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) linesZ.push(j * nx + i);
+  for (let pass = 0; pass < 2; pass++) { blurAxis(occ, tmpO, 1, nx, linesX, false); blurAxis(tmpO, occ, nx, ny, linesY, true); blurAxis(occ, tmpO, sxy, nz, linesZ, false); occ.set(tmpO); }
+  const betaS = new Float32Array(n3);
+  for (let c = 0; c < n3; c++) betaS[c] = solid[c] ? 0 : 1 - smoothstep(0.05, 0.5, occ[c]);
+  // ---------- wake field on a coarse grid: released behind bluff parts, convected, diffused, decaying
+  const W = WAKE, wyz = W.ny * W.nz, wake = new Float32Array(W.nx * wyz);
+  { const frac = (I, J, K) => { let s = 0; for (let c = 0; c < 8; c++) { const x = W.x0 + (I + 0.25 + 0.5 * (c & 1)) * W.dx, y = W.y0 + (J + 0.25 + 0.5 * ((c >> 1) & 1)) * W.dx, z = W.z0 + (K + 0.25 + 0.5 * (c >> 2)) * W.dx; const i = Math.floor((x - x0) / dx), j = Math.floor((y - y0) / dx), k = Math.floor((z - z0) / dx); if (i >= 0 && i < nx && j >= 0 && j < ny && k >= 0 && k < nz) s += solid[(k * ny + j) * nx + i]; } return s * 0.125; };
+    let prev = new Float32Array(wyz), cur = new Float32Array(wyz), tmp = new Float32Array(wyz), sPrev = new Float32Array(wyz), sCur = new Float32Array(wyz);
+    const vv = [0, 0, 0], decay = Math.exp(-W.dx / 7.5), hny = W.ny >> 1, cfy = new Float32Array(hny * (W.nz >> 1)), cfz = new Float32Array(hny * (W.nz >> 1));
+    const at = (a, J, K) => a[clamp(K, 0, W.nz - 1) * W.ny + clamp(J < 0 ? -J - 1 : J, 0, W.ny - 1)];
+    for (let I = 0; I < W.nx; I++) {
+      const x = W.x0 + (I + 0.5) * W.dx;
+      for (let K = 0; K < W.nz; K++) for (let J = 0; J < W.ny; J++) sCur[K * W.ny + J] = frac(I, J, K);
+      // cross-flow induced by the trailing vortices (evaluated on every other cell)
+      for (let K = 0; K < W.nz; K += 2) for (let J = 0; J < W.ny; J += 2) { vortexVel(x, W.y0 + (J + 1) * W.dx, W.z0 + (K + 1) * W.dx, vv); const o = (K >> 1) * hny + (J >> 1); cfy[o] = clamp(vv[1], -0.9, 0.9); cfz[o] = clamp(vv[2], -0.9, 0.9); }
+      for (let K = 0; K < W.nz; K++) for (let J = 0; J < W.ny; J++) {
+        const o = (K >> 1) * hny + (J >> 1), fy = J - cfy[o], fz = K - cfz[o], j0 = Math.floor(fy), k0 = Math.floor(fz), ty = fy - j0, tz = fz - k0;
+        tmp[K * W.ny + J] = lerp(lerp(at(prev, j0, k0), at(prev, j0 + 1, k0), ty), lerp(at(prev, j0, k0 + 1), at(prev, j0 + 1, k0 + 1), ty), tz);
+      }
+      for (let K = 0; K < W.nz; K++) for (let J = 0; J < W.ny; J++) {
+        const b = (4 * at(tmp, J, K) + 2 * (at(tmp, J - 1, K) + at(tmp, J + 1, K) + at(tmp, J, K - 1) + at(tmp, J, K + 1)) + at(tmp, J - 1, K - 1) + at(tmp, J + 1, K - 1) + at(tmp, J - 1, K + 1) + at(tmp, J + 1, K + 1)) / 16;
+        // bluff bodies shed a wake: the tyres and the back of the car strongly, the streamlined middle only faintly
+        const zc = Math.abs(W.z0 + (K + 0.5) * W.dx), shed = Math.max(0.12, smoothstep(1.25, 2.0, x), smoothstep(0.5, 0.62, zc));
+        const c = K * W.ny + J, s = sCur[c], src = smoothstep(0.22, 0.8, sPrev[c] - s) * shed;
+        cur[c] = Math.max(lerp(tmp[c], b, 0.5) * decay, src) * (1 - smoothstep(0.35, 0.9, s));
+        wake[(K * W.ny + J) * W.nx + I] = smoothstep(0.03, 0.65, cur[c]);
+      }
+      let t = prev; prev = cur; cur = t; t = sPrev; sPrev = sCur; sCur = t;
+    } }
+  const wakeAt = (x, y, z) => {
+    const fx = (x - W.x0) / W.dx - 0.5, fy = (y - W.y0) / W.dx - 0.5, fz = (z - W.z0) / W.dx - 0.5;
+    const i0 = Math.floor(fx), j0 = Math.floor(fy), k0 = Math.floor(fz), tx = fx - i0, ty = fy - j0, tz = fz - k0;
+    const g = (i, j, k) => wake[(clamp(k, 0, W.nz - 1) * W.ny + clamp(j, 0, W.ny - 1)) * W.nx + clamp(i, 0, W.nx - 1)];
+    return lerp(lerp(lerp(g(i0, j0, k0), g(i0 + 1, j0, k0), tx), lerp(g(i0, j0 + 1, k0), g(i0 + 1, j0 + 1, k0), tx), ty), lerp(lerp(g(i0, j0, k0 + 1), g(i0 + 1, j0, k0 + 1), tx), lerp(g(i0, j0 + 1, k0 + 1), g(i0 + 1, j0 + 1, k0 + 1), tx), ty), tz);
+  };
+  await step('Solving the airflow', 52);
+  // ---------- base flow (free stream + vortices), sampled on a half-resolution lattice and interpolated
+  const hx = (nx >> 1) + 1, hy = (ny >> 1) + 1, hz = (nz >> 1) + 1, hb = new Float32Array(hx * hy * hz * 3), vv = [0, 0, 0];
+  for (let k = 0; k < hz; k++) for (let j = 0; j < hy; j++) for (let i = 0; i < hx; i++) { vortexVel(x0 + i * 2 * dx, y0 + j * 2 * dx, z0 + k * 2 * dx, vv); const o = ((k * hy + j) * hx + i) * 3; hb[o] = vv[0]; hb[o + 1] = vv[1]; hb[o + 2] = vv[2]; }
+  const beta = new Float32Array(n3), bx = new Float32Array(n3), by = new Float32Array(n3), bz = new Float32Array(n3);
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const c = (k * ny + j) * nx + i, fx = (i + 0.5) / 2, fy = (j + 0.5) / 2, fz = (k + 0.5) / 2, i0 = Math.floor(fx), j0 = Math.floor(fy), k0 = Math.floor(fz), tx = fx - i0, ty = fy - j0, tz = fz - k0;
+    const o = ((k0 * hy + j0) * hx + i0) * 3, dxo = 3, dyo = hx * 3, dzo = hx * hy * 3;
+    for (let a = 0; a < 3; a++) {
+      const v = lerp(lerp(lerp(hb[o + a], hb[o + dxo + a], tx), lerp(hb[o + dyo + a], hb[o + dyo + dxo + a], tx), ty), lerp(lerp(hb[o + dzo + a], hb[o + dzo + dxo + a], tx), lerp(hb[o + dzo + dyo + a], hb[o + dzo + dyo + dxo + a], tx), ty), tz);
+      if (a === 0) bx[c] = 1 + v; else if (a === 1) by[c] = v; else bz[c] = v;
+    }
+    beta[c] = betaS[c] * (1 - FLOW.wakeK * wakeAt(x0 + (i + 0.5) * dx, y0 + (j + 0.5) * dx, z0 + (k + 0.5) * dx));
+  }
+  await step('Solving the airflow', 54);
+  // ---------- coarse-to-fine potential solve
+  const b1 = restrict2(beta, nx, ny, nz), bx1 = restrict2(bx, nx, ny, nz), by1 = restrict2(by, nx, ny, nz), bz1 = restrict2(bz, nx, ny, nz);
+  const n1x = nx >> 1, n1y = ny >> 1, n1z = nz >> 1;
+  const L2 = makeLevel(n1x >> 1, n1y >> 1, n1z >> 1, dx * 4, restrict2(b1, n1x, n1y, n1z), restrict2(bx1, n1x, n1y, n1z), restrict2(by1, n1x, n1y, n1z), restrict2(bz1, n1x, n1y, n1z));
+  relax(L2, 260, 1.72);
+  const L1 = makeLevel(n1x, n1y, n1z, dx * 2, b1, bx1, by1, bz1);
+  prolong(L2, L1); relax(L1, 110, 1.7);
+  await step('Solving the airflow', 56);
+  const L0 = makeLevel(nx, ny, nz, dx, beta, bx, by, bz);
+  prolong(L1, L0); relax(L0, 24, 1.62);
+  await step('Solving the airflow', 58);
+  relax(L0, 24, 1.55);
+  // ---------- cell-centred velocity (flux form, so the field stays solenoidal) -> 3D texture
+  const vel = new Float32Array(n3 * 4), { px, py, pxy, phi, wx, wy, wz, fx: ffx, fy: ffy, fz: ffz } = L0, idx = 1 / dx;
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const c = ((k + 1) * py + j + 1) * px + i + 1, o = ((k * ny + j) * nx + i) * 4;
+    vel[o] = 0.5 * (wx[c] * (ffx[c] + (phi[c + 1] - phi[c]) * idx) + wx[c - 1] * (ffx[c - 1] + (phi[c] - phi[c - 1]) * idx));
+    vel[o + 1] = 0.5 * (wy[c] * (ffy[c] + (phi[c + px] - phi[c]) * idx) + wy[c - px] * (ffy[c - px] + (phi[c] - phi[c - px]) * idx));
+    vel[o + 2] = 0.5 * (wz[c] * (ffz[c] + (phi[c + pxy] - phi[c]) * idx) + wz[c - pxy] * (ffz[c - pxy] + (phi[c] - phi[c - pxy]) * idx));
+    vel[o + 3] = betaS[(k * ny + j) * nx + i];
+  }
+  FLOW.velTex = tex3D(nx, ny, nz, gl.RGBA16F, gl.RGBA, gl.FLOAT, vel, gl.LINEAR);
+  FLOW.wakeTex = tex3D(W.nx, W.ny, W.nz, gl.R16F, gl.RED, gl.FLOAT, wake, gl.LINEAR);
+  FLOW.debug = { solid, vel, wake, beta, ms: performance.now() - T0 };
+  if (typeof setupSmoke === 'function') setupSmoke();
+}
+// ------------------------------------------------------------------ GLSL: shared chunks
+const f3 = (x) => x.toFixed(4);
+const ENV_LEVELS = 7;                 // prefiltered reflection cube: mip i holds roughness i / 6
+const BAKE_W = 512, BAKE_H = 512;     // per-vertex lighting atlas (one texel per car vertex)
+
+const GLSL_NOISE = `
+float hash11(float p){ p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+float hash21(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float hash31(vec3 p3){ p3 = fract(p3 * 0.1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x), mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y); }
+float vnoise3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  float a = mix(mix(hash31(i), hash31(i + vec3(1, 0, 0)), f.x), mix(hash31(i + vec3(0, 1, 0)), hash31(i + vec3(1, 1, 0)), f.x), f.y);
+  float b = mix(mix(hash31(i + vec3(0, 0, 1)), hash31(i + vec3(1, 0, 1)), f.x), mix(hash31(i + vec3(0, 1, 1)), hash31(i + vec3(1, 1, 1)), f.x), f.y);
+  return mix(a, b, f.z); }
+float fbm2(vec2 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++){ s += a * vnoise(p); p = p * 2.03 + 17.13; a *= 0.5; } return s; }
+// antialiased line of half-width w around d = 0
+float lineAA(float d, float w){ float a = max(fwidth(d), 1e-6); return sat((w - abs(d)) / a + 0.5) * min(1.0, 2.0 * w / a + 0.15); }
+`;
+
+const GLSL_ENV = `
+uniform samplerCube uEnv; uniform vec3 uBoxMin, uBoxMax, uProbe;
+// prefiltered, box-projected environment lookup (the hall is a box, so reflections get correct parallax)
+vec3 envSample(vec3 P, vec3 R, float rough){
+  vec3 Rs = mix(R, vec3(1e-5), lessThan(abs(R), vec3(1e-5)));
+  vec3 tm = max((uBoxMax - P) / Rs, (uBoxMin - P) / Rs);
+  float t = max(min(tm.x, min(tm.y, tm.z)), 0.0);
+  return textureLod(uEnv, P + R * t - uProbe, rough * ${f3(ENV_LEVELS - 1)}).rgb;
+}
+vec2 envBRDF(float rough, float NoV){
+  vec4 r = rough * vec4(-1.0, -0.0275, -0.572, 0.022) + vec4(1.0, 0.0425, 1.04, -0.04);
+  float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+  return vec2(-1.04, 1.04) * a004 + r.zw;
+}
+`;
+
+
+const SEG_CEIL_PERIOD = CEIL_SEG.len + CEIL_SEG.gap, SEG_WALL_PERIOD = WALL_SEG.len + WALL_SEG.gap;
+const GLSL_PANELS = `
+// box filter of a box: how much of an emitter of half-width hw a blur of half-width w sees at offset d
+float boxCov(float d, float hw, float w){ return sat((min(d + w, hw) - max(d - w, -hw)) / (2.0 * w)); }
+float segCov(float x, float x0, float len, float period, float n, float w){
+  float i = clamp(floor((x - x0) / period), 0.0, n - 1.0), c = x0 + i * period + 0.5 * len;
+  return boxCov(x - c, 0.5 * len, w);
+}
+// Mirror-like lobes: the light banks are intersected analytically so their reflections stay crisp at any zoom;
+// the prefiltered cube map supplies the rest of the hall.
+vec3 glossRefl(vec3 P, vec3 R, float rough){
+  vec3 col = envSample(P, R, rough);
+  float spread = rough * rough * 2.4 + 0.0012;
+  if (R.y > 0.03) {
+    float t = (${f3(CEIL_SEG.y)} - P.y) / R.y; vec3 H = P + R * t;
+    float w = t * spread, wz = max(w / max(R.y, 0.25), fwidth(H.z) * 0.7), wx = max(w, fwidth(H.x) * 0.7);
+    float rz = clamp(round(H.z / ${f3(CEIL_PITCH)}), -${f3((CEIL_ROWS.length - 1) / 2)}, ${f3((CEIL_ROWS.length - 1) / 2)}) * ${f3(CEIL_PITCH)}, dz = H.z - rz;
+    float cov = boxCov(dz, ${f3(CEIL_SEG.hw)}, wz) * segCov(H.x, ${f3(CEIL_SEG.x0)}, ${f3(CEIL_SEG.len)}, ${f3(SEG_CEIL_PERIOD)}, ${f3(CEIL_SEG.n)}, wx);
+    col = mix(col, vec3(${LIGHT_CEIL.map(f3).join(',')}) * (1.0 - 0.16 * sat(dz * dz / ${f3(CEIL_SEG.hw * CEIL_SEG.hw)})), cov);
+  }
+  float sz = sign(R.z);
+  if (abs(R.z) > 0.03) {
+    float t = (sz * ${f3(HALL.zw - 0.03)} - P.z) / R.z; vec3 H = P + R * t;
+    float w = t * spread, wy = max(w, fwidth(H.y) * 0.7), wx = max(w / max(abs(R.z), 0.25), fwidth(H.x) * 0.7);
+    float cov = boxCov(H.y - ${f3(WALL_SEG.y)}, ${f3(WALL_SEG.hh)}, wy) * segCov(H.x, ${f3(WALL_SEG.x0)}, ${f3(WALL_SEG.len)}, ${f3(SEG_WALL_PERIOD)}, ${f3(WALL_SEG.n)}, wx);
+    col = mix(col, vec3(${LIGHT_WALL.map(f3).join(',')}), cov);
+  }
+  return col;
+}
+`;
+
+const NL = RECT_LIGHTS.length;
+const GLSL_RECT = `
+#define NL ${NL}
+uniform vec3 uLC[NL]; uniform vec3 uLU[NL]; uniform vec3 uLV[NL]; uniform vec3 uLCol[NL];
+vec3 edgeI(vec3 a, vec3 b){ float c = clamp(dot(a, b), -0.9999, 0.9999); return cross(a, b) * (acos(c) * inversesqrt(1.0 - c * c)); }
+// exact form factor of a rectangular emitter seen from P with normal N (no horizon clipping)
+float rectFF(vec3 P, vec3 N, vec3 c, vec3 hu, vec3 hv){
+  if (dot(cross(hu, hv), P - c) <= 0.0) return 0.0;
+  vec3 p0 = normalize(c - hu - hv - P), p1 = normalize(c + hu - hv - P), p2 = normalize(c + hu + hv - P), p3 = normalize(c - hu + hv - P);
+  vec3 F = edgeI(p0, p1) + edgeI(p1, p2) + edgeI(p2, p3) + edgeI(p3, p0);
+  return max(-dot(F, N), 0.0) / TAU;
+}
+`;
+
+// ------------------------------------------------------------------ GLSL: tunnel
+const VS_TUNNEL = `
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor; layout(location=2) in vec4 aTag;
+uniform mat4 uVP; out vec3 vW; out vec3 vN; out vec4 vTag;
+void main(){ vW = aPos; vN = aNor; vTag = aTag; gl_Position = uVP * vec4(aPos, 1.0); }`;
+
+const FS_TUNNEL = `
+in vec3 vW; in vec3 vN; in vec4 vTag;
+uniform vec3 uEye; uniform float uBelt; uniform int uPass; uniform float uEmis;
+uniform sampler2D uLM; uniform vec4 uLMRect; uniform sampler2D uRefl; uniform vec2 uInvRes; uniform vec2 uReflPx; uniform float uFocal;
+uniform sampler2D uAtlas; uniform vec4 uRHall, uRFlow, uRCaution;
+uniform vec3 uFogCol; uniform float uFogDen; uniform vec3 uAmb;
+out vec4 oCol;
+${GLSL_NOISE}${GLSL_ENV}${GLSL_RECT}
+#define NOZ_X ${f3(NOZ.x)}
+#define COL_X ${f3(COL.x)}
+#define BX0 ${f3(BELT.x0)}
+#define BX1 ${f3(BELT.x1)}
+#define BHW ${f3(BELT.hw)}
+float decal(vec4 r, vec2 uv){ if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0; return texture(uAtlas, r.xy + uv * r.zw).r; }
+float sdBox2(vec2 p, vec2 b){ vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
+void main(){
+  vec3 P = vW, N = normalize(vN), Vd = uEye - P; float dist = length(Vd); vec3 V = Vd / dist;
+  int id = int(vTag.x + 0.5);
+  if (uPass == 2 && id == 0) discard;
+  vec3 alb = vec3(0.05), F0 = vec3(0.04), emis = vec3(0.0); float rough = 0.5, lmv = 1.0, glow = 0.0;
+  if (id == 0) {
+    // ---------------- floor
+    float n1 = fbm2(P.xz * 0.6), n2 = fbm2(P.xz * 7.0 + 31.0);
+    alb = vec3(0.105, 0.108, 0.114) * (0.78 + 0.44 * n1); rough = 0.3 + 0.2 * n2; F0 = vec3(0.045);
+    vec2 g = (fract(P.xz / 2.4 + 0.5) - 0.5) * 2.4; float seam = max(lineAA(g.x, 0.004), lineAA(g.y, 0.004));
+    alb *= 1.0 - 0.65 * seam; rough = mix(rough, 0.85, seam);
+    float turn = lineAA(length(P.xz - vec2(0.6, 0.0)) - 5.75, 0.006); alb *= 1.0 - 0.7 * turn; rough = mix(rough, 0.85, turn);
+    vec2 bc = P.xz - vec2(0.5 * (BX0 + BX1), 0.0); vec2 bh = vec2(0.5 * (BX1 - BX0), BHW);
+    float db = sdBox2(bc, bh);
+    // painted keep-out line around the belt, scuffed
+    float yl = lineAA(sdBox2(bc, bh + vec2(0.42, 0.32)), 0.035) * smoothstep(0.25, 0.6, fbm2(P.xz * 3.0 + 9.0) + 0.25);
+    alb = mix(alb, vec3(0.62, 0.43, 0.03), yl * 0.85); rough = mix(rough, 0.55, yl);
+    float tx = decal(uRFlow, vec2((P.x + 3.4) / 3.3, (3.25 - P.z) / 0.66));
+    alb = mix(alb, vec3(0.5, 0.5, 0.48), sat(tx) * 0.55 * smoothstep(0.2, 0.55, fbm2(P.xz * 4.0) + 0.2));
+    if (db < 0.06) {
+      // steel trim and end plates around the belt
+      alb = vec3(0.16, 0.165, 0.17); F0 = vec3(0.5); rough = 0.3 + 0.15 * vnoise(P.xz * vec2(4.0, 300.0));
+      float gap = lineAA(db, 0.004); alb *= 1.0 - 0.9 * gap; F0 *= 1.0 - 0.9 * gap;
+    }
+    if (db < 0.0) {
+      // the moving belt: a satin band with long polishing streaks that travel with the surface
+      float xb = P.x - uBelt;
+      float st = fbm2(vec2(P.z * 55.0, xb * 0.16)), st2 = vnoise(vec2(P.z * 380.0, xb * 0.5)), cloud = fbm2(vec2(P.z * 1.7, xb * 0.11));
+      alb = vec3(0.034, 0.035, 0.038) * (0.7 + 0.5 * st + 0.25 * cloud); F0 = vec3(0.075);
+      rough = 0.12 + 0.11 * st + 0.04 * st2 + 0.07 * cloud;
+      float q = mod(xb + P.z * 0.5, 19.6) - 9.8; float sp = exp(-q * q / 0.0018);
+      alb *= 1.0 + 1.6 * sp; rough += 0.25 * sp;
+      float wear = exp(-pow((abs(P.z) - 0.82) / 0.2, 2.0)); rough -= 0.05 * wear; alb *= 1.0 - 0.15 * wear;
+    }
+    // perforated suction plate ahead of the belt
+    if (P.x > BX0 - 1.05 && P.x < BX0 - 0.12 && abs(P.z) < 1.3) {
+      vec2 h = fract(P.xz / 0.03) - 0.5; float holes = 1.0 - smoothstep(0.2, 0.3, length(h)); float fade = sat(1.0 - fwidth(P.x / 0.03) * 1.5);
+      alb = vec3(0.11, 0.115, 0.12) * (1.0 - 0.75 * holes * fade) * (1.0 - 0.3 * (1.0 - fade)); F0 = vec3(0.35); rough = 0.38;
+      float fr = lineAA(sdBox2(P.xz - vec2(BX0 - 0.585, 0.0), vec2(0.465, 1.3)), 0.006); alb *= 1.0 - 0.8 * fr;
+    }
+    if (P.x < NOZ_X || P.x > COL_X) { alb = vec3(0.11, 0.115, 0.12) * (0.85 + 0.3 * n1); rough = 0.45; F0 = vec3(0.04); }
+    vec2 lu = (P.xz - uLMRect.xy) / uLMRect.zw;
+    if (uPass != 1 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) { vec2 lm = texture(uLM, lu).rg; lmv = lm.g > 1e-7 ? sat(lm.r / lm.g) : 1.0; }
+  } else if (id == 2) {
+    // ---------------- hall walls: acoustic panels
+    vec2 uv = abs(N.x) > 0.5 ? vec2(P.z, P.y) : vec2(P.x, P.y);
+    vec2 cs = vec2(1.25, 2.5), gq = uv / cs, ci = floor(gq), gf = (fract(gq) - 0.5) * cs;
+    float h = hash21(ci + vTag.y * 17.0);
+    alb = vec3(0.078, 0.086, 0.1) * (0.75 + 0.5 * h); rough = 0.5 + 0.2 * h;
+    float seam = max(lineAA(abs(gf.x) - cs.x * 0.5, 0.006), lineAA(abs(gf.y) - cs.y * 0.5, 0.006)); alb *= 1.0 - 0.75 * seam;
+    vec2 pf = fract(uv / 0.045) - 0.5; float fade = sat(1.0 - fwidth(uv.x / 0.045) * 1.4);
+    alb *= 1.0 - 0.45 * fade * (1.0 - smoothstep(0.16, 0.26, length(pf)));
+    if (P.y < 0.3) { alb = vec3(0.016); rough = 0.6; }
+    float band = lineAA(P.y - 1.02, 0.03); alb = mix(alb, vec3(0.5, 0.36, 0.03), band * 0.8);
+    if (vTag.y > 1.5 && vTag.y < 2.5) {
+      float t1 = decal(uRHall, vec2((P.x + 1.6) / 5.2, (P.y - 4.25) / 0.65)); alb = mix(alb, vec3(0.42), t1 * 0.9);
+      float t2 = decal(uRCaution, vec2((P.x - 4.6) / 3.6, (P.y - 3.25) / 0.3)); alb = mix(alb, vec3(0.6, 0.42, 0.03), t2 * 0.9);
+      // service door
+      vec2 dq = vec2(P.x - 6.4, P.y - 1.5); float dd = sdBox2(dq, vec2(1.5, 1.5));
+      if (dd < 0.0) { alb = vec3(0.05, 0.055, 0.06) * (0.9 + 0.2 * vnoise(vec2(P.x * 3.0, P.y * 40.0))); rough = 0.4; float ribs = lineAA(fract(P.y / 0.25) - 0.5, 0.04); alb *= 1.0 - 0.5 * ribs; }
+      alb = mix(alb, vec3(0.5, 0.36, 0.03) * (0.5 + 0.5 * step(0.5, fract((dq.x + dq.y) * 3.0))), lineAA(dd - 0.05, 0.05));
+    }
+  } else if (id == 3) {
+    vec2 gq = P.xz / vec2(1.2, 1.1); float h = hash21(floor(gq)); vec2 gf = fract(gq) - 0.5;
+    alb = vec3(0.04, 0.043, 0.05) * (0.7 + 0.6 * h); rough = 0.7;
+    alb *= 1.0 - 0.6 * max(lineAA(abs(gf.x) - 0.5, 0.012), lineAA(abs(gf.y) - 0.5, 0.012));
+  } else if (id == 4) {
+    // ---------------- light panels
+    float t; vec3 Lc;
+    if (vTag.y < 1.5) { float rz = round(P.z / ${f3(CEIL_PITCH)}) * ${f3(CEIL_PITCH)}; t = (P.z - rz) / ${f3(CEIL_SEG.hw)}; Lc = vec3(${LIGHT_CEIL.map(f3).join(',')}); }
+    else { t = (P.y - ${f3(WALL_SEG.y)}) / ${f3(WALL_SEG.hh)}; Lc = vec3(${LIGHT_WALL.map(f3).join(',')}); }
+    emis = Lc * (1.0 - 0.16 * t * t) * uEmis; alb = vec3(0.0); F0 = vec3(0.0); rough = 1.0;
+  } else if (id == 5) {
+    // ---------------- nozzle / collector: painted steel
+    float sub = vTag.y; float seamx = lineAA(fract(P.x / 1.66) - 0.5, 0.004);
+    alb = (sub > 2.5 && sub < 3.5 ? vec3(0.17, 0.178, 0.19) : vec3(0.25, 0.262, 0.28)) * (0.9 + 0.2 * fbm2(P.xy * 0.8 + P.z));
+    if (sub < 1.5 || sub > 3.5) alb *= 1.0 - 0.5 * seamx;
+    rough = sub > 2.5 && sub < 3.5 ? 0.28 : 0.42;
+  } else if (id == 6) {
+    // ---------------- settling chamber: softly lit flow-straightener honeycomb
+    vec2 q = vec2(P.z, P.y) / 0.19; vec2 r = vec2(1.0, 1.7320508), hh = r * 0.5;
+    vec2 a = mod(q, r) - hh, b = mod(q - hh, r) - hh; vec2 gv = dot(a, a) < dot(b, b) ? a : b;
+    float ed = 0.5 - max(abs(gv.x), dot(abs(gv), normalize(r)));
+    float fade = sat(1.0 - fwidth(q.x) * 1.2);
+    float cell = mix(0.6, smoothstep(0.02, 0.1, ed), fade);
+    emis = vec3(0.34, 0.5, 0.72) * (0.25 + 1.5 * cell) * (0.55 + 0.45 * smoothstep(0.0, 5.5, P.y)) * uEmis; alb = vec3(0.01); rough = 0.8;
+  } else if (id == 7) {
+    // ---------------- control room behind glass
+    vec2 uv = vec2((5.4 - P.x) / 8.0, (P.y - 1.2) / 1.6);
+    vec3 room = vec3(0.50, 0.33, 0.2) * (0.10 + 0.5 * smoothstep(0.2, 1.0, uv.y)) * (0.8 + 0.4 * vnoise(uv * vec2(9.0, 2.0)));
+    float dsk = smoothstep(0.30, 0.26, uv.y); room *= 1.0 - 0.85 * dsk;
+    for (int k = 0; k < 6; k++) {
+      float cx = 0.1 + float(k) * 0.16 + 0.03 * hash11(float(k) * 3.7);
+      vec2 mq = vec2(uv.x - cx, uv.y - 0.43) / vec2(0.055, 0.105); float m = step(max(abs(mq.x), abs(mq.y)), 1.0);
+      vec3 scr = mix(vec3(0.16, 0.36, 0.8), vec3(0.1, 0.7, 0.55), hash11(float(k) + 4.0)) * (0.55 + 0.7 * vnoise(mq * vec2(5.0, 16.0) + float(k) * 9.0));
+      room = mix(room, scr * 2.6, m);
+    }
+    for (int k = 0; k < 2; k++) {
+      vec2 hq = uv - vec2(0.27 + 0.42 * float(k), 0.5); float hd = min(length(hq * vec2(1.0, 0.72)) - 0.045, length((hq + vec2(0.0, 0.2)) * vec2(0.55, 1.0)) - 0.075);
+      room *= smoothstep(-0.006, 0.008, hd);
+    }
+    emis = room * uEmis; alb = vec3(0.0); F0 = vec3(0.05); rough = 0.03;
+  } else if (id == 8) { alb = vec3(0.0); F0 = vec3(0.56, 0.57, 0.6); rough = vTag.y > 0.5 ? 0.22 : 0.3; }
+  else if (id == 9) { alb = vec3(0.2, 0.21, 0.22); rough = 0.4; glow = 1.0; }
+  else { alb = vec3(0.014, 0.015, 0.017); rough = vTag.y > 0.5 ? 0.3 : 0.55; }
+
+  float hallAtt = 1.0;
+  if (P.x < NOZ_X) hallAtt = exp((P.x - NOZ_X) * 0.5); else if (P.x > COL_X) hallAtt = exp((COL_X - P.x) * 0.42);
+  vec3 E = vec3(0.0);
+  for (int i = 0; i < NL; i++) { float ff = rectFF(P, N, uLC[i], uLU[i], uLV[i]); E += uLCol[i] * ff * (i == NL - 2 ? 1.0 : hallAtt); }
+  E = E * lmv + uAmb * (0.55 + 0.45 * N.y) * mix(1.0, lmv, 0.85) * (0.35 + 0.65 * hallAtt);
+  E += glow * vec3(0.3, 0.42, 0.6) * (0.5 - 0.5 * N.x);
+  vec3 col = alb * E + emis;
+  float NoV = sat(dot(N, V));
+  if (uPass != 1) {
+    vec2 ab = envBRDF(rough, NoV); vec3 spec = F0 * ab.x + ab.y;
+    if (id == 0 && uPass == 0) {
+      // planar reflection with distance-based blur: sharp at contact, soft and vertically smeared further away
+      vec2 suv = gl_FragCoord.xy * uInvRes;
+      float dT = max(textureLod(uRefl, suv, 2.0).a, dist + 0.001), dObj = dT - dist;
+      float blur = (rough * rough * 1.8 + 0.003) * uFocal * dObj / dT;
+      float lod = log2(max(blur * 0.75, 1.0)), stretch = mix(1.6, 4.5, pow(1.0 - NoV, 1.5));
+      vec3 rf = vec3(0.0); float ws = 0.0;
+      for (int k = -4; k <= 4; k++) { float t = float(k) / 4.0, w = exp(-2.2 * t * t); rf += textureLod(uRefl, suv + vec2(0.0, t * blur * stretch) * uReflPx, lod).rgb * w; ws += w; }
+      col += rf / ws * spec * mix(1.0, lmv, 0.25);
+    } else {
+      col += envSample(P, reflect(-V, N), rough) * spec * (id == 4 ? 0.0 : 1.0) * (0.3 + 0.7 * hallAtt);
+    }
+    col = mix(uFogCol, col, exp(-dist * uFogDen));
+  }
+  oCol = vec4(col, uPass == 2 ? dist : 1.0);
+}`;
+
+// ------------------------------------------------------------------ GLSL: car
+const VS_CAR = `
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor; layout(location=2) in vec4 aTag;
+uniform mat4 uModel, uVP; uniform sampler2D uBake; uniform int uBakeOff;
+out vec3 vW; out vec3 vN; out vec3 vO; out vec4 vTag; out vec4 vBake;
+void main(){
+  vec4 w = uModel * vec4(aPos, 1.0); vW = w.xyz; vO = aPos; vN = mat3(uModel) * aNor; vTag = aTag;
+  int id = gl_VertexID + uBakeOff; vBake = texelFetch(uBake, ivec2(id % ${BAKE_W}, id / ${BAKE_W}), 0);
+  gl_Position = uVP * w;
+}`;
+
+const FS_CAR = `
+in vec3 vW; in vec3 vN; in vec3 vO; in vec4 vTag; in vec4 vBake;
+uniform vec3 uEye; uniform int uMat; uniform int uPass; uniform float uTime;
+uniform vec3 uKey, uSky, uGround; uniform vec3 uFogCol; uniform float uFogDen;
+uniform float uSpin, uBlur; uniform vec3 uWC; uniform sampler2D uAtlas; uniform vec4 uRNum, uRLabel, uRProto, uRAero, uRTyre;
+uniform int uDebug;
+out vec4 oCol;
+${GLSL_NOISE}${GLSL_ENV}${GLSL_PANELS}
+float decal(vec4 r, vec2 uv){ if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0; return texture(uAtlas, r.xy + uv * r.zw).r; }
+// lettering on a spinning part: averaged along the direction of travel (bu = blur length in decal widths)
+float spinDecal(vec4 r, float u, float v, float bu, float texels, bool wrap){
+  if (v < 0.0 || v > 1.0) return 0.0;
+  const int N = 11; float acc = 0.0, lod = max(log2(max(bu * texels / float(N), 1.0)), log2(max(fwidth(v) * r.w * ${f3(ATLAS.H)}, 1.0)) - 0.5);
+  for (int k = 0; k < N; k++) { float uu = u + ((float(k) + 0.5) / float(N) - 0.5) * bu; if (wrap) uu = fract(uu); if (uu >= 0.0 && uu <= 1.0) acc += textureLod(uAtlas, r.xy + vec2(uu, v) * r.zw, lod).r; }
+  return acc / float(N);
+}
+float specOcc(vec3 R, vec4 bk, float rough, float NoV){
+  float vis = mix(bk.z, bk.w, smoothstep(-0.3, 0.3, R.y));
+  return sat(pow(NoV + vis, exp2(-16.0 * rough - 1.0)) - 1.0 + vis);
+}
+// diffuse from the baked area lighting + one specular lobe + optional clear coat, all from the prefiltered tunnel cube
+vec3 shade(vec3 P, vec3 V, vec3 N, vec3 alb, vec3 F0, float rough, float cc, float ccRough, vec3 ccN, vec4 bk){
+  float NoV = sat(dot(N, V));
+  vec3 amb = mix(uGround * bk.z, uSky * bk.y, N.y * 0.5 + 0.5);
+  vec3 col = alb * (uKey * bk.x + amb);
+  vec3 R = reflect(-V, N); vec2 ab = envBRDF(rough, NoV);
+  vec3 e1 = rough < 0.16 ? glossRefl(P, R, rough) : envSample(P, normalize(mix(R, N, rough * rough * 0.5)), rough);
+  col += e1 * (F0 * ab.x + ab.y) * specOcc(R, bk, rough, NoV);
+  if (cc > 0.0) {
+    float NoVc = sat(dot(ccN, V)), Fc = (0.04 + 0.96 * pow(1.0 - NoVc, 5.0)) * cc; vec3 Rc = reflect(-V, ccN);
+    col = col * (1.0 - Fc) + glossRefl(P, Rc, ccRough) * Fc * specOcc(Rc, bk, ccRough, NoVc);
+  }
+  return col;
+}
+vec3 accent(float x){
+  float t = sat((x + 2.9) / 5.5); vec3 a = vec3(0.66, 0.075, 0.008), b = vec3(0.4, 0.007, 0.055), c = vec3(0.085, 0.012, 0.31);
+  return t < 0.5 ? mix(a, b, smoothstep(0.0, 0.5, t)) : mix(b, c, smoothstep(0.5, 1.0, t));
+}
+// box-filtered arc: an arc of half-width w centred on angle c, smeared over angle b by the wheel's rotation
+float arcBlur(float th, float c, float w, float b){
+  float d = abs(mod(th - c + PI, TAU) - PI); b = max(b, 0.002);
+  return sat((min(d + 0.5 * b, w) - max(d - 0.5 * b, -w)) / b);
+}
+// geometric specular antialiasing: widen the lobe where the normal changes quickly across a pixel
+float aaRough(vec3 N, float r){ vec3 dx = dFdx(N), dy = dFdy(N); float v = 0.25 * (dot(dx, dx) + dot(dy, dy)); return sqrt(sat(r * r + min(2.0 * v, 0.18))); }
+
+void main(){
+  vec3 P = vW, Ng = normalize(vN), Vd = uEye - P; float dist = length(Vd); vec3 V = Vd / dist; vec4 bk = vBake;
+  vec3 col = vec3(0.0);
+  if (uMat == 0) {
+    // ================= painted bodywork: tinted base coat under a glossy clear coat
+    float zone = vTag.x; vec3 p = vO; float az = abs(p.z);
+    vec3 graphite = vec3(0.010, 0.012, 0.017), base = graphite, acc = accent(p.x); float m = 0.0, pin = 0.0, flakes = 0.55, ccR = 0.045, glass = 0.0, white = 0.0;
+    if (zone < 0.5) {
+      float ytop = 0.975 - 0.03 * (p.x - 0.2) - 0.105 * (p.x - 0.2) * (p.x - 0.2);
+      float split = p.x < -1.0 ? mix(0.0, 0.5, smoothstep(-2.95, -1.0, p.x)) : (p.x < 0.1 ? mix(0.5, 0.6, smoothstep(-1.0, 0.1, p.x)) : ytop - mix(0.36, -0.03, smoothstep(0.1, 2.15, p.x)));
+      float d = p.y - split; m = smoothstep(-0.003, 0.003, d); pin = lineAA(d + 0.02, 0.0045);
+      // numerals on the nose and engine cover, stencil text on the flanks
+      white = decal(uRNum, vec2((p.z + 0.085) / 0.17, (p.x + 1.98) / 0.26)) * step(0.5, Ng.y);
+      white = max(white, decal(uRNum, vec2(p.z > 0.0 ? (p.x - 1.02) / 0.4 : (1.42 - p.x) / 0.4, (p.y - 0.47) / 0.3)) * step(0.3, abs(Ng.z)) * step(p.y, ytop - 0.1));
+      white = max(white, 0.8 * decal(uRLabel, vec2(p.z > 0.0 ? (p.x + 1.42) / 0.22 : (-1.2 - p.x) / 0.22, (p.y - 0.36) / 0.045)) * step(0.5, abs(Ng.z)));
+      // shut lines
+      float sl = max(lineAA(p.x + 1.93, 0.0016), max(lineAA(p.x - 0.36, 0.0016), lineAA(p.x - 1.52, 0.0016)));
+      bk.x *= 1.0 - 0.75 * sl; bk.w *= 1.0 - 0.6 * sl;
+      // airbox intake
+      vec2 iq = vec2(p.z / 0.105, (p.y - 0.865) / 0.062); float inl = smoothstep(1.05, 0.9, length(iq)) * smoothstep(-0.2, -0.5, Ng.x) * step(-0.08, p.x) * step(p.x, 0.12);
+      bk.xyzw *= 1.0 - inl; base *= 1.0 - inl; ccR = mix(ccR, 0.6, inl);
+    } else if (zone < 1.5) {
+      float split = 0.52 - 0.34 * smoothstep(-0.45, 1.55, p.x) + 0.05 * sin(p.x * 2.2);
+      float d = p.y - split; m = smoothstep(-0.003, 0.003, d) * smoothstep(1.78, 1.45, p.x); pin = lineAA(d + 0.02, 0.0045) * smoothstep(1.78, 1.45, p.x);
+      white = 0.85 * decal(uRProto, vec2(p.z > 0.0 ? (p.x - 0.02) / 0.62 : (0.64 - p.x) / 0.62, (p.y - 0.305) / 0.095)) * step(0.45, abs(Ng.z));
+      // cooling louvres on the upper surface
+      vec2 lq = vec2((p.x - 0.5) / 0.3, (az - 0.5) / 0.13);
+      if (abs(lq.x) < 1.0 && abs(lq.y) < 1.0 && Ng.y > 0.5) { float s = fract(p.x / 0.035); float slot = smoothstep(0.55, 0.62, s) * smoothstep(1.0, 0.93, s) * smoothstep(1.0, 0.9, abs(lq.y)); bk *= 1.0 - 0.92 * slot; base *= 1.0 - 0.9 * slot; m *= 1.0 - slot; }
+    } else if (zone < 2.5) { m = 0.0; ccR = 0.07; }
+    else { m = 1.0; glass = smoothstep(0.55, 0.8, Ng.x); }
+    base = mix(base, acc, m);
+    base = mix(base, vec3(0.78, 0.79, 0.8), sat(pin + white));
+    float blk = vTag.y; base *= 1.0 - blk;
+    // metallic flake: tiny sparkling facets under the lacquer, only resolvable up close
+    vec3 fp = p * 2600.0; float fw = fwidth(fp.x) + fwidth(fp.y) + fwidth(fp.z);
+    vec3 fl = vec3(hash31(floor(fp)), hash31(floor(fp) + 7.1), hash31(floor(fp) + 13.7)) - 0.5;
+    vec3 Nb = normalize(Ng + fl * 0.28 * sat(1.3 - fw * 0.6));
+    // faint orange peel in the clear coat
+    vec3 op = vec3(vnoise3(p * 420.0), vnoise3(p * 420.0 + 17.0), vnoise3(p * 420.0 + 31.0)) - 0.5;
+    vec3 Nc = normalize(Ng + op * 0.012 * sat(1.5 - fwidth(p.x) * 420.0));
+    vec3 F0 = mix(vec3(0.04), base * 0.9 + 0.03, flakes), alb = base * (1.0 - 0.45 * flakes);
+    if (glass > 0.0) { alb = mix(alb, vec3(0.0), glass); F0 = mix(F0, vec3(0.9), glass); }
+    float rb = mix(0.36, 0.03, glass);
+    col = shade(P, V, Nb, alb, F0 * (1.0 - blk), rb, 1.0 - blk, aaRough(Ng, ccR), Nc, bk);
+  } else if (uMat == 1) {
+    // ================= carbon fibre: 2x2 twill of anisotropic tows under lacquer
+    vec3 an = abs(Ng); vec2 uv; vec3 T, B;
+    if (an.y >= an.x && an.y >= an.z) { uv = P.xz; T = vec3(1, 0, 0); B = vec3(0, 0, 1); }
+    else if (an.z >= an.x) { uv = P.xy; T = vec3(1, 0, 0); B = vec3(0, 1, 0); }
+    else { uv = P.zy; T = vec3(0, 0, 1); B = vec3(0, 1, 0); }
+    if (vTag.y > 0.5) { uv = vec2(uv.x + uv.y, uv.y - uv.x) * 0.70710678; vec3 t2 = normalize(T + B); B = normalize(B - T); T = t2; }
+    T = normalize(T - Ng * dot(Ng, T)); B = normalize(B - Ng * dot(Ng, B) - T * dot(T, B));
+    const float TOW = 0.0042;
+    vec2 q = uv / TOW, ci = floor(q), f = fract(q);
+    float fw = max(fwidth(q.x), fwidth(q.y)), vis = 1.0 - smoothstep(0.45, 1.3, fw);
+    float mm = mod(ci.y - ci.x, 4.0); float warp = step(mm, 1.5);
+    float along = mix(((3.0 - mm) + f.x) * 0.5, (mm + f.y) * 0.5, warp), across = mix(f.y, f.x, warp);
+    vec3 dA = mix(T, B, warp), dC = mix(B, T, warp);
+    float towId = hash21(mix(vec2(ci.y, floor((ci.x - ci.y + 3.0) / 4.0) + 91.0), vec2(ci.x, floor((ci.y - ci.x) / 4.0)), warp));
+    float sA = cos(PI * along) * 0.55, sC = (across - 0.5) * 1.1;
+    vec3 Nt = normalize(Ng - (dA * sA + dC * sC) * vis * 0.55);
+    float gapm = (1.0 - smoothstep(0.34, 0.5, abs(across - 0.5))) * smoothstep(0.0, 0.1, along) * smoothstep(1.0, 0.9, along);
+    float finish = vTag.x; float rT = 0.26 + 0.1 * towId;
+    // each tow reflects the lights as a streak spread across the fibre direction
+    vec3 sw = vec3(0.0), sf = vec3(0.0);
+    for (int k = -1; k <= 1; k++) {
+      float ph = float(k) * 0.72, wgt = k == 0 ? 0.42 : 0.29;
+      vec3 nW = normalize(mix(Ng, Nt, warp) * cos(ph) + T * sin(ph)), nF = normalize(mix(Nt, Ng, warp) * cos(ph) + B * sin(ph));
+      sw += envSample(P, reflect(-V, nW), rT) * wgt; sf += envSample(P, reflect(-V, nF), rT) * wgt;
+    }
+    float wmix = mix(0.5, warp, vis), towm = mix(1.0, gapm * (0.7 + 0.6 * towId), vis);
+    vec3 fibre = mix(sf, sw, wmix) * towm;
+    float NoV = sat(dot(Ng, V)); vec3 R = reflect(-V, Ng);
+    vec3 amb = mix(uGround * bk.z, uSky * bk.y, Ng.y * 0.5 + 0.5);
+    // broad sheen under the overhead banks (Kajiya-Kay): tows lying across the light glow, the others stay dark,
+    // which is what makes the twill read as a pattern and flip as the camera moves
+    vec3 Ld = normalize(vec3(-V.x * 0.25, 1.0, -V.z * 0.25));
+    float tlW = dot(B, Ld), tvW = dot(B, V), tlF = dot(T, Ld), tvF = dot(T, V);
+    float shW = pow(sat(sqrt((1.0 - tlW * tlW) * (1.0 - tvW * tvW)) - tlW * tvW), 7.0), shF = pow(sat(sqrt((1.0 - tlF * tlF) * (1.0 - tvF * tvF)) - tlF * tvF), 7.0);
+    float sheen = mix(shF, shW, wmix) * towm;
+    col = vec3(0.012, 0.012, 0.013) * (uKey * bk.x + amb) + (fibre * 0.75 * specOcc(R, bk, 0.3, NoV) + uKey * (bk.x * 0.5 + 0.25 * bk.w) * sheen * 0.42) * vec3(0.09, 0.094, 0.104);
+    // painted accents on some wing parts
+    float pa = 0.0;
+    if (vTag.z > 1.5) pa = smoothstep(0.0, 0.006, P.y - (P.x < 0.0 ? 0.13 + 0.25 * (P.x + 2.74) : 0.6 + 0.5 * (P.x - 2.2)));
+    if (pa > 0.0) col = mix(col, accent(P.x) * (uKey * bk.x + amb) * 0.85, pa);
+    float ccR = aaRough(Ng, mix(0.05, 0.3, finish)), Fc = (0.04 + 0.96 * pow(1.0 - NoV, 5.0)) * mix(1.0, 0.55, finish);
+    vec3 Nc = normalize(mix(Ng, Nt, 0.06 * vis));
+    col = col * (1.0 - Fc) + glossRefl(P, reflect(-V, Nc), ccR) * Fc * specOcc(R, bk, ccR, NoV);
+  } else if (uMat == 2) {
+    // ================= wheel assembly (static geometry; rotation is carried by the surface pattern + motion blur)
+    vec3 p = vO; float r = length(p.xy), th = atan(p.y, p.x) - uSpin, a = p.z; int part = int(vTag.x + 0.5);
+    vec3 er = normalize(vec3(P.xy - uWC.xy, 1e-5));       // radial direction in world space (the axle is along Z)
+    vec3 N = Ng; vec3 alb, F0 = vec3(0.04); float rough, cc = 0.0, ccR = 0.1;
+    if (part == 0) {
+      float tread = smoothstep(${f3(CAR.R - 0.034)}, ${f3(CAR.R - 0.012)}, r);
+      // sidewall: moulded ribs, a lettering band and a compound stripe, all smeared along the direction of rotation
+      float sw = 1.0 - tread;
+      float txt = spinDecal(uRTyre, fract(-th / TAU * 2.0), (r - 0.283) / 0.036, uBlur / TAU * 2.0, 2048.0, true);
+      float stripe = lineAA(r - 0.331, 0.0035) * (0.35 + 0.65 * (arcBlur(th, 0.6, 0.9, uBlur) + arcBlur(th, 0.6 + PI, 0.9, uBlur)));
+      float thin = lineAA(r - 0.2765, 0.0011) + lineAA(r - 0.3245, 0.0011);
+      // moulded detail: rim-protector ribs, a raised band under the lettering, fine radial serrations at the shoulder
+      float ribs = sin(r * 1400.0) * smoothstep(0.268, 0.262, r) * smoothstep(0.243, 0.248, r);
+      float band = smoothstep(0.279, 0.2815, r) * smoothstep(0.3225, 0.320, r);
+      float edge = (smoothstep(0.2775, 0.2805, r) - smoothstep(0.2805, 0.2835, r)) - (smoothstep(0.3185, 0.3215, r) - smoothstep(0.3215, 0.3245, r));
+      float serr = sin(th * 420.0) * smoothstep(0.336, 0.34, r) * smoothstep(0.349, 0.345, r) * sat(1.3 - uBlur * 60.0);
+      alb = mix(vec3(0.019, 0.019, 0.02), vec3(0.78, 0.76, 0.66), sat(txt * 1.25) * sw);
+      alb = mix(alb, vec3(0.72, 0.6, 0.2), sat(stripe + 0.6 * thin) * sw);
+      rough = mix(0.46, 0.4, band) + 0.12 * sat(txt + stripe);
+      N = normalize(N + er * (ribs * 0.22 + edge * 0.35) * sw + cross(er, vec3(0.0, 0.0, 1.0)) * serr * 0.25 * sw);
+      // tread: scrubbed rubber with fine circumferential graining, slightly glossy bands
+      float gr = vnoise(vec2(a * 900.0, 3.0)), gr2 = vnoise(vec2(a * 140.0, 9.0)), spk = vnoise(vec2(a * 260.0, th * 9.0));
+      vec3 talb = vec3(0.014, 0.014, 0.015) * (0.8 + 0.4 * gr2 + 0.15 * spk); float trough = 0.66 + 0.2 * gr - 0.16 * gr2;
+      alb = mix(alb, talb, tread); rough = mix(rough, trough, tread);
+      F0 = vec3(0.045);
+    } else if (part == 1) { alb = vec3(0.0); F0 = vec3(0.3, 0.31, 0.33); rough = 0.24; }
+    else if (part == 2) {
+      // wheel cover: satin disc with a coloured arc, a pin line and a small stencil
+      float arc = lineAA(r - 0.197, 0.012) * (arcBlur(th, 0.0, 0.95, uBlur) + arcBlur(th, PI, 0.95, uBlur));
+      float ring = lineAA(r - 0.222, 0.0018);
+      float tk = spinDecal(uRLabel, fract(-th / TAU * 3.0) * 2.2 - 0.6, (r - 0.118) / 0.03, uBlur / TAU * 3.0 * 2.2, 640.0, false);
+      alb = mix(vec3(0.016, 0.017, 0.02), vec3(0.95, 0.17, 0.025), sat(arc)); alb = mix(alb, vec3(0.6), sat(ring + tk * 0.8));
+      rough = 0.42; cc = 0.9; ccR = 0.09;
+    } else if (part == 3) { alb = vec3(0.0); F0 = vec3(0.9, 0.36, 0.16); rough = 0.26; }
+    else { alb = vec3(0.014); rough = 0.5; cc = 0.4; ccR = 0.25; }
+    col = shade(P, V, N, alb, F0, aaRough(Ng, rough), cc, ccR, Ng, bk);
+  } else if (uMat == 3) {
+    // ================= bare metals
+    vec3 F0 = vec3(0.62, 0.6, 0.57); float rough = 0.3;
+    if (vTag.x < 0.5) { float h = sat((P.x - 2.3) / 0.31); F0 = mix(vec3(0.56, 0.5, 0.42), mix(vec3(0.62, 0.42, 0.2), vec3(0.25, 0.3, 0.62), smoothstep(0.55, 0.95, h)), smoothstep(0.15, 0.6, h)); rough = 0.34 + 0.1 * vnoise(vec2(P.x * 200.0, atan(P.y - 0.41, P.z) * 3.0)); }
+    col = shade(P, V, Ng, vec3(0.0), F0, rough, 0.0, 0.1, Ng, bk);
+  } else if (uMat == 4) {
+    // ================= helmet: pearl shell, tinted mirror visor
+    vec3 d = normalize((vO - vec3(-0.37, 0.79, 0.0)) / vec3(0.136, 0.122, 0.114));
+    float el = asin(clamp(d.y, -1.0, 1.0)), azm = atan(d.z, -d.x);
+    float visor = smoothstep(0.03, -0.01, max(abs(el - 0.1) - 0.27, abs(azm) - 1.35 + 0.35 * abs(el - 0.1)));
+    float band = smoothstep(0.02, -0.02, abs(abs(d.z) - 0.42) - 0.16) * (1.0 - visor) * step(-0.25, d.y);
+    vec3 alb = mix(vec3(0.72, 0.73, 0.74), accent(d.x * 4.0 + 0.6), band); alb = mix(alb, vec3(0.012), smoothstep(-0.5, -0.62, d.y));
+    vec3 F0 = vec3(0.04); float rough = 0.4, ccR = 0.04;
+    if (visor > 0.0) { alb = mix(alb, vec3(0.0), visor); F0 = mix(F0, vec3(0.75, 0.5, 0.18), visor); rough = mix(rough, 0.06, visor); }
+    col = shade(P, V, Ng, alb, F0, rough, 1.0, aaRough(Ng, ccR), Ng, bk);
+  } else if (uMat == 5) {
+    // ================= matte plastics, cockpit, duct interiors
+    vec3 alb = vec3(0.016); float rough = 0.45; vec3 F0 = vec3(0.04);
+    if (vTag.x > 1.5) { alb = vec3(0.012) + 0.02 * smoothstep(-0.3, -0.18, vO.x); rough = 0.75; }
+    else if (vTag.x > 0.5) { alb = vec3(0.0); F0 = vec3(0.0); rough = 1.0; }
+    col = shade(P, V, Ng, alb, F0, rough, 0.0, 0.1, Ng, bk);
+  } else {
+    // ================= rain light: LED matrix
+    vec2 g = vec2(P.z / 0.0115, P.y / 0.0115); vec2 c = fract(g) - 0.5; float led = smoothstep(0.42, 0.18, length(c));
+    float fade = sat(1.0 - fwidth(g.x)); led = mix(0.45, led, fade);
+    col = vec3(1.0, 0.035, 0.02) * (0.6 + 9.0 * led) * step(0.5, Ng.x) + vec3(0.01) * (1.0 - step(0.5, Ng.x));
+  }
+  if (uDebug == 1) col = vec3(bk.x); else if (uDebug == 2) col = vec3(bk.y, bk.z, bk.w); else if (uDebug == 3) col = Ng * 0.5 + 0.5;
+  col = mix(uFogCol, col, exp(-dist * uFogDen));
+  oCol = vec4(col, uPass == 2 ? dist : 1.0);
+}`;
+
+// ------------------------------------------------------------------ GLSL: light baking
+const VS_DEPTH = `
+layout(location=0) in vec3 aPos; uniform mat4 uModel, uLVP;
+void main(){ gl_Position = uLVP * uModel * vec4(aPos, 1.0); }`;
+const FS_DEPTH = `void main(){}`;
+
+// one point per vertex, written additively into the vertex-lighting atlas
+const VS_BAKE = `
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor;
+uniform mat4 uModel, uLVP; uniform vec3 uLPos, uLNrm; uniform float uLW; uniform int uMode; uniform int uOff;
+uniform sampler2DShadow uShadow; uniform sampler2D uLM; uniform vec4 uLMRect;
+out vec4 vA; out vec4 vB;
+void main(){
+  vec3 P = (uModel * vec4(aPos, 1.0)).xyz, N = normalize(mat3(uModel) * aNor), L; float geo = 1.0;
+  if (uMode == 0) { vec3 d = uLPos - P; float d2 = dot(d, d); L = d * inversesqrt(d2); geo = max(dot(-L, uLNrm), 0.0) / d2; } else L = uLPos;
+  float cs = max(dot(N, L), 0.0);
+  vec4 lp = uLVP * vec4(P + N * 0.014 + L * 0.006, 1.0); vec3 sc = lp.xyz / lp.w * 0.5 + 0.5;
+  float vis = 1.0;
+  if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0) vis = texture(uShadow, vec3(sc.xy, sc.z - 0.0005));
+  if (uMode == 0) { vA = vec4(geo * cs * vis * uLW, 0.0, 0.0, geo * vis); vB = vec4(0.0, 0.0, 0.0, geo); }
+  else if (L.y >= 0.0) { vA = vec4(0.0, cs * vis, 0.0, 0.0); vB = vec4(0.0, cs, 0.0, 0.0); }
+  else {
+    // light bounced off the floor: only as bright as that patch of floor is lit
+    vec2 fp = P.xz + L.xz * (P.y / max(-L.y, 1e-3)); vec2 lu = (fp - uLMRect.xy) / uLMRect.zw; float fl = 1.0;
+    if (lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) { vec2 lm = texture(uLM, lu).rg; fl = lm.g > 1e-7 ? sat(lm.r / lm.g) : 1.0; }
+    vA = vec4(0.0, 0.0, cs * vis * fl, 0.0); vB = vec4(0.0, 0.0, cs, 0.0);
+  }
+  int id = gl_VertexID + uOff;
+  gl_Position = vec4((vec2(float(id % ${BAKE_W}), float(id / ${BAKE_W})) + 0.5) / vec2(${BAKE_W}.0, ${BAKE_H}.0) * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+const FS_BAKE = `in vec4 vA; in vec4 vB; layout(location=0) out vec4 oA; layout(location=1) out vec4 oB; void main(){ oA = vA; oB = vB; }`;
+const FS_BAKE_RESOLVE = `
+uniform sampler2D uA, uB; out vec4 o;
+void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec4 a = texelFetch(uA, p, 0), b = texelFetch(uB, p, 0);
+  o = vec4(a.r, b.g > 1e-5 ? a.g / b.g : 1.0, b.b > 1e-5 ? a.b / b.b : 1.0, b.a > 1e-9 ? a.a / b.a : 1.0); }`;
+// floor shadow map and smoke light volume accumulate the same shadow tests
+const FS_BAKE_FLOOR = `
+in vec2 vUV; uniform mat4 uLVP; uniform vec3 uLPos, uLNrm; uniform float uLW; uniform vec4 uLMRect; uniform sampler2DShadow uShadow;
+uniform int uVolume; uniform vec3 uVolMin, uVolSize; uniform vec3 uVolDim; uniform vec2 uVolTiles;
+out vec4 o;
+void main(){
+  vec3 P; float cosS = 1.0;
+  if (uVolume == 0) P = vec3(uLMRect.x + vUV.x * uLMRect.z, 0.004, uLMRect.y + vUV.y * uLMRect.w);
+  else { vec2 t = vUV * uVolTiles; vec2 ti = floor(t), tf = fract(t); float yi = ti.y * uVolTiles.x + ti.x; P = uVolMin + vec3(tf.x, (yi + 0.5) / uVolDim.y, tf.y) * uVolSize; }
+  vec3 d = uLPos - P; float d2 = dot(d, d); vec3 L = d * inversesqrt(d2);
+  if (uVolume == 0) cosS = max(L.y, 0.0);
+  float geo = cosS * max(dot(-L, uLNrm), 0.0) / d2 * uLW;
+  vec4 lp = uLVP * vec4(P, 1.0); vec3 sc = lp.xyz / lp.w * 0.5 + 0.5; float vis = 1.0;
+  if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0) vis = texture(uShadow, vec3(sc.xy, sc.z - 0.0004));
+  o = vec4(geo * vis, geo, 0.0, 0.0);
+}`;
+
+// ------------------------------------------------------------------ GLSL: environment prefilter (GGX importance sampling)
+const FS_PREFILTER = `
+in vec2 vUV; uniform samplerCube uSrc; uniform int uFace; uniform float uRough; uniform float uSrcSize; out vec4 o;
+vec3 faceDir(int f, vec2 uv){ vec2 p = uv * 2.0 - 1.0;
+  if (f == 0) return vec3(1.0, -p.y, -p.x); if (f == 1) return vec3(-1.0, -p.y, p.x); if (f == 2) return vec3(p.x, 1.0, p.y);
+  if (f == 3) return vec3(p.x, -1.0, -p.y); if (f == 4) return vec3(p.x, -p.y, 1.0); return vec3(-p.x, -p.y, -1.0); }
+float rvdc(uint b){ b = (b << 16u) | (b >> 16u); b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u); b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
+  b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u); b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u); return float(b) * 2.3283064365386963e-10; }
+void main(){
+  vec3 N = normalize(faceDir(uFace, vUV));
+  if (uRough < 0.01) { o = vec4(textureLod(uSrc, N, 0.0).rgb, 1.0); return; }
+  vec3 up = abs(N.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), T = normalize(cross(up, N)), B = cross(N, T);
+  float a = uRough * uRough; vec3 acc = vec3(0.0); float ws = 0.0; const uint NS = 192u;
+  for (uint i = 0u; i < NS; i++) {
+    vec2 xi = vec2(float(i) / float(NS), rvdc(i));
+    float ph = TAU * xi.x, ct = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y)), st = sqrt(1.0 - ct * ct);
+    vec3 H = T * (st * cos(ph)) + B * (st * sin(ph)) + N * ct, L = 2.0 * dot(N, H) * H - N; float nl = dot(N, L);
+    if (nl > 0.0) {
+      float d = ct * ct * (a * a - 1.0) + 1.0, D = a * a / (PI * d * d), pdf = D * 0.25 + 1e-4;
+      float lod = 0.5 * log2((1.0 / (float(NS) * pdf)) / (4.0 * PI / (6.0 * uSrcSize * uSrcSize))) + 1.0;
+      acc += min(textureLod(uSrc, L, max(lod, 0.0)).rgb, vec3(400.0)) * nl; ws += nl;
+    }
+  }
+  o = vec4(acc / max(ws, 1e-4), 1.0);
+}`;
+// ------------------------------------------------------------------ GLSL: smoke
+const SMK = { NP: 512, NS: SEEDS.length, NK: 20, NV: VORT.length, sigma0: 0.0062, growL: 0.00016, growT: 0.085, doseMax: 1.5, diss: 7.0, mass: 0.00072, cut: 2.6, xFade0: 9.6, xFade1: 12.2 };
+
+// Each row of the state texture is one streak line: texel j is the particle released j sub-steps ago.
+// A step moves every particle along the flow and shifts it one texel down the row.
+const FS_SMOKE_STEP = `
+#define NS ${SMK.NS}
+#define NK ${SMK.NK}
+#define NV ${SMK.NV}
+uniform sampler2D uPrev; uniform sampler3D uVel; uniform sampler3D uWake;
+uniform vec3 uVMin, uVSize, uWMin, uWSize; uniform float uH, uU, uTime;
+uniform vec3 uSeed[NS]; uniform vec3 uKK[NK]; uniform vec3 uKA[NK]; uniform float uKP[NK];
+uniform vec3 uVA[NV]; uniform vec3 uVB[NV]; uniform float uVG[NV];
+out vec4 o;
+vec3 vortex(vec3 p){
+  vec3 v = vec3(0.0);
+  for (int i = 0; i < NV; i++) {
+    vec3 r1 = p - uVA[i], r2 = p - uVB[i], r0 = uVB[i] - uVA[i], c = cross(r1, r2);
+    v += c * (uVG[i] * dot(r0, normalize(r1) - normalize(r2)) / (dot(c, c) + ${f3(VORT_CORE2)} * dot(r0, r0)));
+  }
+  return v;
+}
+float wakeAt(vec3 p){ vec3 u = (p - uWMin) / uWSize; if (u.x < 0.0 || u.x > 1.0 || u.z < 0.0 || u.z > 1.0 || u.y > 1.0) return 0.0; return texture(uWake, u).r; }
+vec3 velAt(vec3 p, out float W){
+  W = wakeAt(p);
+  vec3 u = (p - uVMin) / uVSize, e = min(u, 1.0 - u) * uVSize;
+  float w = sat(min(min(e.x, (1.0 - u.y) * uVSize.y), e.z) / 0.3), beta = 1.0;
+  vec3 v = vec3(1.0, 0.0, 0.0);
+  if (w < 1.0) v = (vec3(1.0, 0.0, 0.0) + vortex(p)) * (1.0 - ${f3(FLOW.wakeK)} * W);
+  if (w > 0.0) { vec4 g = texture(uVel, u); v = w < 1.0 ? mix(v, g.xyz, w) : g.xyz; beta = mix(1.0, g.w, w); }
+  vec3 tb = vec3(0.0);
+  for (int i = 0; i < NK; i++) tb += uKA[i] * cos(dot(uKK[i], p) + uKP[i]);
+  return (v + tb * (${f3(FLOW.ti0)} + ${f3(FLOW.ti1)} * W * sqrt(W)) * beta) * uU;
+}
+void main(){
+  ivec2 px = ivec2(gl_FragCoord.xy); int j = px.x, s = px.y;
+  if (j == 0) { o = vec4(uSeed[s] + 0.0022 * vec3(0.0, sin(uTime * 9.1 + float(s) * 1.7), cos(uTime * 7.3 + float(s) * 2.9)), 0.0); return; }
+  vec4 pr = texelFetch(uPrev, ivec2(j - 1, s), 0);
+  vec3 p = pr.xyz; float W, W2;
+  vec3 v1 = velAt(p, W), v2 = velAt(p + v1 * (0.5 * uH), W2);
+  p += v2 * uH; p.y = max(p.y, 0.012);
+  float sp = length(v2) / uU;
+  o = vec4(p, pr.w + uH * (W2 + 0.15 * sat(1.0 - sp / 0.2)));
+}`;
+
+// Every streak segment is drawn as a quad covering a tube of Gaussian density; the fragment shader integrates
+// that density along the view ray analytically, so tubes merge without seams and fade softly into geometry.
+const VS_SMOKE = `
+uniform sampler2D uState; uniform mat4 uView, uProj; uniform vec2 uVP; uniform float uEmit, uH; uniform int uLodBias;
+flat out vec3 vA; flat out vec3 vB; flat out vec4 vPar; flat out vec4 vTex;
+const int NPM = ${SMK.NP - 1};
+float sigmaOf(int i, float dose){ return sqrt(${(SMK.sigma0 * SMK.sigma0).toExponential(4)} + ${f3(SMK.growL)} * float(i) / float(NPM) + ${f3(SMK.growT)} * min(dose, ${f3(SMK.doseMax)})); }
+int levelOf(float sg){ return min(int(clamp(floor(log2(sg / 0.028)), 0.0, 5.0)) + uLodBias, 5); }
+void main(){
+  int seg = gl_InstanceID % NPM, s = gl_InstanceID / NPM;
+  vec4 p1 = texelFetch(uState, ivec2(seg, s), 0);
+  float rA = sigmaOf(seg, p1.w);
+  // level of detail: wide, diffuse plumes are drawn with proportionally longer segments (power-of-two strides
+  // that tile the streak exactly), which keeps overdraw bounded however much the smoke has spread
+  int lv = levelOf(rA), tz = 0; bool covered = false;
+  for (int l = 1; l <= 5; l++) {
+    int m = (1 << l) - 1, b = seg - (seg & m);
+    if (b == seg) tz = l; else if (levelOf(sigmaOf(b, texelFetch(uState, ivec2(b, s), 0).w)) >= l) covered = true;
+  }
+  int stride = 1 << min(lv, tz), end = min(seg + stride, NPM);
+  vec4 p2 = texelFetch(uState, ivec2(end, s), 0);
+  float rB = sigmaOf(end, p2.w);
+  vec3 A = (uView * vec4(p1.xyz, 1.0)).xyz, B = (uView * vec4(p2.xyz, 1.0)).xyz;
+  float ageB = float(end) / float(NPM), L = length(p2.xyz - p1.xyz);
+  float fade = (1.0 - smoothstep(0.84, 1.0, ageB)) * smoothstep(0.0, 0.01, ageB);
+  fade *= 1.0 - smoothstep(${f3(SMK.xFade0)}, ${f3(SMK.xFade1)}, p1.x);
+  fade *= smoothstep(0.45 + 4.0 * rA, 1.6 + 10.0 * rA, min(length(A), length(B)));        // keep smoke off the lens
+  fade *= 1.0 / (1.0 + ${f3(SMK.diss)} * p1.w);                     // turbulent mixing thins the smoke out
+  fade *= smoothstep(0.1, 0.36, L / (float(stride) * ${f3(FLOW.U * FLOW.h)}));   // smoke that stalls against a surface disperses
+  bool cull = covered || fade < 0.003 || min(-A.z, -B.z) < 0.3 || L > 0.4 * float(stride) + 0.6;
+  float R = ${f3(SMK.cut)} * max(rA, rB);
+  vec4 ca = uProj * vec4(A, 1.0), cb = uProj * vec4(B, 1.0);
+  vec2 pa = ca.xy / ca.w * uVP * 0.5, pb = cb.xy / cb.w * uVP * 0.5;
+  float k = uProj[1][1] * uVP.y * 0.5, rr = R * k / min(-A.z, -B.z) + 1.5;
+  vec2 d = pb - pa; float l = length(d); d = l > 1e-3 ? d / l : vec2(1.0, 0.0); vec2 n = vec2(-d.y, d.x);
+  float sx = (gl_VertexID & 1) == 0 ? -1.0 : 1.0, sy = (gl_VertexID & 2) == 0 ? -1.0 : 1.0;
+  vec2 pos = (sx < 0.0 ? pa - d * rr : pb + d * rr) + n * (sy * rr);
+  vec4 cm = uProj * vec4(0.5 * (A + B), 1.0);
+  gl_Position = cull ? vec4(2.0, 2.0, 2.0, 1.0) : vec4(pos / (uVP * 0.5), cm.z / cm.w, 1.0);
+  vA = A; vB = B;
+  vPar = vec4(rA, rB, ${f3(SMK.mass)} * float(stride) * fade / max(L, 0.012 * float(stride)), min(1.0, 0.14 + 2.4 * (p1.w + p2.w)));
+  vTex = vec4((uEmit - float(seg)) * uH, (uEmit - float(end)) * uH, float(s) * 7.31, 0.0);
+}`;
+
+const GLSL_LVOL = `
+uniform sampler2D uLVol; uniform vec3 uVolMin, uVolSize, uVolDim; uniform vec2 uVolTiles;
+// fraction of the ceiling light reaching a point (baked, low resolution): shades the smoke in the car's shadow
+float lightVol(vec3 P){
+  vec3 u = (P - uVolMin) / uVolSize;
+  if (u.x < 0.0 || u.x > 1.0 || u.y < 0.0 || u.y > 1.0 || u.z < 0.0 || u.z > 1.0) return 1.0;
+  float fy = u.y * uVolDim.y - 0.5, y0 = clamp(floor(fy), 0.0, uVolDim.y - 1.0), y1 = min(y0 + 1.0, uVolDim.y - 1.0), fr = sat(fy - y0);
+  vec2 q = clamp(u.xz, 0.5 / uVolDim.xz, 1.0 - 0.5 / uVolDim.xz);
+  vec2 a = texture(uLVol, (vec2(mod(y0, uVolTiles.x), floor(y0 / uVolTiles.x)) + q) / uVolTiles).rg;
+  vec2 b = texture(uLVol, (vec2(mod(y1, uVolTiles.x), floor(y1 / uVolTiles.x)) + q) / uVolTiles).rg;
+  return mix(a.g > 1e-7 ? a.r / a.g : 1.0, b.g > 1e-7 ? b.r / b.g : 1.0, fr);
+}`;
+
+const FS_SMOKE = `
+flat in vec3 vA; flat in vec3 vB; flat in vec4 vPar; flat in vec4 vTex;
+uniform sampler2D uDepth; uniform vec2 uInvVP; uniform vec2 uTanHalf; uniform mat4 uInvView; uniform vec2 uLight; uniform int uMirror; uniform vec3 uTint;
+out vec4 o;
+${GLSL_NOISE}${GLSL_LVOL}
+float erf_(float x){ float a = abs(x), t = 1.0 / (1.0 + 0.3275911 * a);
+  float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+  return x < 0.0 ? -y : y; }
+void main(){
+  vec2 uv = gl_FragCoord.xy * uInvVP;
+  vec3 dir = normalize(vec3((uv * 2.0 - 1.0) * uTanHalf, -1.0));
+  float lamS = uMirror == 1 ? 1e6 : texelFetch(uDepth, ivec2(gl_FragCoord.xy), 0).r / -dir.z;
+  vec3 AB = vB - vA; float L = max(length(AB), 1e-5); vec3 t = AB / L;
+  float a = dot(dir, t), At = dot(vA, t), Av = dot(vA, dir), den = max(1.0 - a * a, 1e-5);
+  float lam0 = (Av - a * At) / den, s0 = a * lam0 - At;
+  vec3 dv = dir * lam0 - vA - t * s0; float b2 = dot(dv, dv), l1, l2;
+  if (abs(a) > 1e-3) { float la = At / a, lb = (L + At) / a; l1 = min(la, lb); l2 = max(la, lb); }
+  else { if (s0 < 0.0 || s0 > L) discard; l1 = lam0 - 50.0; l2 = lam0 + 50.0; }
+  l1 = max(l1, 0.05); l2 = min(l2, lamS);
+  if (l2 <= l1) discard;
+  float lm = clamp(lam0, l1, l2), sm = sat((a * lm - At) / L);
+  float sig = mix(vPar.x, vPar.y, sm), i2 = 0.5 / (sig * sig), q = b2 * i2;
+  const float QC = ${f3(0.5 * SMK.cut * SMK.cut)}; if (q > QC) discard;
+  float e = (exp(-q) - exp(-QC)) / (1.0 - exp(-QC)), k = sqrt(den * i2);
+  float I = e * 0.886226925 / k * (erf_(k * (l2 - lam0)) - erf_(k * (l1 - lam0)));
+  // density structure carried with the smoke: slow pulses along the stream plus fine wisps once it turns turbulent
+  float uc = mix(vTex.x, vTex.y, sm), side = dot(dv, normalize(cross(t, dir) + vec3(1e-6))) / sig;
+  float dens = 1.0;
+  if (uMirror == 0) { float n1 = vnoise(vec2(uc * 6.5 + vTex.z, vTex.z * 0.37)), n2 = fbm2(vec2(uc * 30.0 + vTex.z * 3.1, side * 0.75 + vTex.z)); dens = (0.8 + 0.4 * n1) * mix(1.0, 0.25 + 1.5 * n2, vPar.w); }
+  float tau = vPar.z * I * i2 / PI * dens;
+  vec3 Pw = (uInvView * vec4(dir * lm, 1.0)).xyz;
+  float top = sat(0.5 + 0.38 * (mat3(uInvView) * dv).y / sig);          // lit from above: the upper side of each plume is brighter
+  float lum = uLight.x + uLight.y * lightVol(Pw) * (0.74 + 0.4 * top);
+  if (uMirror == 1) { float a = 1.0 - exp(-tau); o = vec4(uTint * lum * a, a); }        // reflection pass: plain 'over' blending
+  else o = vec4(tau * lum, tau, tau * lm * -dir.z, 0.0);
+}`;
+
+// ------------------------------------------------------------------ GLSL: post chain
+const GLSL_LIN = `uniform vec2 uNF; float lin(float d){ return 2.0 * uNF.x * uNF.y / (uNF.y + uNF.x - (d * 2.0 - 1.0) * (uNF.y - uNF.x)); }`;
+// linear view depth at the smoke resolution; a min/max checkerboard keeps both sides of every silhouette available
+const FS_HDEPTH = `
+uniform sampler2D uDepth; uniform int uScale; out vec4 o;
+${GLSL_LIN}
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy) * uScale, mx = textureSize(uDepth, 0) - 1;
+  if (uScale == 1) { o = vec4(lin(texelFetch(uDepth, p, 0).r)); return; }
+  float a = lin(texelFetch(uDepth, min(p, mx), 0).r), b = lin(texelFetch(uDepth, min(p + ivec2(1, 0), mx), 0).r);
+  float c = lin(texelFetch(uDepth, min(p + ivec2(0, 1), mx), 0).r), d = lin(texelFetch(uDepth, min(p + ivec2(1, 1), mx), 0).r);
+  ivec2 q = ivec2(gl_FragCoord.xy);
+  o = vec4(((q.x + q.y) & 1) == 0 ? min(min(a, b), min(c, d)) : max(max(a, b), max(c, d)));
+}`;
+const FS_COMPOSITE = `
+in vec2 vUV; uniform sampler2D uScene, uDepth, uSmoke, uHDepth; uniform vec2 uSmokeSize; uniform vec3 uSmokeTint; uniform float uFocus;
+out vec4 o;
+${GLSL_LIN}
+void main(){
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec3 scene = texelFetch(uScene, ip, 0).rgb; float z = lin(texelFetch(uDepth, ip, 0).r);
+  vec2 sp = vUV * uSmokeSize - 0.5; ivec2 b = ivec2(floor(sp)); vec2 f = fract(sp);
+  vec4 acc = vec4(0.0), best = vec4(0.0); float bd = 1e9; bool close = true;
+  for (int k = 0; k < 4; k++) {
+    ivec2 q = clamp(b + ivec2(k & 1, k >> 1), ivec2(0), ivec2(uSmokeSize) - 1);
+    float zk = texelFetch(uHDepth, q, 0).r; vec4 sk = texelFetch(uSmoke, q, 0);
+    float w = ((k & 1) == 0 ? 1.0 - f.x : f.x) * ((k >> 1) == 0 ? 1.0 - f.y : f.y), dz = abs(zk - z);
+    if (dz > 0.05 * z + 0.02) close = false;
+    if (dz < bd) { bd = dz; best = sk; }
+    acc += sk * w;
+  }
+  vec4 sm = close ? acc : best;
+  float tau = sm.g, T = exp(-tau);
+  vec3 col = scene * T + uSmokeTint * (sm.r / max(tau, 1e-6)) * (1.0 - T);
+  // depth for the lens blur: smoke in front of a distant wall keeps its own focus, but never defocuses what is behind it
+  float zs = max(sm.b / max(tau, 1e-6), min(z, uFocus));
+  o = vec4(col, mix(z, zs, (1.0 - T) * step(1e-5, tau)));
+}`;
+// gather depth of field (after D. Gustafsson): golden-angle spiral, sample radius limited by each sample's own blur
+const FS_DOF = `
+in vec2 vUV; uniform sampler2D uSrc; uniform vec2 uPx; uniform float uFocus, uFocusK, uMaxBlur;
+out vec4 o;
+float coc(float z){ return clamp((1.0 / uFocus - 1.0 / z) * uFocusK, -uMaxBlur, uMaxBlur); }
+void main(){
+  vec4 c0 = textureLod(uSrc, vUV, 0.0); float cs = abs(coc(c0.a));
+  vec3 col = c0.rgb; float tot = 1.0, r = 1.4;
+  for (float ang = 0.0; r < uMaxBlur; ang += 2.39996323) {
+    vec4 s = textureLod(uSrc, vUV + vec2(cos(ang), sin(ang)) * uPx * r, 0.0); float ss = abs(coc(s.a));
+    if (s.a > c0.a) ss = clamp(ss, 0.0, cs * 2.0);
+    float m = smoothstep(r - 0.5, r + 0.5, ss);
+    col += mix(col / tot, s.rgb, m); tot += 1.0; r += 1.7 / r;
+  }
+  o = vec4(col / tot, cs);
+}`;
+const FS_BLOOM_DOWN = `
+in vec2 vUV; uniform sampler2D uSrc; uniform vec2 uPx; uniform int uFirst; out vec4 o;
+float kw(vec3 c){ return 1.0 / (1.0 + max(c.r, max(c.g, c.b))); }
+void main(){
+  vec3 a = textureLod(uSrc, vUV + uPx * vec2(-2, 2), 0.0).rgb, b = textureLod(uSrc, vUV + uPx * vec2(0, 2), 0.0).rgb, c = textureLod(uSrc, vUV + uPx * vec2(2, 2), 0.0).rgb;
+  vec3 d = textureLod(uSrc, vUV + uPx * vec2(-2, 0), 0.0).rgb, e = textureLod(uSrc, vUV, 0.0).rgb, f = textureLod(uSrc, vUV + uPx * vec2(2, 0), 0.0).rgb;
+  vec3 g = textureLod(uSrc, vUV + uPx * vec2(-2, -2), 0.0).rgb, h = textureLod(uSrc, vUV + uPx * vec2(0, -2), 0.0).rgb, i = textureLod(uSrc, vUV + uPx * vec2(2, -2), 0.0).rgb;
+  vec3 j = textureLod(uSrc, vUV + uPx * vec2(-1, 1), 0.0).rgb, k = textureLod(uSrc, vUV + uPx * vec2(1, 1), 0.0).rgb, l = textureLod(uSrc, vUV + uPx * vec2(-1, -1), 0.0).rgb, m = textureLod(uSrc, vUV + uPx * vec2(1, -1), 0.0).rgb;
+  if (uFirst == 1) {
+    vec3 g0 = (a + b + d + e) * 0.25, g1 = (b + c + e + f) * 0.25, g2 = (d + e + g + h) * 0.25, g3 = (e + f + h + i) * 0.25, g4 = (j + k + l + m) * 0.25;
+    float w0 = kw(g0) * 0.125, w1 = kw(g1) * 0.125, w2 = kw(g2) * 0.125, w3 = kw(g3) * 0.125, w4 = kw(g4) * 0.5;
+    o = vec4((g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);
+  } else o = vec4(e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125, 1.0);
+}`;
+const FS_BLOOM_UP = `
+in vec2 vUV; uniform sampler2D uSrc; uniform vec2 uPx; uniform float uGain; out vec4 o;
+void main(){
+  vec3 s = textureLod(uSrc, vUV, 0.0).rgb * 4.0;
+  s += (textureLod(uSrc, vUV + uPx * vec2(1, 0), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(-1, 0), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(0, 1), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(0, -1), 0.0).rgb) * 2.0;
+  s += textureLod(uSrc, vUV + uPx * vec2(1, 1), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(-1, 1), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(1, -1), 0.0).rgb + textureLod(uSrc, vUV + uPx * vec2(-1, -1), 0.0).rgb;
+  o = vec4(s / 16.0 * uGain, 1.0);
+}`;
+const FS_FINAL = `
+in vec2 vUV; uniform sampler2D uSharp, uDof, uBloom; uniform float uFocus, uFocusK, uMaxBlur, uExposure, uBloomK, uBloomN, uTime, uFade, uAspect;
+out vec4 o;
+${GLSL_NOISE}
+vec3 scene(vec2 uv){
+  vec4 s = textureLod(uSharp, uv, 0.0), d = textureLod(uDof, uv, 0.0);
+  float c = abs(clamp((1.0 / uFocus - 1.0 / s.a) * uFocusK, -uMaxBlur, uMaxBlur));
+  return mix(s.rgb, d.rgb, smoothstep(0.9, 2.4, max(c, d.a * 0.7)));
+}
+// AgX display transform (Troy Sobotka), polynomial fit by B. Wrensch
+vec3 agxCurve(vec3 x){ vec3 x2 = x * x, x4 = x2 * x2; return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232; }
+vec3 agx(vec3 v){
+  const mat3 m = mat3(0.842479062253094, 0.0423282422610123, 0.0423756549057051, 0.0784335999999992, 0.878468636469772, 0.0784336, 0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+  const mat3 mi = mat3(1.19687900512017, -0.0528968517574562, -0.0529716355144438, -0.0980208811401368, 1.15190312990417, -0.0980434501171241, -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+  v = m * max(v, vec3(1e-10)); v = clamp(log2(v), -12.47393, 4.026069); v = agxCurve((v + 12.47393) / 16.500999);
+  float l = dot(v, vec3(0.2126, 0.7152, 0.0722)); v = pow(max(v, vec3(0.0)), vec3(1.3)); v = l + 1.36 * (v - l);
+  return clamp(mi * v, 0.0, 1.0);
+}
+void main(){
+  vec2 c = vUV - 0.5; vec2 ca = vec2(c.x * uAspect, c.y); float r2 = dot(ca, ca) / (0.25 * (uAspect * uAspect + 1.0));
+  vec2 off = c * r2 * 0.0035;
+  vec3 col = vec3(scene(vUV + off).r, scene(vUV).g, scene(vUV - off).b);
+  col = mix(col, textureLod(uBloom, vUV, 0.0).rgb * uBloomN, uBloomK);
+  col *= uExposure * mix(1.0, 0.5, smoothstep(0.12, 1.05, r2));
+  col = agx(col);
+  // grade: cool shadows, a touch of warmth in the highlights, gentle toe
+  float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col += vec3(-0.012, 0.004, 0.02) * (1.0 - smoothstep(0.0, 0.45, l)) + vec3(0.012, 0.004, -0.014) * smoothstep(0.5, 1.0, l);
+  col = mix(col, col * col * (3.0 - 2.0 * col), 0.22);
+  // film grain + dither
+  vec2 gp = gl_FragCoord.xy + fract(uTime * vec2(13.7, 7.9)) * 911.0;
+  float gr = hash21(gp) + hash21(gp + 61.7) - 1.0;
+  col += gr * (0.016 + 0.02 * (1.0 - l)) * 0.75;
+  col = max(col * uFade, vec3(0.0));
+  o = vec4(col + (hash21(gp * 1.37 + 3.1) - 0.5) / 255.0, 1.0);
+}`;
+// ------------------------------------------------------------------ renderer: scene resources
+const S = { items: [], tunnel: null, atlas: null, env: null, time: 0, belt: 0, spin: 0, debug: 0 };
+const P = {};                                       // shader programs
+const PROBE = [0.0, 0.75, 0.0];
+const BOX_MIN = [HALL.x0, 0.0, -HALL.zw], BOX_MAX = [HALL.x1, HALL.h, HALL.zw];
+const FOG_COL = [0.02, 0.027, 0.036], FOG_DEN = 0.011;
+const KEY_COL = (() => { const l = 0.2126 * LIGHT_CEIL[0] + 0.7152 * LIGHT_CEIL[1] + 0.0722 * LIGHT_CEIL[2]; return LIGHT_CEIL.map((x) => x / l); })();
+const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+const LM = { w: 1024, h: 768, rect: [-6.0, -4.5, 12.0, 9.0] };              // floor shadow map: x0, z0, sizeX, sizeZ
+const VOL = { dim: [80, 16, 32], tiles: [4, 4], min: [-4.0, 0.0, -1.9], size: [10.0, 2.0, 3.8] };   // smoke light volume
+
+function setupScene() {
+  const car = buildCar();
+  S.car = car;
+  const matOf = { paint: 0, carbon: 1, metal: 3, helmet: 4, matte: 5, emis: 6 };
+  let off = 0;
+  const gpu = {};
+  for (const k in car.meshes) gpu[k] = uploadMesh(car.meshes[k]);
+  for (const k in matOf) { S.items.push({ g: gpu[k], mat: matOf[k], model: M4.ident(), bakeOff: off, name: k }); off += gpu[k].nv; }
+  for (const w of car.wheels) { S.items.push({ g: gpu[w.mesh], mat: 2, model: w.model, bakeOff: off, wheel: w, name: w.mesh }); off += gpu[w.mesh].nv; }
+  if (off > BAKE_W * BAKE_H) console.warn('bake atlas too small for', off, 'vertices');
+  S.bakeCount = off;
+  S.tunnel = uploadMesh(buildTunnel());
+  S.atlas = buildAtlas();
+}
+
+function compilePrograms() {
+  P.tunnel = makeProgram('tunnel', VS_TUNNEL, FS_TUNNEL);
+  P.car = makeProgram('car', VS_CAR, FS_CAR);
+  P.depth = makeProgram('depth', VS_DEPTH, FS_DEPTH);
+  P.bake = makeProgram('bake', VS_BAKE, FS_BAKE);
+  P.bakeRes = makeProgram('bakeRes', VS_FS, FS_BAKE_RESOLVE);
+  P.bakeFloor = makeProgram('bakeFloor', VS_FS, FS_BAKE_FLOOR);
+  P.prefilter = makeProgram('prefilter', VS_FS, FS_PREFILTER);
+}
+
+function setLightUniforms() {
+  const c = [], u = [], v = [], col = [];
+  for (const l of RECT_LIGHTS) { c.push(...l.c); u.push(...l.u); v.push(...l.v); col.push(...l.col); }
+  U('uLC', c); U('uLU', u); U('uLV', v); U('uLCol', col);
+}
+function setEnvUniforms() {
+  UT('uEnv', gl.TEXTURE_CUBE_MAP, S.env); U('uBoxMin', BOX_MIN); U('uBoxMax', BOX_MAX); U('uProbe', PROBE);
+}
+
+function drawTunnel(vp, eye, pass, emis) {
+  use(P.tunnel);
+  U('uVP', vp); U('uEye', eye); U('uPass', pass); U('uEmis', emis === undefined ? 1 : emis); U('uBelt', S.belt);
+  U('uFogCol', FOG_COL); U('uFogDen', FOG_DEN); U('uAmb', [0.08, 0.09, 0.105]);
+  setLightUniforms();
+  UT('uEnv', gl.TEXTURE_CUBE_MAP, pass === 1 ? S.blackCube : S.env); U('uBoxMin', BOX_MIN); U('uBoxMax', BOX_MAX); U('uProbe', PROBE);
+  UT('uLM', gl.TEXTURE_2D, BK.lm || S.black); U('uLMRect', LM.rect);
+  UT('uRefl', gl.TEXTURE_2D, pass === 0 && RT.refl ? RT.refl : S.black);
+  if (pass === 0) { U('uInvRes', [1 / RT.w, 1 / RT.h]); U('uReflPx', [1 / RT.rw, 1 / RT.rh]); U('uFocal', (RT.rh * 0.5) / Math.tan(CAM.fov * 0.5)); }
+  UT('uAtlas', gl.TEXTURE_2D, S.atlas); U('uRHall', ATLAS.rects.hall); U('uRFlow', ATLAS.rects.flow); U('uRCaution', ATLAS.rects.caution);
+  gl.bindVertexArray(S.tunnel.vao);
+  gl.drawElements(gl.TRIANGLES, S.tunnel.count, gl.UNSIGNED_INT, 0);
+}
+
+function drawCar(vp, eye, pass) {
+  use(P.car);
+  U('uVP', vp); U('uEye', eye); U('uPass', pass); U('uTime', S.time); U('uDebug', S.debug);
+  U('uKey', KEY_COL); U('uSky', [0.07, 0.08, 0.095]); U('uGround', [0.24, 0.25, 0.265]);
+  U('uFogCol', FOG_COL); U('uFogDen', FOG_DEN);
+  setEnvUniforms();
+  UT('uBake', gl.TEXTURE_2D, BK.tex); UT('uAtlas', gl.TEXTURE_2D, S.atlas);
+  U('uRNum', ATLAS.rects.num); U('uRLabel', ATLAS.rects.label); U('uRProto', ATLAS.rects.proto); U('uRAero', ATLAS.rects.aero); U('uRTyre', ATLAS.rects.tyre);
+  for (const it of S.items) {
+    U('uModel', it.model); U('uMat', it.mat); U('uBakeOff', it.bakeOff);
+    if (it.wheel) { U('uSpin', S.spin * it.wheel.spin); U('uBlur', S.spinBlur); U('uWC', [it.model[12], it.model[13], it.model[14]]); }
+    gl.bindVertexArray(it.g.vao);
+    gl.drawElements(gl.TRIANGLES, it.g.count, gl.UNSIGNED_INT, 0);
+  }
+}
+
+// ------------------------------------------------------------------ environment cube: capture the lit hall, then GGX-prefilter it
+function captureEnvironment() {
+  const size = 512, levels = Math.log2(size) + 1;
+  const mk = (lv) => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);
+    gl.texStorage2D(gl.TEXTURE_CUBE_MAP, lv, gl.RGBA16F, size, size);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  S.envRaw = mk(levels); S.env = mk(ENV_LEVELS);
+  const drb = renderbuffer(size, size, gl.DEPTH_COMPONENT24, 0), fbo = gl.createFramebuffer();
+  const dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], ups = [[0, -1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0], [0, -1, 0]];
+  const proj = M4.persp(PI / 2, 1, 0.05, 80);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, drb);
+  gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND); gl.depthMask(true);
+  for (let f = 0; f < 6; f++) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, S.envRaw, 0);
+    gl.viewport(0, 0, size, size); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    drawTunnel(M4.mul(proj, M4.lookAt(PROBE, V.add(PROBE, dirs[f]), ups[f])), PROBE, 1, 1);
+  }
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, null);
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, S.envRaw); gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+  gl.disable(gl.DEPTH_TEST);
+  use(P.prefilter);
+  for (let lv = 0; lv < ENV_LEVELS; lv++) {
+    const sz = size >> lv;
+    for (let f = 0; f < 6; f++) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, S.env, lv);
+      gl.viewport(0, 0, sz, sz);
+      texUnit = 0; UT('uSrc', gl.TEXTURE_CUBE_MAP, S.envRaw); U('uFace', f); U('uRough', lv / (ENV_LEVELS - 1)); U('uSrcSize', size);
+      drawFS();
+    }
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fbo); gl.deleteRenderbuffer(drb);
+}
+
+// ------------------------------------------------------------------ light baking
+// The ceiling panels are sampled as a few hundred point lights with shadow maps; their summed, shadowed
+// contribution is accumulated per car vertex, into a floor shadow map, and into a small volume that shades the smoke.
+const BK = { samples: [], done: 0, tex: null, lm: null, vol: null };
+function setupBake() {
+  const SM = 2048;
+  BK.sm = SM;
+  BK.shadow = tex2D(SM, SM, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, { filter: gl.LINEAR });
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+  BK.shadowFBO = makeFBO([], BK.shadow);
+  const mk = (w, h, f) => tex2D(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, { filter: f });
+  BK.a = mk(BAKE_W, BAKE_H, gl.NEAREST); BK.b = mk(BAKE_W, BAKE_H, gl.NEAREST); BK.tex = mk(BAKE_W, BAKE_H, gl.NEAREST);
+  BK.accFBO = makeFBO([BK.a, BK.b]); BK.resFBO = makeFBO([BK.tex]);
+  BK.lm = mk(LM.w, LM.h, gl.LINEAR); BK.lmFBO = makeFBO([BK.lm]);
+  BK.vol = mk(VOL.dim[0] * VOL.tiles[0], VOL.dim[2] * VOL.tiles[1], gl.LINEAR); BK.volFBO = makeFBO([BK.vol]);
+  for (const f of [BK.accFBO, BK.resFBO, BK.lmFBO, BK.volFBO]) { gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  const C = [0, 0.5, 0], RAD = 3.25, rnd = mulberry32(7);
+  const persp = (pos) => {
+    const d = V.len(V.sub(pos, C)), fov = 2 * Math.asin(Math.min(RAD / d, 0.98)), dir = V.norm(V.sub(C, pos));
+    const up = Math.abs(dir[1]) > 0.9 ? [1, 0, 0] : [0, 1, 0];
+    return M4.mul(M4.persp(fov, 1, Math.max(d - RAD, 0.3), d + RAD), M4.lookAt(pos, C, up));
+  };
+  // emitters: every ceiling panel and wall strip, stratified along its length
+  const add = (cx, cy, cz, hx, hy, hz, nrm, n, radiance) => {
+    const area = 4 * (hx || 1) * (hy || 1) * (hz || 1);
+    for (let i = 0; i < n; i++) {
+      const u = (i + rnd()) / n * 2 - 1, v = rnd() * 2 - 1;
+      const pos = [cx + u * hx, cy + (hx && hz ? 0 : v * hy), cz + (hx && hz ? v * hz : 0)];
+      BK.samples.push({ mode: 0, pos, nrm, w: (radiance * area) / (PI * n), vp: persp(pos) });
+    }
+  };
+  for (const z of CEIL_ROWS) for (let k = 0; k < CEIL_SEG.n; k++) add(CEIL_SEG.x0 + k * (CEIL_SEG.len + CEIL_SEG.gap) + CEIL_SEG.len / 2, CEIL_SEG.y, z, CEIL_SEG.len / 2, 0, CEIL_SEG.hw, [0, -1, 0], 5, lum(LIGHT_CEIL));
+  for (const sg of [1, -1]) for (let k = 0; k < WALL_SEG.n; k++) add(WALL_SEG.x0 + k * (WALL_SEG.len + WALL_SEG.gap) + WALL_SEG.len / 2, WALL_SEG.y, sg * (HALL.zw - 0.03), WALL_SEG.len / 2, WALL_SEG.hh, 0, [0, 0, -sg], 4, lum(LIGHT_WALL));
+  // shuffle so the picture converges evenly while the bake is still running
+  for (let i = BK.samples.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = BK.samples[i]; BK.samples[i] = BK.samples[j]; BK.samples[j] = t; }
+  BK.nPanel = BK.samples.length;
+  // ambient occlusion: uniformly distributed directions, orthographic shadow maps
+  const NA = 80;
+  for (let i = 0; i < NA; i++) {
+    const y = 1 - (2 * (i + 0.5)) / NA, r = Math.sqrt(1 - y * y), a = i * 2.399963229728653, dir = [r * Math.cos(a), y, r * Math.sin(a)];
+    const up = Math.abs(dir[1]) > 0.9 ? [1, 0, 0] : [0, 1, 0];
+    BK.samples.push({ mode: 1, pos: dir, nrm: [0, 0, 0], w: 1, vp: M4.mul(M4.ortho(-RAD, RAD, -RAD, RAD, 0.5, 2 * RAD + 6), M4.lookAt(V.mad(C, dir, RAD + 3), C, up)) });
+  }
+}
+function bakeStep(count) {
+  if (BK.done >= BK.samples.length) return false;
+  for (let n = 0; n < count && BK.done < BK.samples.length; n++) {
+    const s = BK.samples[BK.done++];
+    // shadow map
+    gl.bindFramebuffer(gl.FRAMEBUFFER, BK.shadowFBO); gl.viewport(0, 0, BK.sm, BK.sm);
+    gl.enable(gl.DEPTH_TEST); gl.depthMask(true); gl.depthFunc(gl.LESS); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+    gl.clearDepth(1); gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(1.5, 3.0);
+    use(P.depth); U('uLVP', s.vp);
+    for (const it of S.items) { U('uModel', it.model); gl.bindVertexArray(it.g.vao); gl.drawElements(gl.TRIANGLES, it.g.count, gl.UNSIGNED_INT, 0); }
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    // accumulate per vertex
+    gl.bindFramebuffer(gl.FRAMEBUFFER, BK.accFBO); gl.viewport(0, 0, BAKE_W, BAKE_H);
+    gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    use(P.bake); U('uLVP', s.vp); U('uLPos', s.pos); U('uLNrm', s.nrm); U('uLW', s.w); U('uMode', s.mode); U('uLMRect', LM.rect);
+    UT('uShadow', gl.TEXTURE_2D, BK.shadow); UT('uLM', gl.TEXTURE_2D, s.mode === 1 ? BK.lm : S.black);
+    for (const it of S.items) { U('uModel', it.model); U('uOff', it.bakeOff); gl.bindVertexArray(it.g.vao); gl.drawArrays(gl.POINTS, 0, it.g.nv); }
+    if (s.mode === 0) {
+      use(P.bakeFloor); U('uLVP', s.vp); U('uLPos', s.pos); U('uLNrm', s.nrm); U('uLW', s.w); U('uLMRect', LM.rect);
+      UT('uShadow', gl.TEXTURE_2D, BK.shadow);
+      U('uVolMin', VOL.min); U('uVolSize', VOL.size); U('uVolDim', VOL.dim); U('uVolTiles', VOL.tiles);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, BK.lmFBO); gl.viewport(0, 0, LM.w, LM.h); U('uVolume', 0); drawFS();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, BK.volFBO); gl.viewport(0, 0, VOL.dim[0] * VOL.tiles[0], VOL.dim[2] * VOL.tiles[1]); U('uVolume', 1); drawFS();
+    }
+  }
+  gl.disable(gl.BLEND);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, BK.resFBO); gl.viewport(0, 0, BAKE_W, BAKE_H);
+  use(P.bakeRes); UT('uA', gl.TEXTURE_2D, BK.a); UT('uB', gl.TEXTURE_2D, BK.b); drawFS();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return true;
+}
+
+// ------------------------------------------------------------------ per-frame render targets
+const RT = {};
+function disposeTargets() {
+  for (const k in RT) { const o = RT[k]; if (o instanceof WebGLTexture) gl.deleteTexture(o); else if (o instanceof WebGLFramebuffer) gl.deleteFramebuffer(o); else if (o instanceof WebGLRenderbuffer) gl.deleteRenderbuffer(o); delete RT[k]; }
+}
+function setupTargets(w, h) {
+  disposeTargets();
+  RT.w = w; RT.h = h; RT.samples = Math.min(4, MAX_SAMPLES);
+  for (;;) {
+    RT.msColor = renderbuffer(w, h, gl.RGBA16F, RT.samples); RT.msDepth = renderbuffer(w, h, gl.DEPTH_COMPONENT24, RT.samples);
+    RT.msFBO = makeFBO([{ rb: RT.msColor }], { rb: RT.msDepth });
+    gl.bindFramebuffer(gl.FRAMEBUFFER, RT.msFBO);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE || RT.samples === 0) break;
+    gl.deleteFramebuffer(RT.msFBO); gl.deleteRenderbuffer(RT.msColor); gl.deleteRenderbuffer(RT.msDepth); RT.samples = 0;       // no multisampled float targets here
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  RT.scene = tex2D(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, { filter: gl.LINEAR });
+  RT.depth = tex2D(w, h, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, { filter: gl.NEAREST });
+  RT.resFBO = makeFBO([RT.scene], RT.depth);
+  RT.rw = Math.max(2, w >> 1); RT.rh = Math.max(2, h >> 1);
+  const lv = Math.floor(Math.log2(Math.max(RT.rw, RT.rh))) + 1;
+  RT.refl = tex2D(RT.rw, RT.rh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, { levels: lv, min: gl.LINEAR_MIPMAP_LINEAR });
+  RT.reflDepth = renderbuffer(RT.rw, RT.rh, gl.DEPTH_COMPONENT24, 0);
+  RT.reflFBO = makeFBO([RT.refl], { rb: RT.reflDepth });
+  if (typeof setupPostTargets === 'function') setupPostTargets(w, h);
+}
+// ------------------------------------------------------------------ smoke simulation + post processing
+const SM = { state: [null, null], fbo: [null, null], cur: 0, acc: 0, emit: 0, simT: 0, on: true };
+const PT = { bloom: [], bloomFBO: [], bloomSize: [] };
+const TUNE = { exposure: 0.58, bloom: 0.07, smokeAmb: 0.22, smokeKey: 2.3, smokeTint: [0.93, 0.96, 1.0], dofK: 0.017, dofMax: 0.011, focus: 6 };
+
+function compileFxPrograms() {
+  P.smokeStep = makeProgram('smokeStep', VS_FS, FS_SMOKE_STEP);
+  P.smoke = makeProgram('smoke', VS_SMOKE, FS_SMOKE);
+  P.hdepth = makeProgram('hdepth', VS_FS, FS_HDEPTH);
+  P.composite = makeProgram('composite', VS_FS, FS_COMPOSITE);
+  P.dof = makeProgram('dof', VS_FS, FS_DOF);
+  P.bloomDown = makeProgram('bloomDown', VS_FS, FS_BLOOM_DOWN);
+  P.bloomUp = makeProgram('bloomUp', VS_FS, FS_BLOOM_UP);
+  P.final = makeProgram('final', VS_FS, FS_FINAL);
+}
+
+function setupSmoke() {
+  const { NP, NS, NK } = SMK, init = new Float32Array(NP * NS * 4);
+  SM.seed = new Float32Array(NS * 3);
+  for (let s = 0; s < NS; s++) {
+    SM.seed[s * 3] = RAKE_X + 0.175; SM.seed[s * 3 + 1] = SEEDS[s][1]; SM.seed[s * 3 + 2] = SEEDS[s][0];
+    for (let j = 0; j < NP; j++) { const o = (s * NP + j) * 4; init[o] = SM.seed[s * 3]; init[o + 1] = SM.seed[s * 3 + 1]; init[o + 2] = SM.seed[s * 3 + 2]; }
+  }
+  for (let k = 0; k < 2; k++) {
+    SM.state[k] = tex2D(NP, NS, CAN32 ? gl.RGBA32F : gl.RGBA16F, gl.RGBA, gl.FLOAT, { data: init, filter: gl.NEAREST });
+    SM.fbo[k] = makeFBO([SM.state[k]]);
+  }
+  // kinematic turbulence: random solenoidal Fourier modes over a decade and a half of scales
+  const rnd = mulberry32(90210), unit = () => { const z = rnd() * 2 - 1, a = rnd() * TAU, r = Math.sqrt(1 - z * z); return [r * Math.cos(a), z, r * Math.sin(a)]; };
+  SM.kk = new Float32Array(NK * 3); SM.ka = new Float32Array(NK * 3); SM.kp0 = new Float64Array(NK); SM.kr = new Float64Array(NK); SM.kp = new Float32Array(NK);
+  let e = 0; const amp = [];
+  const LAM0 = 2.4, LAM1 = 0.3;
+  for (let m = 0; m < NK; m++) { const lam = LAM0 * Math.pow(LAM1 / LAM0, m / (NK - 1)); amp.push(Math.pow(lam, 1 / 3)); e += 0.5 * amp[m] * amp[m]; }
+  for (let m = 0; m < NK; m++) {
+    const lam = LAM0 * Math.pow(LAM1 / LAM0, m / (NK - 1)), k = TAU / lam, kd = unit(), a = V.norm(V.cross(kd, unit())), A = amp[m] / Math.sqrt(e);
+    for (let c = 0; c < 3; c++) { SM.kk[m * 3 + c] = kd[c] * k; SM.ka[m * 3 + c] = a[c] * A; }
+    SM.kp0[m] = rnd() * TAU;
+    SM.kr[m] = (rnd() < 0.5 ? -1 : 1) * 0.4 * k * 0.25 * FLOW.U * Math.pow(lam / LAM0, 1 / 3) - kd[0] * k * 0.75 * FLOW.U;
+  }
+  SM.va = new Float32Array(SMK.NV * 3); SM.vb = new Float32Array(SMK.NV * 3); SM.vg = new Float32Array(SMK.NV);
+  VORT.forEach((s, i) => { SM.va.set(s.a, i * 3); SM.vb.set(s.b, i * 3); SM.vg[i] = s.k; });
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+  for (let i = 0; i < NP + 60; i++) smokeSubstep();          // start with fully developed streaks
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+function smokeSubstep() {
+  const src = SM.cur, dst = 1 - src, F = FLOW, W = WAKE;
+  for (let m = 0; m < SMK.NK; m++) SM.kp[m] = (SM.kp0[m] + SM.kr[m] * SM.simT) % TAU;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, SM.fbo[dst]); gl.viewport(0, 0, SMK.NP, SMK.NS);
+  use(P.smokeStep);
+  UT('uPrev', gl.TEXTURE_2D, SM.state[src]); UT('uVel', gl.TEXTURE_3D, F.velTex); UT('uWake', gl.TEXTURE_3D, F.wakeTex);
+  U('uVMin', [F.x0, F.y0, F.z0]); U('uVSize', [F.nx * F.dx, F.ny * F.dx, F.nz * F.dx]);
+  U('uWMin', [W.x0, W.y0, W.z0]); U('uWSize', [W.nx * W.dx, W.ny * W.dx, W.nz * W.dx]);
+  U('uH', F.h); U('uU', F.U); U('uTime', SM.simT);
+  U('uSeed', SM.seed); U('uKK', SM.kk); U('uKA', SM.ka); U('uKP', SM.kp); U('uVA', SM.va); U('uVB', SM.vb); U('uVG', SM.vg);
+  drawFS();
+  SM.cur = dst; SM.emit = (SM.emit + 1) % 262144; SM.simT += F.h;
+}
+function stepSmoke(dt) {
+  if (!SM.state[0]) return;
+  SM.acc += dt;
+  let n = Math.floor(SM.acc / FLOW.h); SM.acc -= n * FLOW.h; n = Math.min(n, 14);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+  for (let i = 0; i < n; i++) smokeSubstep();
+}
+
+// smoke as seen in the floor mirror: coarser segments, depth-tested per segment, blended straight into the reflection
+function drawSmokeMirror(viewM) {
+  if (!SM.state[0] || !SM.on) return;
+  const th = Math.tan(CAM.fov * 0.5);
+  gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE); gl.depthMask(false); gl.disable(gl.CULL_FACE);
+  use(P.smoke);
+  UT('uState', gl.TEXTURE_2D, SM.state[SM.cur]); UT('uDepth', gl.TEXTURE_2D, S.black); UT('uLVol', gl.TEXTURE_2D, BK.vol);
+  U('uView', viewM); U('uProj', CAM.proj); U('uInvView', M4.invert(viewM)); U('uVP', [RT.rw, RT.rh]); U('uInvVP', [1 / RT.rw, 1 / RT.rh]);
+  U('uTanHalf', [th * (RT.w / RT.h), th]); U('uEmit', SM.emit); U('uH', FLOW.h); U('uLight', [TUNE.smokeAmb, TUNE.smokeKey]);
+  U('uVolMin', VOL.min); U('uVolSize', VOL.size); U('uVolDim', VOL.dim); U('uVolTiles', VOL.tiles);
+  U('uMirror', 1); U('uLodBias', 1); U('uTint', TUNE.smokeTint);
+  gl.bindVertexArray(emptyVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (SMK.NP - 1) * SMK.NS);
+  gl.disable(gl.BLEND); gl.depthMask(true); gl.enable(gl.CULL_FACE);
+}
+
+function setupPostTargets(w, h) {
+  for (const k of ['hdepth', 'smoke', 'comp', 'dof']) if (PT[k]) gl.deleteTexture(PT[k]);
+  for (const k of ['hdFBO', 'smokeFBO', 'compFBO', 'dofFBO']) if (PT[k]) gl.deleteFramebuffer(PT[k]);
+  PT.bloom.forEach((t) => gl.deleteTexture(t)); PT.bloomFBO.forEach((f) => gl.deleteFramebuffer(f));
+  PT.bloom = []; PT.bloomFBO = []; PT.bloomSize = [];
+  const hf = (ww, hh, f) => tex2D(ww, hh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, { filter: f });
+  PT.scale = w * h > 1.5e6 ? 2 : 1;
+  PT.sw = Math.ceil(w / PT.scale); PT.sh = Math.ceil(h / PT.scale);
+  PT.hdepth = CAN32 ? tex2D(PT.sw, PT.sh, gl.R32F, gl.RED, gl.FLOAT, { filter: gl.NEAREST }) : tex2D(PT.sw, PT.sh, gl.R16F, gl.RED, gl.HALF_FLOAT, { filter: gl.NEAREST });
+  PT.hdFBO = makeFBO([PT.hdepth]);
+  PT.smoke = hf(PT.sw, PT.sh, gl.NEAREST); PT.smokeFBO = makeFBO([PT.smoke]);
+  PT.comp = hf(w, h, gl.LINEAR); PT.compFBO = makeFBO([PT.comp]);
+  PT.dw = Math.max(2, w >> 1); PT.dh = Math.max(2, h >> 1);
+  PT.dof = hf(PT.dw, PT.dh, gl.LINEAR); PT.dofFBO = makeFBO([PT.dof]);
+  let bw = PT.dw, bh = PT.dh;
+  for (let i = 0; i < 6 && bw >= 4 && bh >= 4; i++) { const t = hf(bw, bh, gl.LINEAR); PT.bloom.push(t); PT.bloomFBO.push(makeFBO([t])); PT.bloomSize.push([bw, bh]); bw = Math.max(2, bw >> 1); bh = Math.max(2, bh >> 1); }
+}
+
+function renderPost(dt) {
+  const w = RT.w, h = RT.h, nf = [CAM.near, CAM.far];
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+  // linear depth at smoke resolution
+  gl.bindFramebuffer(gl.FRAMEBUFFER, PT.hdFBO); gl.viewport(0, 0, PT.sw, PT.sh);
+  use(P.hdepth); UT('uDepth', gl.TEXTURE_2D, RT.depth); U('uNF', nf); U('uScale', PT.scale); drawFS();
+  // smoke optical depth
+  gl.bindFramebuffer(gl.FRAMEBUFFER, PT.smokeFBO); gl.viewport(0, 0, PT.sw, PT.sh);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (SM.state[0] && SM.on) {
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    use(P.smoke);
+    const th = Math.tan(CAM.fov * 0.5);
+    UT('uState', gl.TEXTURE_2D, SM.state[SM.cur]); UT('uDepth', gl.TEXTURE_2D, PT.hdepth); UT('uLVol', gl.TEXTURE_2D, BK.vol);
+    U('uView', CAM.view); U('uProj', CAM.proj); U('uInvView', M4.invert(CAM.view)); U('uVP', [PT.sw, PT.sh]); U('uInvVP', [1 / PT.sw, 1 / PT.sh]);
+    U('uTanHalf', [th * (w / h), th]); U('uEmit', SM.emit); U('uH', FLOW.h); U('uLight', [TUNE.smokeAmb, TUNE.smokeKey]);
+    U('uVolMin', VOL.min); U('uVolSize', VOL.size); U('uVolDim', VOL.dim); U('uVolTiles', VOL.tiles);
+    U('uMirror', 0); U('uLodBias', 0); U('uTint', TUNE.smokeTint);
+    gl.bindVertexArray(emptyVAO);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (SMK.NP - 1) * SMK.NS);
+    gl.disable(gl.BLEND);
+  }
+  // scene + smoke
+  gl.bindFramebuffer(gl.FRAMEBUFFER, PT.compFBO); gl.viewport(0, 0, w, h);
+  use(P.composite);
+  UT('uScene', gl.TEXTURE_2D, RT.scene); UT('uDepth', gl.TEXTURE_2D, RT.depth); UT('uSmoke', gl.TEXTURE_2D, PT.smoke); UT('uHDepth', gl.TEXTURE_2D, PT.hdepth);
+  U('uNF', nf); U('uSmokeSize', [PT.sw, PT.sh]); U('uSmokeTint', TUNE.smokeTint); U('uFocus', TUNE.focus); drawFS();
+  // focus follows the part of the car nearest the lens
+  const e = CAM.eye, near = V.len(V.sub(e, [clamp(e[0], -2.85, 2.7), clamp(e[1], 0.1, 0.95), clamp(e[2], -0.95, 0.95)])), mid = V.len(V.sub(e, CAM.tgt));
+  const f = TUNE.focusFix || lerp(near, mid, 0.5); TUNE.focus += (f - TUNE.focus) * (1 - Math.exp(-dt * 4));
+  const K = TUNE.dofK * h * (0.5 / CAM.fov), cap = TUNE.dofMax * h, maxBlur = clamp(K * (1 / TUNE.focus - 1 / 60) * 1.05 + 1.5, 2, cap);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, PT.dofFBO); gl.viewport(0, 0, PT.dw, PT.dh);
+  use(P.dof); UT('uSrc', gl.TEXTURE_2D, PT.comp); U('uPx', [1 / w, 1 / h]); U('uFocus', TUNE.focus); U('uFocusK', K); U('uMaxBlur', maxBlur); drawFS();
+  // bloom pyramid
+  const nb = PT.bloom.length;
+  use(P.bloomDown);
+  for (let i = 0; i < nb; i++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, PT.bloomFBO[i]); gl.viewport(0, 0, PT.bloomSize[i][0], PT.bloomSize[i][1]);
+    texUnit = 0; UT('uSrc', gl.TEXTURE_2D, i === 0 ? PT.comp : PT.bloom[i - 1]);
+    U('uPx', i === 0 ? [1 / w, 1 / h] : [1 / PT.bloomSize[i - 1][0], 1 / PT.bloomSize[i - 1][1]]); U('uFirst', i === 0 ? 1 : 0); drawFS();
+  }
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  use(P.bloomUp);
+  for (let i = nb - 2; i >= 0; i--) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, PT.bloomFBO[i]); gl.viewport(0, 0, PT.bloomSize[i][0], PT.bloomSize[i][1]);
+    texUnit = 0; UT('uSrc', gl.TEXTURE_2D, PT.bloom[i + 1]); U('uPx', [1 / PT.bloomSize[i + 1][0], 1 / PT.bloomSize[i + 1][1]]); U('uGain', 1); drawFS();
+  }
+  gl.disable(gl.BLEND);
+  // lens + film
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+  use(P.final);
+  UT('uSharp', gl.TEXTURE_2D, PT.comp); UT('uDof', gl.TEXTURE_2D, PT.dof); UT('uBloom', gl.TEXTURE_2D, PT.bloom[0]);
+  U('uFocus', TUNE.focus); U('uFocusK', K); U('uMaxBlur', maxBlur); U('uExposure', TUNE.exposure); U('uBloomK', TUNE.bloom); U('uBloomN', 1 / nb);
+  U('uTime', S.time % 100); U('uFade', 1); U('uAspect', w / h);
+  drawFS();
+}
+// ------------------------------------------------------------------ camera: slow cinematic glide + orbit / zoom controls
+const CAM = {
+  fov: 0.5, az: 2.2, el: 0.2, zoom: 0.93, azT: 2.2, elT: 0.2, zoomT: 0.93, dist: 7, tgt: [0.1, 0.45, 0], vel: 0, velEl: 0,
+  auto: 1, lastInput: -1e9, dragging: false, eye: [0, 0, 0], view: null, proj: null, near: 0.12, far: 90, frozen: false,
+};
+function camDir(az, el) { return [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)]; }
+// Zoom runs between two smooth shells around the car: an inner one that keeps the lens just clear of the bodywork
+// (so a full zoom is a close-up of whatever faces the camera) and an outer one that stays inside the hall.
+const ellipsoid = (d, ax, ay, az) => 1 / Math.sqrt((d[0] * d[0]) / (ax * ax) + (d[1] * d[1]) / (ay * ay) + (d[2] * d[2]) / (az * az));
+const camMinDist = (d) => ellipsoid(d, 4.0, 1.85, 2.0);
+const camMaxDist = (d) => Math.min(10.5, ellipsoid(d, 7.5, HALL.h - 1.1, HALL.zw - 0.7));
+function touchCamera() { CAM.lastInput = performance.now(); $('hint').classList.remove('on'); }
+function updateCamera(dt, time) {
+  const idle = (performance.now() - CAM.lastInput) / 1000, wantAuto = !CAM.dragging && idle > 3.2 && !CAM.frozen;
+  CAM.auto = clamp(CAM.auto + (wantAuto ? dt / 3.0 : -dt / 0.4), 0, 1);
+  const k = CAM.auto * CAM.auto * (3 - 2 * CAM.auto);
+  if (!CAM.dragging && !CAM.frozen) {
+    // inertia after a drag, blending into the automatic glide
+    const glide = 0.082 * (1 + 0.22 * Math.sin(time * 0.071));
+    CAM.vel *= Math.exp(-dt * 2.4); CAM.velEl *= Math.exp(-dt * 3.5);
+    CAM.azT += (CAM.vel * (1 - k) + glide * k) * dt;
+    CAM.elT += CAM.velEl * (1 - k) * dt;
+    // choreography: low and wide along the flanks, rising for the views down the length of the car
+    // (higher still when directly behind, to look down over the rising wake rather than through it)
+    const c = Math.cos(CAM.azT), cr = Math.max(c, 0);
+    const elAuto = 0.13 + 0.08 * Math.sin(time * 0.083 + 1.0) + 0.17 * c * c + 0.17 * cr * cr * cr + 0.04 * Math.sin(time * 0.031);
+    const zoomAuto = Math.min(1, 0.8 + 0.2 * (1 - c * c) + 0.07 * Math.sin(time * 0.057 + 2.0) - 0.05 * (0.5 + 0.5 * Math.sin(time * 0.023)));
+    CAM.elT += (elAuto - CAM.elT) * (1 - Math.exp(-dt * 0.22)) * k;
+    CAM.zoomT += (zoomAuto - CAM.zoomT) * (1 - Math.exp(-dt * 0.16)) * k;
+    const tx = 0.1 + 0.4 * Math.sin(time * 0.043), ty = 0.44 + 0.07 * Math.sin(time * 0.061);
+    CAM.tgt[0] += (tx - CAM.tgt[0]) * (1 - Math.exp(-dt * 0.3)) * k; CAM.tgt[1] += (ty - CAM.tgt[1]) * (1 - Math.exp(-dt * 0.3)) * k;
+  }
+  CAM.elT = clamp(CAM.elT, 0.015, 1.45);
+  CAM.zoomT = clamp(CAM.zoomT, 0, 1);
+  const s = 1 - Math.exp(-dt * 10);
+  CAM.az += (CAM.azT - CAM.az) * s; CAM.el += (CAM.elT - CAM.el) * s; CAM.zoom += (CAM.zoomT - CAM.zoom) * (1 - Math.exp(-dt * 7));
+  // hold the horizontal field of view so the car stays framed; on tall (portrait) screens, where that would need an
+  // extreme lens, cap the lens and step the camera back instead (less so when zoomed right in, to keep close-ups close)
+  const aspect = RT.w / RT.h;
+  CAM.fov = clamp(2 * Math.atan(0.42 / aspect), 0.36, 1.3);
+  const back = 1 + (clamp(0.42 / (Math.tan(CAM.fov * 0.5) * aspect), 1, 1.7) - 1) * CAM.zoom;
+  const d = camDir(CAM.az, CAM.el), lo = camMinDist(d), hi = Math.max(camMaxDist(d), lo + 0.5);
+  if (!CAM.frozen) CAM.dist = Math.min(lo * Math.pow(hi / lo, CAM.zoom) * back, Math.max(hi, lo));
+  CAM.eye = V.mad(CAM.tgt, d, CAM.dist);
+  if (CAM.eye[1] < 0.16) CAM.eye[1] = 0.16;
+  CAM.view = M4.lookAt(CAM.eye, CAM.tgt, [0, 1, 0]);
+  CAM.proj = M4.persp(CAM.fov, aspect, CAM.near, CAM.far);
+  CAM.vp = M4.mul(CAM.proj, CAM.view);
+}
+function setupInput() {
+  const pts = new Map(); let pinch = 0, lastT = 0;
+  const ROT = 0.0052;
+  canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); CAM.dragging = true; CAM.vel = 0; CAM.velEl = 0; lastT = performance.now();
+    if (pts.size === 2) { const a = [...pts.values()]; pinch = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y); }
+    canvas.classList.add('drag'); touchCamera(); e.preventDefault();
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    const p = pts.get(e.pointerId); if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
+    if (pts.size === 1) {
+      CAM.azT += dx * ROT; CAM.elT = clamp(CAM.elT + dy * ROT, 0.015, 1.5);
+      const now = performance.now(), dtm = Math.max((now - lastT) / 1000, 1 / 240); lastT = now;
+      CAM.vel = lerp(CAM.vel, clamp((dx * ROT) / dtm, -6, 6), 0.35); CAM.velEl = lerp(CAM.velEl, clamp((dy * ROT) / dtm, -4, 4), 0.35);
+    } else if (pts.size === 2) {
+      const a = [...pts.values()], d = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y);
+      if (pinch > 0 && d > 0) CAM.zoomT = clamp(CAM.zoomT + Math.log2(pinch / d) * 0.55, 0, 1);
+      pinch = d;
+    }
+    touchCamera(); e.preventDefault();
+  });
+  const up = (e) => {
+    pts.delete(e.pointerId);
+    if (pts.size < 2) pinch = 0;
+    if (pts.size === 0) { CAM.dragging = false; canvas.classList.remove('drag'); if (performance.now() - lastT > 90) { CAM.vel = 0; CAM.velEl = 0; } }
+    else { CAM.vel = 0; CAM.velEl = 0; }
+    touchCamera();
+  };
+  canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up); canvas.addEventListener('lostpointercapture', up);
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const dy = e.deltaY * (e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? 400 : 1);
+    CAM.zoomT = clamp(CAM.zoomT + clamp(dy, -240, 240) * (e.ctrlKey ? 0.006 : 0.0013), 0, 1);
+    touchCamera();
+  }, { passive: false });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, (e) => e.preventDefault());
+  window.addEventListener('keydown', (e) => {
+    const k = e.key; let used = true;
+    if (k === 'ArrowLeft') CAM.azT -= 0.12; else if (k === 'ArrowRight') CAM.azT += 0.12;
+    else if (k === 'ArrowUp') CAM.elT += 0.06; else if (k === 'ArrowDown') CAM.elT -= 0.06;
+    else if (k === '+' || k === '=') CAM.zoomT -= 0.08; else if (k === '-' || k === '_') CAM.zoomT += 0.08; else used = false;
+    if (used) { touchCamera(); e.preventDefault(); }
+  });
+}
+
+// ------------------------------------------------------------------ frame
+const FS_FINAL_SIMPLE = `in vec2 vUV; uniform sampler2D uSrc; out vec4 o;
+void main(){ vec3 c = texture(uSrc, vUV).rgb * 1.0; c = c / (1.0 + c); o = vec4(pow(c, vec3(1.0 / 2.2)), 1.0); }`;
+
+function renderScene() {
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true); gl.disable(gl.BLEND); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+  // mirrored pass for the floor reflections
+  const mirror = M4.scale(1, -1, 1), vpM = M4.mul(CAM.vp, mirror), eyeM = [CAM.eye[0], -CAM.eye[1], CAM.eye[2]];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.reflFBO); gl.viewport(0, 0, RT.rw, RT.rh);
+  gl.clearColor(FOG_COL[0], FOG_COL[1], FOG_COL[2], 60); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.frontFace(gl.CW);
+  drawTunnel(vpM, eyeM, 2); drawCar(vpM, eyeM, 2);
+  gl.frontFace(gl.CCW);
+  if (typeof drawSmokeMirror === 'function') drawSmokeMirror(M4.mul(CAM.view, mirror));
+  gl.bindTexture(gl.TEXTURE_2D, RT.refl); gl.generateMipmap(gl.TEXTURE_2D);
+  // main pass
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.msFBO); gl.viewport(0, 0, RT.w, RT.h);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawTunnel(CAM.vp, CAM.eye, 0); drawCar(CAM.vp, CAM.eye, 0);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, RT.msFBO); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, RT.resFBO);
+  gl.blitFramebuffer(0, 0, RT.w, RT.h, 0, 0, RT.w, RT.h, gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+}
+
+let lastNow = 0, frameNo = 0, ready = false;
+const PERF = { ema: 16.7, scale: 1 };
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2) * PERF.scale;
+  let w = Math.max(2, Math.floor(canvas.clientWidth * dpr)), h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+  const cap = 3.7e6; if (w * h > cap) { const s = Math.sqrt(cap / (w * h)); w = Math.floor(w * s); h = Math.floor(h * s); }
+  if (w !== RT.w || h !== RT.h) { canvas.width = w; canvas.height = h; setupTargets(w, h); }
+}
+// keep the frame rate up on slower GPUs by trading resolution: scale down when frames run long, back up when there is headroom
+function adaptResolution(rawDt) {
+  if (USE_TIMER || !ready || rawDt > 0.2) return;
+  PERF.ema += (rawDt * 1000 - PERF.ema) * 0.06; PERF.hold = (PERF.hold || 0) + rawDt;
+  PERF.sinceUp = (PERF.sinceUp || 0) + rawDt;
+  if (PERF.hold < 1.2) return;
+  if (PERF.ema > 25 && PERF.scale > 0.45) { if (PERF.sinceUp < 8) PERF.upFails = (PERF.upFails || 0) + 1; PERF.scale = Math.max(0.45, PERF.scale * 0.84); PERF.hold = 0; PERF.ema = 17; }
+  else if (PERF.ema < 17.5 && PERF.scale < 1 && PERF.hold > 6 && (PERF.upFails || 0) < 2) { PERF.scale = Math.min(1, PERF.scale * 1.1); PERF.hold = 0; PERF.sinceUp = 0; }
+}
+function frame(now) {
+  raf(frame);
+  const rawDt = (now - lastNow) / 1000, dt = clamp(rawDt, 0.001, 0.05); lastNow = now;
+  adaptResolution(rawDt);
+  resize();
+  S.time += dt;
+  const U0 = typeof FLOW !== 'undefined' ? FLOW.U : 12, om = U0 / CAR.R;
+  S.belt = (S.belt + U0 * dt) % 9800; S.spin = (S.spin + om * dt) % TAU; S.spinBlur = om / 330;
+  updateCamera(dt, S.time);
+  if (bakeStep(frameNo < 3 ? 4 : 10)) { const p = BK.done / BK.samples.length; $('loadbar').style.width = (60 + 40 * p).toFixed(1) + '%'; }
+  else if (!ready) { ready = true; $('veil').classList.add('off'); $('load').classList.add('off'); setTimeout(() => { if (performance.now() - CAM.lastInput > 5000) $('hint').classList.add('on'); }, 2600); setTimeout(() => $('hint').classList.remove('on'), 11000); }
+  if (typeof stepSmoke === 'function') stepSmoke(dt);
+  renderScene();
+  if (typeof renderPost === 'function') renderPost(dt);
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, RT.w, RT.h); use(P.finalSimple); UT('uSrc', gl.TEXTURE_2D, RT.scene); drawFS(); }
+  frameNo++;
+}
+
+async function boot() {
+  const step = async (txt, pct) => { $('loadtxt').textContent = txt; $('loadbar').style.width = pct + '%'; await nextFrame(); await nextFrame(); };
+  S.black = tex2D(1, 1, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, { data: new Uint8Array([0, 0, 0, 255]), filter: gl.NEAREST });
+  S.blackCube = gl.createTexture(); gl.bindTexture(gl.TEXTURE_CUBE_MAP, S.blackCube);
+  for (let f = 0; f < 6; f++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  await step('Building the car', 6);
+  setupScene();
+  await step('Compiling materials', 22);
+  compilePrograms();
+  P.finalSimple = makeProgram('finalSimple', VS_FS, FS_FINAL_SIMPLE);
+  if (typeof compileFxPrograms === 'function') compileFxPrograms();
+  await step('Lighting the hall', 36);
+  setupBake();
+  captureEnvironment();
+  if (typeof setupFlow === 'function') { await step('Solving the airflow', 46); await setupFlow(step); }
+  await step('Tracing light', 60);
+  setupInput();
+  resize();
+  lastNow = performance.now();
+  raf(frame);
+}
+// ?debug exposes inspection hooks (camera placement, fast-forward, frame timing) on window.__f1
+if (QS.has('debug')) window.__f1 = {
+  S, CAM, BK, RT, P, SM, TUNE, FLOW, PT, SMK, ATLAS,
+  cam(az, el, dist, tx, ty, tz) { CAM.frozen = true; CAM.az = CAM.azT = az; CAM.el = CAM.elT = el; CAM.dist = dist; if (tx !== undefined) CAM.tgt = [tx, ty, tz]; },
+  free() { CAM.frozen = false; },
+  // fast-forward the automatic camera (debug)
+  skip(sec) { CAM.frozen = false; CAM.lastInput = -1e9; for (let t = 0; t < sec; t += 1 / 30) { S.time += 1 / 30; updateCamera(1 / 30, S.time); } },
+  // render n frames back to back and report the average cost, forcing the GPU to finish
+  bench(n = 20) { const px = new Uint8Array(4), t0 = performance.now(); for (let i = 0; i < n; i++) { renderScene(); renderPost(1 / 60); } gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); return (performance.now() - t0) / n; },
+};
+boot().catch((e) => { console.error(e); try { fatal('Could not start the renderer: ' + e.message); } catch (err) { /* already shown */ } });
+})();
+</script>
+</body>
+</html>

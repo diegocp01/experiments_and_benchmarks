@@ -1,0 +1,11 @@
+import {chromium} from '/Users/diego/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/index.mjs';
+const browser=await chromium.launch({executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true,args:['--allow-file-access-from-files']});
+const page=await browser.newPage({viewport:{width:1600,height:1000},deviceScaleFactor:1});
+let errors=[];page.on('pageerror',e=>{errors.push(e.message);console.log('PAGE ERROR: '+e.message);});page.on('console',m=>{if(m.type()==='error'){errors.push(m.text());console.log(m.text());}});
+await page.goto('file:///Users/diego/Downloads/miami-gpt/ocean-drive.html');
+await page.waitForFunction(()=>window.sceneReady,null,{timeout:120000});
+await page.evaluate(()=>window.oceanDrive.seek(5));await page.waitForTimeout(1600);
+await page.screenshot({path:'review/refined-005.png'});
+console.log(JSON.stringify({errors,stats:await page.evaluate(()=>window.oceanDrive.stats)},null,2));
+await page.evaluate(()=>window.oceanDrive.seek(38));await page.waitForTimeout(500);await page.screenshot({path:'review/refined-038.png'});
+await browser.close();

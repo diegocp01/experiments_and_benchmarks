@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Procedural City</title>
+<link rel="stylesheet" href="styles.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="view" tabindex="0"></canvas>
+
+<aside id="panel">
+  <header>
+    <h1>Procedural City</h1>
+    <p id="subtitle">Generated in your browser — no assets</p>
+  </header>
+
+  <label class="field" for="seed">
+    <span>Seed</span>
+    <div class="seed-row">
+      <input id="seed" type="text" maxlength="24" spellcheck="false" autocomplete="off">
+      <button id="apply" class="ghost" title="Build the city for this seed (Enter)">Build</button>
+    </div>
+  </label>
+
+  <div class="buttons">
+    <button id="regen" class="primary" title="New random seed (R)">Regenerate City</button>
+    <button id="daynight" title="Toggle day / night (N)"><span class="ico" id="dn-ico">☾</span><span id="dn-label">Night</span></button>
+    <button id="fly" title="Toggle fly-through mode (F)"><span class="ico">✈</span><span id="fly-label">Fly mode</span></button>
+  </div>
+
+  <dl id="stats">
+    <div><dt>Buildings</dt><dd id="s-buildings">–</dd></div>
+    <div><dt>Trees</dt><dd id="s-trees">–</dd></div>
+    <div><dt>Cars</dt><dd id="s-cars">–</dd></div>
+    <div><dt>FPS</dt><dd id="s-fps">–</dd></div>
+  </dl>
+</aside>
+
+<div id="help">
+  <span id="help-orbit"><b>Drag</b> orbit · <b>Right-drag</b> pan · <b>Scroll</b> zoom · <b>F</b> fly · <b>N</b> day/night · <b>R</b> regenerate</span>
+  <span id="help-fly" hidden><b>WASD</b> move · <b>Mouse</b> look · <b>Space / Q</b> up / down · <b>Shift</b> boost · <b>Esc</b> or <b>F</b> exit</span>
+</div>
+
+<div id="crosshair" hidden></div>
+<div id="loading"><div class="spinner"></div><span id="loading-text">Generating city…</span></div>
+
+<script>
+  // Shown if the modules cannot load (opened from file://, or the Three.js CDN is unreachable).
+  function loadFailed() {
+    var el = document.getElementById('loading');
+    el.classList.add('error');
+    document.getElementById('loading-text').textContent =
+      'Could not load the app. Serve this folder with a static server (e.g. "python3 -m http.server") and check that the Three.js CDN is reachable.';
+  }
+</script>
+<script type="module" src="src/main.js" onerror="loadFailed()"></script>
+</body>
+</html>

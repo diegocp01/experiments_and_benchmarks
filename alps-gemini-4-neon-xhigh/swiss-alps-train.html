@@ -1,0 +1,3070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Swiss Alps Express — Window Seat</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: #07090d;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", sans-serif;
+    color: #f4f1ea;
+  }
+  #glcanvas {
+    display: block; width: 100vw; height: 100vh;
+    touch-action: none;
+    cursor: grab;
+  }
+  #glcanvas.dragging { cursor: grabbing; }
+
+  #hint {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    padding: 8px 18px; border-radius: 999px;
+    background: rgba(12, 15, 21, 0.48);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    font-size: 12px; letter-spacing: 0.06em; font-weight: 400;
+    color: rgba(246, 243, 236, 0.90);
+    pointer-events: none;
+    transition: opacity 1.1s ease;
+    white-space: nowrap;
+  }
+  #hint.hidden { opacity: 0; }
+
+  #hud {
+    position: fixed; left: 20px; bottom: 20px;
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 13px; border-radius: 10px;
+    background: rgba(10, 13, 18, 0.38);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    font-size: 11px; letter-spacing: 0.06em;
+    opacity: 0.34;
+    transition: opacity 0.4s ease, background 0.4s ease;
+    z-index: 10;
+  }
+  #hud:hover { opacity: 0.94; background: rgba(10, 13, 18, 0.72); }
+  #hud .cross {
+    width: 14px; height: 14px; border-radius: 2px; background: #c41e25;
+    position: relative; flex-shrink: 0;
+  }
+  #hud .cross::before, #hud .cross::after {
+    content: ""; position: absolute; background: #fff; left: 50%; top: 50%; transform: translate(-50%,-50%);
+  }
+  #hud .cross::before { width: 8px; height: 2.5px; }
+  #hud .cross::after { width: 2.5px; height: 8px; }
+  #hud .loc { font-weight: 500; color: rgba(255,252,245,0.92); text-transform: uppercase; }
+  #hud .meta { color: rgba(220,226,236,0.72); font-variant-numeric: tabular-nums; }
+  #hud .dots { display: flex; gap: 5px; margin-left: 6px; padding-left: 8px; border-left: 1px solid rgba(255,255,255,0.16); }
+  #hud .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(255,255,255,0.28); border: none; padding: 0; cursor: pointer;
+    transition: transform 0.2s ease, background 0.2s ease;
+  }
+  #hud .dot:hover { background: rgba(255,255,255,0.85); transform: scale(1.25); }
+  #hud .dot.active { background: #e8b86d; transform: scale(1.2); }
+
+  #err {
+    display: none; position: fixed; inset: 0; align-items: center; justify-content: center;
+    background: #0c1017; color: #f2ece4; padding: 32px; text-align: center; z-index: 99;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="hint">Drag to look 360° &nbsp;·&nbsp; Scroll or pinch to zoom</div>
+<div id="hud">
+  <div class="cross" title="Swiss Alps Express"></div>
+  <span class="loc" id="hudLoc">ALPINE LAKE VISTA</span>
+  <span class="meta" id="hudMeta">1,540 m</span>
+  <div class="dots" id="hudDots">
+    <button class="dot" data-s="190" title="Alpine Lake & Village (1)"></button>
+    <button class="dot" data-s="865" title="Landwasser Stone Viaduct (2)"></button>
+    <button class="dot" data-s="1210" title="Granite Cliff Tunnel (3)"></button>
+    <button class="dot" data-s="1635" title="Pine Forest Gorge (4)"></button>
+    <button class="dot" data-s="2068" title="Avalanche Gallery (5)"></button>
+  </div>
+</div>
+<div id="err"></div>
+
+<script>
+(() => {
+"use strict";
+
+// ============================================================================
+// 1. CONSTANTS, HASH PARAMS & DETERMINISTIC PRNG
+// ============================================================================
+const LOOP_LEN = 2800.0;
+const BASE_SPEED = 26.5; // m/s (~95 km/h)
+const WIN_PLANE_X = 1.40;
+// Seated cleanly at right window seat: lower-left periphery frames smoked walnut table edge,
+// glowing brass lamp & espresso cup while main 82% of viewport opens onto the soaring Swiss Alps!
+const CAM_SEAT_POS = [0.66, 1.32, 0.30];
+const DEFAULT_YAW = -0.065;   // -3.7° gently forward-looking out the panoramic window
+const DEFAULT_PITCH = -0.028; // -1.6° frames lake/valley below + soaring summits & sapphire sky above!
+const DEFAULT_FOV = 53.0;
+
+function parseHashParams() {
+  const out = {};
+  const h = (location.hash || "").replace(/^#/, "");
+  if (!h) return out;
+  for (const part of h.split("&")) {
+    const [k, v] = part.split("=");
+    if (k) out[decodeURIComponent(k)] = v !== undefined ? decodeURIComponent(v) : "1";
+  }
+  return out;
+}
+const HASH = parseHashParams();
+if (HASH.nohud === "1") {
+  document.getElementById("hud").style.display = "none";
+  document.getElementById("hint").style.display = "none";
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mix(a, b, t) { return a + (b - a) * t; }
+function smoothstep(e0, e1, x) {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+function wrapS(s) {
+  let r = s % LOOP_LEN;
+  return r < 0 ? r + LOOP_LEN : r;
+}
+function wrapDeltaS(ds) {
+  return ((ds + LOOP_LEN * 0.5) % LOOP_LEN + LOOP_LEN) % LOOP_LEN - LOOP_LEN * 0.5;
+}
+function smoothBox(s, a, b, feather) {
+  const mid = 0.5 * (a + b);
+  const half = 0.5 * (b - a);
+  const d = Math.abs(wrapDeltaS(s - mid));
+  return 1.0 - smoothstep(half - feather, half + feather, d);
+}
+
+// Golden late-afternoon Alpine cross-light (sculpts bold dark cobalt shadows & luminous golden-ivory snow ridges!)
+const SUN_WORLD = (() => {
+  const x = 0.34, y = 0.28, z = -0.898;
+  const l = Math.hypot(x, y, z);
+  return [x / l, y / l, z / l];
+})();
+
+// ============================================================================
+// 2. FAST 2D NOISE & SHARED ALPINE TERRAIN MODEL
+// ============================================================================
+const PERM = new Uint8Array(512);
+(() => {
+  const rng = mulberry32(133742);
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  for (let i = 255; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = p[i]; p[i] = p[j]; p[j] = tmp;
+  }
+  for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+})();
+
+function hash2(ix, iy) { return PERM[(ix & 255) + PERM[iy & 255]] / 255.0; }
+function vnoise2(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+  return mix(
+    mix(hash2(ix, iy), hash2(ix + 1, iy), ux),
+    mix(hash2(ix, iy + 1), hash2(ix + 1, iy + 1), ux),
+    uy
+  );
+}
+function pnoise(s, u, freqS, freqU, phase = 0) {
+  const ang = (s / LOOP_LEN) * Math.PI * 2.0;
+  const R = freqS / (Math.PI * 2.0);
+  const cx = Math.cos(ang) * R + phase * 13.7;
+  const cy = Math.sin(ang) * R + u * freqU + phase * 7.3;
+  return 0.55 * vnoise2(cx + u * freqU * 0.42, cy) + 0.45 * vnoise2(cy * 0.87 - phase * 5.1, cx * 1.13 + u * freqU * 0.92);
+}
+function ridgedPeriodic(s, u, freqS, freqU, octaves = 4) {
+  let sum = 0.0, amp = 0.55, w = 1.0, fs = freqS, fu = freqU;
+  for (let i = 0; i < octaves; i++) {
+    const n = pnoise(s, u, fs, fu, i * 1.7 + 0.3);
+    let r = 1.0 - Math.abs(n * 2.0 - 1.0);
+    r = r * r * w;
+    w = clamp(r * 1.75, 0.18, 1.0);
+    sum += r * amp;
+    fs *= 2.0; fu *= 2.05; amp *= 0.48;
+  }
+  return sum;
+}
+function fbmPeriodic(s, u, freqS, freqU, octaves = 4) {
+  let sum = 0.0, amp = 0.5, fs = freqS, fu = freqU;
+  for (let i = 0; i < octaves; i++) {
+    sum += pnoise(s, u, fs, fu, i * 2.3 + 4.1) * amp;
+    fs *= 2.0; fu *= 2.03; amp *= 0.5;
+  }
+  return sum;
+}
+
+// ============================================================================
+// 3. PERIODIC TRACK SPLINE & JOURNEY ZONES
+// ============================================================================
+const KNOT_X = [
+  -24, -40, -36, -18,   // 0..525: graceful overlook above glacial turquoise lake & Swiss village
+   -8,  32, 138, 235,   // 700..1225: sweeping right curve onto gorge viaduct & into granite cliff tunnel!
+  218, 135,  48,  -8,   // 1400..1925: tunnel exit into lush dense pine forest gorge
+  -34, -46, -36, -26    // 2100..2625: avalanche gallery, spur tunnel, return to lake
+];
+const KNOT_Y = [
+   70,  68,  67,  69,
+   72,  76,  78,  80,
+   82,  82,  79,  76,
+   78,  80,  76,  72
+];
+
+function evalPeriodicBSpline(knots, s) {
+  const n = knots.length;
+  const f = (wrapS(s) / LOOP_LEN) * n;
+  const i1 = Math.floor(f) % n;
+  const t = f - Math.floor(f);
+  const p0 = knots[(i1 - 1 + n) % n], p1 = knots[i1], p2 = knots[(i1 + 1) % n], p3 = knots[(i1 + 2) % n];
+  const t2 = t * t, t3 = t2 * t;
+  const val = ((1 - t)**3 * p0 + (3*t3 - 6*t2 + 4)*p1 + (-3*t3 + 3*t2 + 3*t + 1)*p2 + t3*p3) / 6;
+  const d1 = (-3*(1 - t)**2 * p0 + (9*t2 - 12*t)*p1 + (-9*t2 + 6*t + 3)*p2 + 3*t2*p3) / 6;
+  const d2 = (6*(1 - t)*p0 + (18*t - 12)*p1 + (-18*t + 6)*p2 + 6*t*p3) / 6;
+  const scale = n / LOOP_LEN;
+  return { val, d1: d1 * scale, d2: d2 * scale * scale };
+}
+
+function evalTrack(s) {
+  const sw = wrapS(s);
+  const bx = evalPeriodicBSpline(KNOT_X, sw);
+  const by = evalPeriodicBSpline(KNOT_Y, sw);
+  const tx = bx.d1, ty = by.d1, tz = -1.0;
+  const tlen = Math.hypot(tx, ty, tz);
+  const fwd = [tx / tlen, ty / tlen, tz / tlen];
+  const rlen = Math.hypot(1.0, bx.d1);
+  const right = [1.0 / rlen, 0.0, bx.d1 / rlen];
+  const up = [
+    right[1]*fwd[2] - right[2]*fwd[1],
+    right[2]*fwd[0] - right[0]*fwd[2],
+    right[0]*fwd[1] - right[1]*fwd[0]
+  ];
+  const curvature = bx.d2 / Math.pow(1.0 + bx.d1 * bx.d1, 1.5);
+  return {
+    s: sw, x: bx.val, y: by.val, z: -sw,
+    dx: bx.d1, dy: by.d1, curvature,
+    bank: clamp(-curvature * 12.0, -0.055, 0.055),
+    fwd, right, up
+  };
+}
+
+// Secondary Iconic Curved Landwasser-Style Stone Viaduct across the Gorge (visible DEAD-CENTER out the window at s=760..1040!)
+// Sweeps gracefully in a dramatic high masonry arc across the rocky gorge (with a moving red Glacier Express train gliding across it!)
+function evalGorgeViaduct(t) {
+  // t in [0, 1] along 280m curved stone bridge spanning the chasm from rocky left cliff (s=760, u=225) curving forward into right granite bluff (s=1020, u=145)
+  const s = mix(755.0, 1025.0, t);
+  const tr = evalTrack(s);
+  // Graceful Landwasser arc bowing out toward the valley (+u)
+  const uArc = mix(205.0, 142.0, t) + Math.sin(t * Math.PI) * 58.0;
+  const wx = tr.x + uArc;
+  const wy = 46.0 + Math.sin(t * Math.PI) * 2.0; // Majestic bridge deck sitting 65m above the foaming gorge river & framed dead-center from our window at y=76m!
+  const wz = -s;
+  return [wx, wy, wz, s, uArc];
+}
+function evalGorgeViaductFrame(t) {
+  const eps = 0.004;
+  const p0 = evalGorgeViaduct(clamp(t - eps, 0, 1));
+  const p1 = evalGorgeViaduct(clamp(t + eps, 0, 1));
+  const p  = evalGorgeViaduct(t);
+  let fx = p1[0] - p0[0], fy = p1[1] - p0[1], fz = p1[2] - p0[2];
+  const fl = Math.hypot(fx, fy, fz) || 1;
+  fx /= fl; fy /= fl; fz /= fl;
+  let rx = -fz, ry = 0, rz = fx;
+  const rl = Math.hypot(rx, rz) || 1;
+  rx /= rl; rz /= rl;
+  const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+  return { pos: [p[0], p[1], p[2]], fwd: [fx, fy, fz], right: [rx, ry, rz], up: [ux, uy, uz] };
+}
+
+const TUNNEL1_A = 1140, TUNNEL1_B = 1480;
+const TUNNEL2_A = 2180, TUNNEL2_B = 2285;
+const GALLERY_A = 2015, GALLERY_B = 2180;
+const VIADUCT_A = 700,  VIADUCT_B = 1140;
+
+function getTunnelFactor(s) {
+  return Math.max(smoothBox(s, TUNNEL1_A, TUNNEL1_B, 5.5), smoothBox(s, TUNNEL2_A, TUNNEL2_B, 5.0));
+}
+function getGalleryFactor(s) { return smoothBox(s, GALLERY_A, GALLERY_B, 4.0); }
+function getViaductFactor(s) { return smoothBox(s, VIADUCT_A, VIADUCT_B, 14.0); }
+function getSectionInfo(s) {
+  const sw = wrapS(s);
+  const tr = evalTrack(sw);
+  const elev = Math.round(1470 + tr.y * 1.15);
+  if (sw >= TUNNEL1_A - 8 && sw <= TUNNEL1_B + 8) return { name: "Landwasser Cliff Tunnel", elev, idx: 2 };
+  if (sw >= VIADUCT_A - 20 && sw < TUNNEL1_A - 8) return { name: "Landwasser Stone Viaduct", elev, idx: 1 };
+  if (sw > TUNNEL1_B + 8 && sw < GALLERY_A) return { name: "Albula Pine Forest Gorge", elev, idx: 3 };
+  if (sw >= GALLERY_A && sw <= TUNNEL2_B + 10) return { name: "Alpine Avalanche Gallery", elev, idx: 4 };
+  if (sw > TUNNEL2_B + 10) return { name: "High Glacier Valley", elev, idx: 0 };
+  return { name: "Alpine Lake & Village", elev, idx: 0 };
+}
+
+// ============================================================================
+// 4. MASTER PROCEDURAL ALPINE HEIGHTFIELD H(s, u) (V3: Natural Lakeshore + Dramatic Summits + Lush Gorge!)
+// ============================================================================
+function terrainHeight(s, u) {
+  const sw = wrapS(s);
+  const tr = evalTrack(sw);
+  const trackY = tr.y;
+
+  const viaductMask = smoothBox(sw, VIADUCT_A + 10, VIADUCT_B - 10, 38.0);
+  const tunnel1Mask = smoothBox(sw, TUNNEL1_A - 10, TUNNEL1_B + 10, 20.0);
+  const tunnel2Mask = smoothBox(sw, TUNNEL2_A - 10, TUNNEL2_B + 10, 18.0);
+  const tunnelMask  = Math.max(tunnel1Mask, tunnel2Mask);
+  const forestZone  = smoothBox(sw, 1495, 2000, 42.0);
+
+  // Organic winding alpine lake contour (no straight boxy corners!)
+  const shoreWarp = (fbmPeriodic(sw, 0.0, 9.0, 0.01, 3) - 0.5) * 85.0;
+  const lakeMask  = smoothBox(sw + shoreWarp * 0.45, -15, 625, 85.0);
+  const villageFlat = smoothBox(sw, 130, 415, 42.0) * smoothstep(260, 315, u) * (1.0 - smoothstep(430, 515, u));
+  const hamletFlat  = smoothBox(sw, 1690, 1910, 38.0) * smoothstep(138, 178, u) * (1.0 - smoothstep(262, 315, u));
+
+  let h = trackY - 1.0;
+
+  if (u >= 0.0) {
+    // Near slope drop-off: steep overlooking lake & viaduct, gentler lush wooded shelf in Pine Forest Gorge so tall spruces soar across window!
+    const steepDrop = smoothstep(3.2, mix(70.0, 125.0, forestZone), u);
+    const valleyFloorY = mix(mix(18.0, 42.0, forestZone), -14.0, lakeMask);
+    let baseSlope = mix(trackY - 1.2, valleyFloorY, Math.pow(steepDrop, mix(0.76, 1.15, forestZone)));
+
+    // Deep Rocky Viaduct Gorge spanning cleanly beneath BOTH our bridge AND the iconic curved Landwasser chasm viaduct (u = 0..320m)!
+    const gorgeWidth = 1.0 - smoothstep(175.0, 390.0, u);
+    baseSlope = mix(baseSlope, -23.0 + 18.0 * smoothstep(95.0, 290.0, u), viaductMask * gorgeWidth);
+
+    // Organic curved Glacial Lake Basin (multi-harmonic organic bays & coves — ZERO straight lines!)
+    const bayWave = Math.sin(sw * 0.017) * 34.0 + Math.cos(sw * 0.031 + 1.2) * 20.0 + shoreWarp * 0.65;
+    const uLakeNear = 46.0 + bayWave * 0.35;
+    const uLakeFar  = 295.0 + bayWave * 0.72;
+    const inLakeU = smoothstep(uLakeNear - 24.0, uLakeNear + 34.0, u) * (1.0 - smoothstep(uLakeFar - 55.0, uLakeFar + 38.0, u));
+    baseSlope = mix(baseSlope, -12.0, lakeMask * inLakeU);
+
+    // Scenic Alpine Village Peninsula jutting organically into the turquoise lake
+    const penWarp = (fbmPeriodic(sw, 100.0, 11.0, 0.01, 2) - 0.5) * 44.0 + Math.sin(sw * 0.024) * 22.0;
+    const peninsula = smoothBox(sw + penWarp * 0.45, 118, 430, 62.0) * smoothstep(245.0 + penWarp * 0.38, 308.0 + penWarp * 0.38, u) * (1.0 - smoothstep(425.0, 545.0, u));
+    baseSlope = mix(baseSlope, 9.5 + (u - 285.0) * 0.15, peninsula * 0.94);
+
+    // Mid-range dramatic forested foothills & rugged valleys (u = 380m .. 2200m)
+    const midRamp = smoothstep(370.0, 2400.0, u);
+    const midRidges = ridgedPeriodic(sw, u, 6.0, 0.0014, 4);
+    const midDetail = fbmPeriodic(sw, u, 14.0, 0.0038, 3);
+    const midLift = Math.pow(midRamp, 1.38) * (250.0 + 380.0 * midRidges) + midRamp * (midDetail - 0.45) * 110.0;
+
+    // Monumental Sculpted Swiss Alpine Peaks (tuned so EVERY iconic jagged summit crowns cleanly against sapphire sky!)
+    const farRamp = smoothstep(1350.0, 5600.0, u);
+    const megaRidge1 = ridgedPeriodic(sw, u * 0.85, 4.0, 0.00044, 5);
+    const megaRidge2 = ridgedPeriodic(sw + 430.0, u * 1.15, 7.0, 0.00090, 4);
+
+    const addPeak = (sPeak, uPeak, radS, radU, peakH) => {
+      const ds = wrapDeltaS(sw - sPeak);
+      const du = u - uPeak;
+      const dist = Math.hypot(ds / radS, du / radU);
+      if (dist > 2.2) return 0.0;
+      const ang = Math.atan2(du, ds);
+      const arete = 0.74 + 0.26 * Math.abs(Math.cos(ang * 1.5 + sPeak * 0.013));
+      const cone = Math.max(0.0, 1.0 - dist * 0.62);
+      const sharp = Math.pow(cone, 1.65) * arete * peakH;
+      const crag = 0.74 + 0.44 * ridgedPeriodic(sw + sPeak * 0.3, u, 9.0, 0.0014, 3);
+      return sharp * crag;
+    };
+
+    // Sculpted iconic Swiss skyline peaks framed completely INSIDE upper third of panoramic window!
+    const heroPeaks =
+      addPeak( 175, 4800,  620, 1450,  760) + // Iconic Matterhorn pyramid framed cleanly below top window edge!
+      addPeak( 460, 5400,  740, 1700,  690) + // Twin jagged glaciated peak beside lake
+      addPeak( 880, 4900,  700, 1600,  790) + // Soaring Piz Bernina crown above Landwasser Viaduct!
+      addPeak(1240, 5600,  780, 1800,  720) +
+      addPeak(1660, 4800,  680, 1600,  760) + // Dramatic Eiger peak rising above dense spruce forest!
+      addPeak(2140, 5100,  740, 1700,  740) + // Crisp summit framed between Avalanche Gallery pillars!
+      addPeak(2560, 5200,  760, 1700,  680);
+
+    const farLift = Math.pow(farRamp, 1.24) * (240.0 + 520.0 * megaRidge1 + 210.0 * megaRidge2) + heroPeaks;
+    const nearNoise = (fbmPeriodic(sw, u, 28.0, 0.016, 3) - 0.5) * 16.0 * smoothstep(10.0, 48.0, u) * (1.0 - smoothstep(200.0, 380.0, u));
+
+    h = baseSlope + nearNoise + midLift + farLift;
+
+    if (villageFlat > 0.01) {
+      const targetV = 8.5 + clamp((u - 280.0) * 0.15, 0.0, 32.0);
+      h = mix(h, targetV, villageFlat * 0.80);
+    }
+    if (hamletFlat > 0.01) {
+      const targetH = 54.0 + clamp((u - 150.0) * 0.17, 0.0, 26.0);
+      h = mix(h, targetH, hamletFlat * 0.75);
+    }
+    if (tunnelMask > 0.001) {
+      const cliffSpan = 1.0 - smoothstep(20.0, 250.0, u);
+      const cliffNoise = ridgedPeriodic(sw, u, 16.0, 0.012, 3);
+      const cliffH = trackY + 110.0 + 150.0 * cliffNoise;
+      h = mix(h, Math.max(h, cliffH), tunnelMask * cliffSpan);
+    }
+  } else {
+    // OPPOSITE WINDOW SIDE (-u): Scenic rocky sunlit Alpine ridge with exposed granite cliffs, pine slopes & blue sky visible above!
+    const au = -u;
+    const nearRise = smoothstep(5.0, 45.0, au);
+    // Keep crest elevation gentle (~18° angle) so opposite window sees lush pines + rugged granite cliffs + crisp sapphire sky above!
+    const slopeRise = Math.pow(au, 0.96) * 0.24;
+    const crag = ridgedPeriodic(sw, au, 11.0, 0.0055, 4) * (14.0 + au * 0.24);
+    const farBack = smoothstep(240.0, 1450.0, au) * (160.0 + 380.0 * ridgedPeriodic(sw + 900, au, 5.0, 0.0012, 4));
+    h = trackY - 3.0 + nearRise * (2.5 + slopeRise + crag) + farBack;
+
+    const gorgeBack = viaductMask * (1.0 - smoothstep(45.0, 200.0, au));
+    h = mix(h, -21.0 + au * 0.34, gorgeBack);
+
+    const galMask = smoothBox(sw, GALLERY_A - 15, GALLERY_B + 15, 22.0);
+    if (galMask > 0.001) {
+      const galCliff = 1.0 - smoothstep(8.0, 120.0, au);
+      h = mix(h, Math.max(h, trackY + 80.0 + au * 0.8), galMask * galCliff);
+    }
+    if (tunnelMask > 0.001) {
+      const cliffSpan = 1.0 - smoothstep(10.0, 220.0, au);
+      h = mix(h, Math.max(h, trackY + 125.0 + 120.0 * ridgedPeriodic(sw, au, 14.0, 0.01, 3)), tunnelMask * cliffSpan);
+    }
+  }
+
+  const openTrack = (1.0 - viaductMask) * (1.0 - tunnelMask);
+  if (openTrack > 0.001) {
+    const corr = 1.0 - smoothstep(2.6, 4.6, Math.abs(u));
+    h = mix(h, trackY - 0.95, corr * openTrack);
+  }
+  return h;
+}
+
+function bakeSunShadow(s, u, hHere) {
+  let shadow = 1.0;
+  const steps = [45, 115, 240, 460, 820, 1400, 2250];
+  for (let i = 0; i < steps.length; i++) {
+    const d = steps[i];
+    const hTest = terrainHeight(s - SUN_WORLD[2] * d, u + SUN_WORLD[0] * d);
+    const pen = (hTest - (hHere + SUN_WORLD[1] * d)) / (d * 0.08 + 8.0);
+    if (pen > 0.0) {
+      shadow = Math.min(shadow, 1.0 - clamp(pen, 0.0, 0.90));
+      if (shadow < 0.10) return 0.10;
+    }
+  }
+  return shadow;
+}
+
+// ============================================================================
+// 5. MATRIX MATH UTILITIES
+// ============================================================================
+const Mat4 = {
+  create() { return new Float32Array(16); },
+  identity(out) { out.fill(0); out[0] = out[5] = out[10] = out[15] = 1; return out; },
+  multiply(out, a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    out.set(o); return out;
+  },
+  perspective(out, fovyRad, aspect, near, far) {
+    const f = 1.0 / Math.tan(fovyRad * 0.5);
+    out.fill(0);
+    out[0] = f / aspect; out[5] = f;
+    out[10] = (far + near) / (near - far); out[11] = -1;
+    out[14] = (2 * far * near) / (near - far);
+    return out;
+  },
+  lookAt(out, eye, center, up) {
+    let zx = eye[0]-center[0], zy = eye[1]-center[1], zz = eye[2]-center[2];
+    let len = Math.hypot(zx, zy, zz) || 1; zx /= len; zy /= len; zz /= len;
+    let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+    len = Math.hypot(xx, xy, xz) || 1; xx /= len; xy /= len; xz /= len;
+    const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+    out[0]=xx; out[4]=xy; out[8]=xz;  out[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+    out[1]=yx; out[5]=yy; out[9]=yz;  out[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+    out[2]=zx; out[6]=zy; out[10]=zz; out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+    out[3]=0;  out[7]=0;  out[11]=0;  out[15]=1;
+    return out;
+  },
+  mirrorX(out, planeX) { Mat4.identity(out); out[0] = -1; out[12] = 2 * planeX; return out; },
+  fromBasis(out, right, up, fwd, pos) {
+    out[0]=right[0]; out[1]=right[1]; out[2]=right[2]; out[3]=0;
+    out[4]=up[0];    out[5]=up[1];    out[6]=up[2];    out[7]=0;
+    out[8]=-fwd[0];  out[9]=-fwd[1];  out[10]=-fwd[2]; out[11]=0;
+    out[12]=pos[0];  out[13]=pos[1];  out[14]=pos[2];  out[15]=1;
+    return out;
+  },
+  invertRigid(out, m) {
+    const r00=m[0],r01=m[4],r02=m[8], r10=m[1],r11=m[5],r12=m[9], r20=m[2],r21=m[6],r22=m[10];
+    const tx=m[12],ty=m[13],tz=m[14];
+    out[0]=r00; out[1]=r01; out[2]=r02; out[3]=0;
+    out[4]=r10; out[5]=r11; out[6]=r12; out[7]=0;
+    out[8]=r20; out[9]=r21; out[10]=r22; out[11]=0;
+    out[12]=-(r00*tx+r10*ty+r20*tz);
+    out[13]=-(r01*tx+r11*ty+r21*tz);
+    out[14]=-(r02*tx+r12*ty+r22*tz);
+    out[15]=1; return out;
+  },
+  invert4(out, m) {
+    const a00=m[0],a01=m[1],a02=m[2],a03=m[3],a10=m[4],a11=m[5],a12=m[6],a13=m[7],
+          a20=m[8],a21=m[9],a22=m[10],a23=m[11],a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+    const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10,
+          b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12,
+          b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30,
+          b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+    let det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06;
+    if (!det) return Mat4.identity(out);
+    det = 1.0 / det;
+    out[0]=(a11*b11-a12*b10+a13*b09)*det; out[1]=(a02*b10-a01*b11-a03*b09)*det;
+    out[2]=(a31*b05-a32*b04+a33*b03)*det; out[3]=(a22*b04-a21*b05-a23*b03)*det;
+    out[4]=(a12*b08-a10*b11-a13*b07)*det; out[5]=(a00*b11-a02*b08+a03*b07)*det;
+    out[6]=(a32*b02-a30*b05-a33*b01)*det; out[7]=(a20*b05-a22*b02+a23*b01)*det;
+    out[8]=(a10*b10-a11*b08+a13*b06)*det; out[9]=(a01*b08-a00*b10-a03*b06)*det;
+    out[10]=(a30*b04-a31*b02+a33*b00)*det; out[11]=(a21*b02-a20*b04-a23*b00)*det;
+    out[12]=(a11*b07-a10*b09-a12*b06)*det; out[13]=(a00*b09-a01*b07+a02*b06)*det;
+    out[14]=(a31*b01-a30*b03-a32*b00)*det; out[15]=(a20*b03-a21*b01+a22*b00)*det;
+    return out;
+  }
+};
+function rotateVecByRoll(v, roll) {
+  const c = Math.cos(roll), s = Math.sin(roll);
+  return [v[0]*c - v[1]*s, v[0]*s + v[1]*c, v[2]];
+}
+
+// ============================================================================
+// 6. WEBGL2 CONTEXT & HELPERS
+// ============================================================================
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2", {
+  antialias: false, alpha: false, depth: false,
+  powerPreference: "high-performance",
+  preserveDrawingBuffer: true
+});
+if (!gl) {
+  const errEl = document.getElementById("err");
+  errEl.style.display = "flex";
+  errEl.textContent = "WebGL 2 is required to view Swiss Alps Express.";
+  throw new Error("WebGL2 unavailable");
+}
+const extFloat = gl.getExtension("EXT_color_buffer_float");
+const extHalfLinear = gl.getExtension("OES_texture_float_linear");
+const extAniso = gl.getExtension("EXT_texture_filter_anisotropic");
+const maxAniso = extAniso ? Math.min(8, gl.getParameter(extAniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)) : 1;
+const HDR_FORMAT = extFloat ? gl.RGBA16F : gl.RGBA8;
+const HDR_TYPE = extFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+const HDR_FILTER = (extFloat && extHalfLinear) ? gl.LINEAR : gl.NEAREST;
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error("Shader error: " + gl.getShaderInfoLog(sh));
+  return sh;
+}
+function createProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("Link error: " + gl.getProgramInfoLog(p));
+  const uniforms = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    if (info) uniforms[info.name.replace(/\[0\]$/, "")] = gl.getUniformLocation(p, info.name);
+  }
+  return { prog: p, u: uniforms };
+}
+function createTex2D(w, h, internalFmt, fmt, type, filter = gl.LINEAR, wrap = gl.CLAMP_TO_EDGE) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, fmt, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  return t;
+}
+function createFBO(w, h, attachments, withDepth = false) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const texs = [], drawBufs = [];
+  for (let i = 0; i < attachments.length; i++) {
+    const a = attachments[i];
+    const t = createTex2D(w, h, a.internalFmt || HDR_FORMAT, a.fmt || gl.RGBA, a.type || HDR_TYPE, a.filter || HDR_FILTER, gl.CLAMP_TO_EDGE);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0);
+    texs.push(t); drawBufs.push(gl.COLOR_ATTACHMENT0 + i);
+  }
+  gl.drawBuffers(drawBufs);
+  let depthBuf = null;
+  if (withDepth) {
+    depthBuf = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuf);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthBuf);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, texs, depthBuf, w, h };
+}
+function destroyFBO(f) {
+  if (!f) return;
+  if (f.fbo) gl.deleteFramebuffer(f.fbo);
+  if (f.texs) f.texs.forEach(t => gl.deleteTexture(t));
+  if (f.depthBuf) gl.deleteRenderbuffer(f.depthBuf);
+}
+
+// ============================================================================
+// 7. V3 REFINED LUXURY PROCEDURAL PBR TEXTURES
+// ============================================================================
+function uploadCanvasTex(cnv, repeat = true) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cnv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const w = repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, w);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, w);
+  if (extAniso) gl.texParameterf(gl.TEXTURE_2D, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, maxAniso);
+  return tex;
+}
+
+function createProceduralTextures() {
+  // 1. Deep Smoked European Walnut (rich espresso-chestnut tone, tight silky woodgrain!)
+  const walnutCnv = document.createElement("canvas");
+  walnutCnv.width = walnutCnv.height = 512;
+  const wctx = walnutCnv.getContext("2d");
+  const wImg = wctx.createImageData(512, 512);
+  for (let y = 0; y < 512; y++) {
+    for (let x = 0; x < 512; x++) {
+      const u = x / 512, v = y / 512;
+      const warp = Math.sin(v * Math.PI * 2.0) * 0.03 + (vnoise2(u * 4.0, v * 2.0) - 0.5) * 0.08;
+      const rings = Math.sin((u * 18.0 + warp * 8.0) * Math.PI * 2.0) * 0.5 + 0.5;
+      const fine = vnoise2(u * 110, v * 14) * 0.45 + vnoise2(u * 240, v * 26) * 0.25;
+      const g = clamp(rings * 0.30 + fine * 0.70, 0, 1);
+      const idx = (y * 512 + x) * 4;
+      wImg.data[idx]     = Math.round(mix(28, 56, g));
+      wImg.data[idx + 1] = Math.round(mix(16, 33, g));
+      wImg.data[idx + 2] = Math.round(mix(10, 19, g));
+      wImg.data[idx + 3] = Math.round(mix(145, 220, g));
+    }
+  }
+  wctx.putImageData(wImg, 0, 0);
+
+  // 2. Deep Luxury Swiss Claret / Wine-Burgundy Herringbone Wool Upholstery!
+  const fabCnv = document.createElement("canvas");
+  fabCnv.width = fabCnv.height = 256;
+  const fctx = fabCnv.getContext("2d");
+  const fImg = fctx.createImageData(256, 256);
+  for (let y = 0; y < 256; y++) {
+    for (let x = 0; x < 256; x++) {
+      const band = (x >> 3) & 1;
+      const diag = band ? ((x + y) & 7) : ((x - y + 256) & 7);
+      const weave = (diag < 4 ? 1.0 : 0.74) * (0.88 + 0.24 * vnoise2(x * 0.4, y * 0.4));
+      const fleck = vnoise2(x * 0.95, y * 0.95) > 0.82 ? 1.18 : 1.0;
+      const m = weave * fleck;
+      const idx = (y * 256 + x) * 4;
+      fImg.data[idx]     = clamp(Math.round(52 * m), 0, 255);
+      fImg.data[idx + 1] = clamp(Math.round(9 * m), 0, 255);
+      fImg.data[idx + 2] = clamp(Math.round(14 * m), 0, 255);
+      fImg.data[idx + 3] = clamp(Math.round(weave * 220), 0, 255);
+    }
+  }
+  fctx.putImageData(fImg, 0, 0);
+
+  // 3. Panoramic Window Glass Mask (subtle ceramic frit border + whisper-fine micro dust)
+  const glassCnv = document.createElement("canvas");
+  glassCnv.width = 512; glassCnv.height = 512;
+  const gctx = glassCnv.getContext("2d");
+  const gImg = gctx.createImageData(512, 512);
+  const grng = mulberry32(8891);
+  const specks = [];
+  for (let i = 0; i < 65; i++) specks.push({ x: grng(), y: grng(), r: 0.001 + grng() * 0.0018, a: 0.12 + grng() * 0.35 });
+  for (let y = 0; y < 512; y++) {
+    for (let x = 0; x < 512; x++) {
+      const u = x / 511, v = y / 511;
+      const edge = Math.min(Math.min(u, 1 - u), Math.min(v, 1 - v));
+      let frit = 0;
+      if (edge < 0.010) frit = 1.0;
+      else if (edge < 0.030) {
+        const t = (edge - 0.010) / 0.020;
+        const gx = ((x % 6) - 2.5) / 3.0, gy = ((y % 6) - 2.5) / 3.0;
+        const dotR = mix(0.84, 0.12, t);
+        frit = smoothstep(dotR + 0.14, dotR - 0.14, Math.hypot(gx, gy));
+      }
+      const streak = Math.pow(vnoise2(u * 12 + v * 5, v * 12 - u * 4), 3.0) * smoothstep(0.22, 0.01, edge);
+      const fineDust = Math.pow(vnoise2(u * 150, v * 150), 8.0) * 0.28;
+      const idx = (y * 512 + x) * 4;
+      gImg.data[idx]     = Math.round(clamp(frit, 0, 1) * 255);
+      gImg.data[idx + 1] = Math.round(clamp(fineDust, 0, 1) * 255);
+      gImg.data[idx + 2] = Math.round(clamp(streak, 0, 1) * 255);
+      gImg.data[idx + 3] = 255;
+    }
+  }
+  for (const sp of specks) {
+    const cx = Math.floor(sp.x * 512), cy = Math.floor(sp.y * 512), rad = Math.max(1, Math.floor(sp.r * 512));
+    for (let dy = -rad; dy <= rad; dy++) {
+      for (let dx = -rad; dx <= rad; dx++) {
+        const px = cx + dx, py = cy + dy;
+        if (px < 0 || px >= 512 || py < 0 || py >= 512) continue;
+        const d = Math.hypot(dx, dy) / rad;
+        if (d > 1) continue;
+        const idx = (py * 512 + px) * 4;
+        gImg.data[idx + 1] = Math.min(255, gImg.data[idx + 1] + Math.round((1 - d) * sp.a * 75));
+      }
+    }
+  }
+  gctx.putImageData(gImg, 0, 0);
+
+  // 4. Swiss Glacier Express Bulkhead Digital Route Sign
+  const signCnv = document.createElement("canvas");
+  signCnv.width = 512; signCnv.height = 96;
+  const sctx = signCnv.getContext("2d");
+  sctx.fillStyle = "#080a0f";
+  sctx.fillRect(0, 0, 512, 96);
+  sctx.strokeStyle = "#252b36";
+  sctx.lineWidth = 4;
+  sctx.strokeRect(4, 4, 504, 88);
+  sctx.fillStyle = "#c41e25";
+  sctx.fillRect(24, 24, 48, 48);
+  sctx.fillStyle = "#ffffff";
+  sctx.fillRect(34, 43, 28, 10);
+  sctx.fillRect(43, 34, 10, 28);
+  sctx.fillStyle = "#ffbf5e";
+  sctx.font = "600 25px -apple-system, Helvetica Neue, monospace";
+  sctx.fillText("GLACIER EXPRESS", 92, 46);
+  sctx.fillStyle = "#ffd99a";
+  sctx.font = "400 18px -apple-system, Helvetica Neue, monospace";
+  sctx.fillText("CHUR  →  FILISUR  →  ST. MORITZ", 92, 74);
+  sctx.fillStyle = "#ff9944";
+  sctx.font = "600 22px monospace";
+  sctx.fillText("15:42", 422, 54);
+
+  return {
+    walnut: uploadCanvasTex(walnutCnv, true),
+    fabric: uploadCanvasTex(fabCnv, true),
+    glass: uploadCanvasTex(glassCnv, false),
+    sign: uploadCanvasTex(signCnv, false)
+  };
+}
+
+// ============================================================================
+// 8. PROCEDURAL 3D MESH BUILDER
+// ============================================================================
+class MeshBuilder {
+  constructor() { this.pos=[]; this.nor=[]; this.uv=[]; this.col=[]; this.idx=[]; }
+  vcount() { return this.pos.length / 3; }
+  addVert(x, y, z, nx, ny, nz, u, v, r, g, b, a) {
+    const id = this.pos.length / 3;
+    this.pos.push(x, y, z); this.nor.push(nx, ny, nz); this.uv.push(u, v); this.col.push(r, g, b, a);
+    return id;
+  }
+  addTri(a, b, c) { this.idx.push(a, b, c); }
+  addQuad(a, b, c, d) { this.idx.push(a, b, c, a, c, d); }
+
+  addBox(cx, cy, cz, sx, sy, sz, col, matId, uvScale = 1.0) {
+    const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+    const faces = [
+      { n:[ 1, 0, 0], v:[[ hx,-hy, hz],[ hx,-hy,-hz],[ hx, hy,-hz],[ hx, hy, hz]], w:sz, h:sy },
+      { n:[-1, 0, 0], v:[[-hx,-hy,-hz],[-hx,-hy, hz],[-hx, hy, hz],[-hx, hy,-hz]], w:sz, h:sy },
+      { n:[ 0, 1, 0], v:[[-hx, hy, hz],[ hx, hy, hz],[ hx, hy,-hz],[-hx, hy,-hz]], w:sx, h:sz },
+      { n:[ 0,-1, 0], v:[[-hx,-hy,-hz],[ hx,-hy,-hz],[ hx,-hy, hz],[-hx,-hy, hz]], w:sx, h:sz },
+      { n:[ 0, 0, 1], v:[[-hx,-hy, hz],[ hx,-hy, hz],[ hx, hy, hz],[-hx, hy, hz]], w:sx, h:sy },
+      { n:[ 0, 0,-1], v:[[ hx,-hy,-hz],[-hx,-hy,-hz],[-hx, hy,-hz],[ hx, hy,-hz]], w:sx, h:sy }
+    ];
+    for (const f of faces) {
+      const b = this.vcount();
+      const uvs = [[0,0],[f.w*uvScale,0],[f.w*uvScale,f.h*uvScale],[0,f.h*uvScale]];
+      for (let i = 0; i < 4; i++) {
+        this.addVert(cx+f.v[i][0], cy+f.v[i][1], cz+f.v[i][2], f.n[0], f.n[1], f.n[2], uvs[i][0], uvs[i][1], col[0], col[1], col[2], matId);
+      }
+      this.addQuad(b, b+1, b+2, b+3);
+    }
+  }
+
+  // Reclined / pitched box around local X axis (for ergonomic angled train seat backrests!)
+  addTiltedBox(cx, cy, cz, sx, sy, sz, tiltXRad, col, matId, uvScale = 1.0) {
+    const ct = Math.cos(tiltXRad), st = Math.sin(tiltXRad);
+    const R = [1, 0, 0], U = [0, ct, st], F = [0, st, -ct];
+    this.addTransformedBox([cx, cy, cz], R, U, F, sx, sy, sz, col, matId, uvScale);
+  }
+
+  addTransformedBox(center, right, up, fwd, sx, sy, sz, col, matId, uvScale = 1.0) {
+    const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+    const toW = (lx, ly, lz) => [
+      center[0] + right[0]*lx + up[0]*ly - fwd[0]*lz,
+      center[1] + right[1]*lx + up[1]*ly - fwd[1]*lz,
+      center[2] + right[2]*lx + up[2]*ly - fwd[2]*lz
+    ];
+    const nToW = (nx, ny, nz) => [
+      right[0]*nx + up[0]*ny - fwd[0]*nz,
+      right[1]*nx + up[1]*ny - fwd[1]*nz,
+      right[2]*nx + up[2]*ny - fwd[2]*nz
+    ];
+    const faces = [
+      { n:[ 1, 0, 0], v:[[ hx,-hy, hz],[ hx,-hy,-hz],[ hx, hy,-hz],[ hx, hy, hz]], w:sz, h:sy },
+      { n:[-1, 0, 0], v:[[-hx,-hy,-hz],[-hx,-hy, hz],[-hx, hy, hz],[-hx, hy,-hz]], w:sz, h:sy },
+      { n:[ 0, 1, 0], v:[[-hx, hy, hz],[ hx, hy, hz],[ hx, hy,-hz],[-hx, hy,-hz]], w:sx, h:sz },
+      { n:[ 0,-1, 0], v:[[-hx,-hy,-hz],[ hx,-hy,-hz],[ hx,-hy, hz],[-hx,-hy, hz]], w:sx, h:sz },
+      { n:[ 0, 0, 1], v:[[-hx,-hy, hz],[ hx,-hy, hz],[ hx, hy, hz],[-hx, hy, hz]], w:sx, h:sy },
+      { n:[ 0, 0,-1], v:[[ hx,-hy,-hz],[-hx,-hy,-hz],[-hx, hy,-hz],[ hx, hy,-hz]], w:sx, h:sy }
+    ];
+    for (const f of faces) {
+      const b = this.vcount();
+      const nw = nToW(f.n[0], f.n[1], f.n[2]);
+      const uvs = [[0,0],[f.w*uvScale,0],[f.w*uvScale,f.h*uvScale],[0,f.h*uvScale]];
+      for (let i = 0; i < 4; i++) {
+        const pw = toW(f.v[i][0], f.v[i][1], f.v[i][2]);
+        this.addVert(pw[0], pw[1], pw[2], nw[0], nw[1], nw[2], uvs[i][0], uvs[i][1], col[0], col[1], col[2], matId);
+      }
+      this.addQuad(b, b+1, b+2, b+3);
+    }
+  }
+
+  addCylinder(cx, cy, cz, rBot, rTop, h, segs, col, matId, capTop = true, capBot = true) {
+    const y0 = cy - h * 0.5, y1 = cy + h * 0.5;
+    const base = this.vcount();
+    const slope = (rBot - rTop) / h;
+    for (let i = 0; i <= segs; i++) {
+      const a = (i / segs) * Math.PI * 2;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const nl = Math.hypot(1, slope);
+      this.addVert(cx + ca*rBot, y0, cz + sa*rBot, ca/nl, slope/nl, sa/nl, i/segs, 0, col[0], col[1], col[2], matId);
+      this.addVert(cx + ca*rTop, y1, cz + sa*rTop, ca/nl, slope/nl, sa/nl, i/segs, 1, col[0], col[1], col[2], matId);
+    }
+    for (let i = 0; i < segs; i++) { const k = base + i*2; this.addQuad(k, k+2, k+3, k+1); }
+    if (capTop && rTop > 0.0005) {
+      const cIdx = this.addVert(cx, y1, cz, 0, 1, 0, 0.5, 0.5, col[0], col[1], col[2], matId);
+      const ring = this.vcount();
+      for (let i = 0; i <= segs; i++) { const a = (i/segs)*Math.PI*2; this.addVert(cx+Math.cos(a)*rTop, y1, cz+Math.sin(a)*rTop, 0, 1, 0, 0.5+0.5*Math.cos(a), 0.5+0.5*Math.sin(a), col[0], col[1], col[2], matId); }
+      for (let i = 0; i < segs; i++) this.addTri(cIdx, ring+i+1, ring+i);
+    }
+    if (capBot && rBot > 0.0005) {
+      const cIdx = this.addVert(cx, y0, cz, 0, -1, 0, 0.5, 0.5, col[0], col[1], col[2], matId);
+      const ring = this.vcount();
+      for (let i = 0; i <= segs; i++) { const a = (i/segs)*Math.PI*2; this.addVert(cx+Math.cos(a)*rBot, y0, cz+Math.sin(a)*rBot, 0, -1, 0, 0.5, 0.5, col[0], col[1], col[2], matId); }
+      for (let i = 0; i < segs; i++) this.addTri(cIdx, ring+i, ring+i+1);
+    }
+  }
+
+  upload() {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const makeBuf = (arr, loc, size) => {
+      const b = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(arr), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+      return b;
+    };
+    makeBuf(this.pos, 0, 3); makeBuf(this.nor, 1, 3); makeBuf(this.uv, 2, 2); makeBuf(this.col, 3, 4);
+    const ebo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+    const useUint32 = this.vcount() > 65535;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, useUint32 ? new Uint32Array(this.idx) : new Uint16Array(this.idx), gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return { vao, count: this.idx.length, idxType: useUint32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT };
+  }
+}
+
+// ============================================================================
+// 9. WORLD GEOMETRY GENERATION
+// ============================================================================
+function computeTerrainNormal(s, u) {
+  const ds = Math.max(3.5, Math.abs(u) * 0.015);
+  const du = Math.max(2.0, Math.abs(u) * 0.018);
+  const trP = evalTrack(s + ds), trM = evalTrack(s - ds);
+  const hSp = terrainHeight(s + ds, u), hSm = terrainHeight(s - ds, u);
+  const hUp = terrainHeight(s, u + du), hUm = terrainHeight(s, u - du);
+  const tuX = 2*du, tuY = hUp - hUm, tsX = trP.x - trM.x, tsY = hSp - hSm, tsZ = -2*ds;
+  let nx = tuY * tsZ, ny = -tuX * tsZ, nz = tuX * tsY - tuY * tsX;
+  const nl = Math.hypot(nx, ny, nz) || 1;
+  return [nx / nl, ny / nl, nz / nl];
+}
+
+function buildTerrainChunks() {
+  const CHUNKS = 8, CHUNK_LEN = LOOP_LEN / CHUNKS;
+  const nearU = [
+    -1400, -1050, -760, -520, -340, -210, -125, -72, -38, -18, -8, -4.0, -2.0,
+     0.0,
+     2.0, 4.0, 8, 15, 25, 38, 55, 76, 102, 132, 168, 210, 255, 300, 345, 395, 455,
+     530, 625, 740, 880, 1050, 1260
+  ];
+  const farU = [1160]; // Hidden skirt row overlapping smoothly behind nearU so ZERO cracks ever appear!
+  for (let u = 1220; u <= 9400; u += (u < 3000 ? 145 : (u < 6000 ? 185 : 240))) farU.push(u);
+
+  const chunks = [];
+  for (let c = 0; c < CHUNKS; c++) {
+    const sStart = c * CHUNK_LEN;
+    const mb = new MeshBuilder();
+    const addGrid = (uArr, sSteps, skirtFirstCol = false) => {
+      const nu = uArr.length, base = mb.vcount();
+      for (let is = 0; is <= sSteps; is++) {
+        const s = sStart + (is / sSteps) * CHUNK_LEN;
+        const tr = evalTrack(s);
+        for (let iu = 0; iu < nu; iu++) {
+          const u = uArr[iu];
+          let wy = terrainHeight(s, u);
+          const n = computeTerrainNormal(s, u);
+          const lakeProx = smoothBox(s, 0, 660, 70) * smoothstep(38, 95, u) * (1 - smoothstep(260, 340, u));
+          const sunShadow = bakeSunShadow(s, u, wy);
+          if (skirtFirstCol && iu === 0) wy -= 55.0; // Clean vertical hidden stitch skirt!
+          mb.addVert(tr.x + u, wy, -s, n[0], n[1], n[2], s / LOOP_LEN, u, lakeProx, sunShadow, 0, 0);
+        }
+      }
+      for (let is = 0; is < sSteps; is++)
+        for (let iu = 0; iu < nu - 1; iu++) {
+          const a = base + is * nu + iu;
+          mb.addQuad(a, a + 1, a + nu + 1, a + nu);
+        }
+    };
+    addGrid(nearU, 35, false);
+    addGrid(farU, 7, true);
+    chunks.push({ mesh: mb.upload(), sCenter: sStart + CHUNK_LEN * 0.5 });
+  }
+  return chunks;
+}
+
+function buildLakeAndRiver() {
+  const mb = new MeshBuilder();
+  // Glacial Lake extending organically under curved terrain shoreline (u = 28..380)
+  const sN = 84, uN = 38, base = mb.vcount();
+  for (let is = 0; is <= sN; is++) {
+    const s = mix(-60, 720, is / sN);
+    const tr = evalTrack(s);
+    for (let iu = 0; iu <= uN; iu++) {
+      const u = mix(28, 380, iu / uN);
+      const th = terrainHeight(s, u);
+      const depth = Math.max(0.0, 0.0 - th);
+      const shadow = bakeSunShadow(s, u, 0.0);
+      mb.addVert(tr.x + u, 0.0, -s, 0, 1, 0, s * 0.02, u * 0.02, depth, 0.0, shadow, 1.0);
+    }
+  }
+  for (let is = 0; is < sN; is++)
+    for (let iu = 0; iu < uN; iu++) {
+      const a = base + is * (uN + 1) + iu;
+      mb.addQuad(a, a + 1, a + uN + 2, a + uN + 1);
+    }
+
+  // Foaming Glacial Torrent River flowing down the deep Viaduct Gorge (y = -18.5, wide enough to gleam beneath BOTH bridges!)
+  const rBase = mb.vcount(), rsN = 52, ruN = 22;
+  for (let is = 0; is <= rsN; is++) {
+    const s = mix(655, 1185, is / rsN);
+    const tr = evalTrack(s);
+    for (let iu = 0; iu <= ruN; iu++) {
+      const u = mix(-55, 295, iu / ruN);
+      const th = terrainHeight(s, u);
+      const depth = Math.max(0.0, -18.5 - th);
+      mb.addVert(tr.x + u, -18.5, -s, 0, 1, 0, s * 0.04, u * 0.04, depth, 1.0, 0.70, 1.0);
+    }
+  }
+  for (let is = 0; is < rsN; is++)
+    for (let iu = 0; iu < ruN; iu++) {
+      const a = rBase + is * (ruN + 1) + iu;
+      mb.addQuad(a, a + 1, a + ruN + 2, a + ruN + 1);
+    }
+  return mb.upload();
+}
+
+function buildViaductAndTrack() {
+  const mb = new MeshBuilder();
+  const addExtrudedRibbon = (profile, sA, sB, step, col, matId, vScale = 0.2) => {
+    const steps = Math.max(2, Math.round((sB - sA) / step));
+    const pLen = profile.length, base = mb.vcount();
+    for (let i = 0; i <= steps; i++) {
+      const s = mix(sA, sB, i / steps);
+      const tr = evalTrack(s);
+      for (let j = 0; j < pLen; j++) {
+        const pt = profile[j];
+        mb.addVert(
+          tr.x + tr.right[0]*pt[0] + tr.up[0]*pt[1], tr.y + tr.right[1]*pt[0] + tr.up[1]*pt[1], -s + tr.right[2]*pt[0] + tr.up[2]*pt[1],
+          tr.right[0]*pt[2] + tr.up[0]*pt[3], tr.right[1]*pt[2] + tr.up[1]*pt[3], tr.right[2]*pt[2] + tr.up[2]*pt[3],
+          pt[4], s * vScale, col[0], col[1], col[2], matId
+        );
+      }
+    }
+    for (let i = 0; i < steps; i++)
+      for (let j = 0; j < pLen - 1; j++) { const a = base + i*pLen + j; mb.addQuad(a, a+1, a+pLen+1, a+pLen); }
+  };
+
+  // Ballast & twin gleaming steel rails
+  addExtrudedRibbon([
+    [-3.4, -1.6, -0.7, 0.7, 0.0], [-2.1, -0.25,-0.3, 0.95, 0.3],
+    [ 2.1, -0.25, 0.3, 0.95, 0.7], [ 3.4, -1.6,  0.7, 0.7, 1.0]
+  ], 0, LOOP_LEN, 9.0, [0.28, 0.27, 0.26], 2.0, 0.25);
+
+  for (const rx of [-0.68, 0.68]) {
+    addExtrudedRibbon([
+      [rx-0.06,-0.18,-1,0,0], [rx-0.05,0,0,1,0.3], [rx+0.05,0,0,1,0.7], [rx+0.06,-0.18,1,0,1]
+    ], 0, LOOP_LEN, 9.0, [0.68, 0.70, 0.74], 3.0, 0.2);
+  }
+
+  // 1) OUR TRAIN'S OWN STONE VIADUCT DECK & PIERS (weathered dark ashlar stone parapet staying cleanly below eye line!)
+  addExtrudedRibbon([
+    [-3.2, -4.6, -1, 0, 0.0], [-3.2, -0.35,-1, 0, 1.0], [-3.4, -0.20, 0, 1, 1.2], [-2.9, -0.20, 0, 1, 1.5],
+    [ 2.9, -0.20, 0, 1, 2.5], [ 3.4, -0.20, 0, 1, 2.8], [ 3.2, -0.35, 1, 0, 3.0], [ 3.2, -4.6,  1, 0, 4.0]
+  ], VIADUCT_A - 8, VIADUCT_B + 8, 4.5, [0.42, 0.40, 0.37], 1.0, 0.16);
+
+  // Slim dark wrought-iron handrail along viaduct parapet (y = 0.48m)
+  for (const side of [-3.30, 3.30]) {
+    addExtrudedRibbon([[side-0.022, 0.44,-1,0,0],[side, 0.48,0,1,0.5],[side+0.022, 0.44,1,0,1]], VIADUCT_A-4, VIADUCT_B+4, 6.0, [0.09, 0.10, 0.12], 3.0, 0.2);
+    for (let s = VIADUCT_A; s <= VIADUCT_B; s += 3.2) {
+      const tr = evalTrack(s);
+      mb.addTransformedBox([tr.x + tr.right[0]*side, tr.y + 0.22, -s + tr.right[2]*side], tr.right, tr.up, tr.fwd, 0.04, 0.50, 0.04, [0.09, 0.10, 0.12], 3.0, 1.0);
+    }
+  }
+  const NUM_OUR = 7, spanOur = (VIADUCT_B - VIADUCT_A) / NUM_OUR, archROur = spanOur * 0.40;
+  for (let i = 0; i <= NUM_OUR; i++) {
+    const sp = VIADUCT_A + i * spanOur, tr = evalTrack(sp);
+    for (let t = 0; t < 4; t++) {
+      const yMid = mix(-32, tr.y - 4.2, (t + 0.5) / 4), taper = mix(1.42, 1.0, (t + 0.5) / 4);
+      mb.addTransformedBox([tr.x, yMid, -sp], tr.right, tr.up, tr.fwd, 6.4*taper, (tr.y + 28)/4 + 0.2, (spanOur - 2*archROur + 2.0)*taper, [0.42, 0.40, 0.37], 1.0, 0.15);
+    }
+  }
+
+  // 2) MONUMENTAL ICONIC LANDWASSER / ALBULA CURVED STONE-ARCH VIADUCT SPANNING THE GORGE RIGHT OUTSIDE THE WINDOW!
+  //    (6 towering 70m tapered ashlar limestone piers, sweeping semicircular stone arches, radial voussoir rings,
+  //     stone parapet, catenary masts, AND a carved cliffside stone tunnel portal at the far end!)
+  const GORGE_ARCHES = 6;
+  const gSpanT = 1.0 / GORGE_ARCHES;
+  // Continuous curved stone deck & dark parapet cornice
+  const deckSegs = 48;
+  for (let i = 0; i < deckSegs; i++) {
+    const tM = (i + 0.5) / deckSegs;
+    const fr = evalGorgeViaductFrame(tM);
+    const segLen = 285.0 / deckSegs + 0.35;
+    mb.addTransformedBox([fr.pos[0], fr.pos[1] - 2.2, fr.pos[2]], fr.right, fr.up, fr.fwd, 6.2, 4.4, segLen, [0.48, 0.46, 0.42], 1.0, 0.16);
+    // Protruding top stone coping cornice
+    mb.addTransformedBox([fr.pos[0], fr.pos[1] + 0.15, fr.pos[2]], fr.right, fr.up, fr.fwd, 6.9, 0.75, segLen, [0.56, 0.54, 0.49], 1.0, 0.18);
+    // Dark safety parapet rails on both edges
+    for (const sgn of [-3.25, 3.25]) {
+      const rp = [fr.pos[0] + fr.right[0]*sgn, fr.pos[1] + 0.95, fr.pos[2] + fr.right[2]*sgn];
+      mb.addTransformedBox(rp, fr.right, fr.up, fr.fwd, 0.10, 0.10, segLen, [0.12, 0.13, 0.15], 3.0, 0.5);
+    }
+  }
+  // 7 Towering Tapered Limestone Ashlar Piers dropping 72m down into the foaming glacial torrent!
+  for (let i = 0; i <= GORGE_ARCHES; i++) {
+    const fr = evalGorgeViaductFrame(i * gSpanT);
+    const topY = fr.pos[1] - 3.8, botY = -28.0, pierH = topY - botY;
+    for (let tier = 0; tier < 5; tier++) {
+      const f = (tier + 0.5) / 5;
+      const yMid = mix(botY, topY, f);
+      const taper = mix(1.48, 1.0, f);
+      mb.addTransformedBox([fr.pos[0], yMid, fr.pos[2]], fr.right, fr.up, fr.fwd, 6.4 * taper, pierH / 5 + 0.2, 6.8 * taper, [0.46, 0.44, 0.40], 1.0, 0.15);
+    }
+    // Protruding carved stone impost capital ledge where arches spring!
+    mb.addTransformedBox([fr.pos[0], fr.pos[1] - 20.5, fr.pos[2]], fr.right, fr.up, fr.fwd, 7.6, 1.6, 8.2, [0.56, 0.53, 0.48], 1.0, 0.16);
+    // Delicate catenary mast rising from each pier!
+    const mastP = [fr.pos[0] - fr.right[0]*3.0, fr.pos[1] + 3.4, fr.pos[2] - fr.right[2]*3.0];
+    mb.addTransformedBox(mastP, fr.right, fr.up, fr.fwd, 0.22, 6.8, 0.22, [0.30, 0.33, 0.36], 3.0, 0.5);
+    mb.addTransformedBox([fr.pos[0] - fr.right[0]*1.3, fr.pos[1] + 5.8, fr.pos[2] - fr.right[2]*1.3], fr.right, fr.up, fr.fwd, 3.6, 0.12, 0.12, [0.32, 0.35, 0.38], 3.0, 0.5);
+  }
+  // 6 Monumental Semicircular Stone Arches + Protruding Radial Voussoir Arch Rings!
+  const gArchR = 17.5;
+  for (let i = 0; i < GORGE_ARCHES; i++) {
+    const tMid = (i + 0.5) * gSpanT;
+    const archSegs = 14;
+    for (let k = 0; k < archSegs; k++) {
+      const aM = Math.PI * ((k + 0.5) / archSegs);
+      const tHere = tMid - Math.cos(aM) * (gSpanT * 0.42);
+      const fr = evalGorgeViaductFrame(tHere);
+      const archY = (fr.pos[1] - 21.2) + Math.sin(aM) * gArchR;
+      const spandrelH = Math.max(1.2, (fr.pos[1] - 3.6) - archY);
+      const segW = (Math.PI * gArchR / archSegs) * 1.24;
+      mb.addTransformedBox([fr.pos[0], archY + spandrelH * 0.5, fr.pos[2]], fr.right, fr.up, fr.fwd, 6.0, spandrelH + 0.4, segW, [0.47, 0.45, 0.41], 1.0, 0.15);
+      // Protruding bright dressed-limestone voussoir arch ring outlining every semicircular span!
+      mb.addTransformedBox([fr.pos[0], archY + 0.75, fr.pos[2]], fr.right, fr.up, fr.fwd, 6.75, 1.75, segW * 1.08, [0.58, 0.55, 0.50], 1.0, 0.18);
+    }
+  }
+  // Carved Granite Cliff Abutments at BOTH ends of the Gorge Viaduct (t=1.0 left cliff tunnel portal + t=0.0 graceful low tapered stone embankment!)
+  {
+    const frEnd = evalGorgeViaductFrame(0.99);
+    mb.addTransformedBox([frEnd.pos[0], frEnd.pos[1] + 4.5, frEnd.pos[2]], frEnd.right, frEnd.up, frEnd.fwd, 20.0, 42.0, 11.0, [0.34, 0.33, 0.32], 1.0, 0.15);
+    mb.addTransformedBox([frEnd.pos[0] - frEnd.fwd[0]*5.6, frEnd.pos[1] + 2.6, frEnd.pos[2] - frEnd.fwd[2]*5.6], frEnd.right, frEnd.up, frEnd.fwd, 5.2, 6.0, 0.6, [0.02, 0.02, 0.03], 4.0, 1.0);
+    // Graceful flush stone approach embankment tapering smoothly down into the green alpine hillside (NEVER taller than deck!)
+    const frStart = evalGorgeViaductFrame(0.0);
+    mb.addTransformedBox([frStart.pos[0] - frStart.fwd[0]*7.5, frStart.pos[1] - 19.5, frStart.pos[2] - frStart.fwd[2]*7.5], frStart.right, frStart.up, frStart.fwd, 7.6, 38.0, 15.0, [0.44, 0.42, 0.38], 1.0, 0.15);
+    mb.addTransformedBox([frStart.pos[0] - frStart.fwd[0]*19.0, frStart.pos[1] - 25.0, frStart.pos[2] - frStart.fwd[2]*19.0], frStart.right, frStart.up, frStart.fwd, 9.2, 34.0, 16.0, [0.38, 0.37, 0.34], 1.0, 0.15);
+    mb.addTransformedBox([frStart.pos[0] - frStart.fwd[0]*8.0, frStart.pos[1] + 0.12, frStart.pos[2] - frStart.fwd[2]*8.0], frStart.right, frStart.up, frStart.fwd, 7.0, 0.72, 16.5, [0.54, 0.51, 0.46], 1.0, 0.16);
+  }
+
+  // 3) GALVANIZED STEEL CATENARY MASTS & OVERHEAD WIRES ALONG OUR TRACK (Close-range motion blur!)
+  const wireHeight = 5.15, messHeight = 6.15;
+  for (let s = 18; s < LOOP_LEN; s += 38) {
+    if (getTunnelFactor(s) > 0.2 || getGalleryFactor(s) > 0.2) continue;
+    const tr = evalTrack(s);
+    const side = 3.05;
+    const mx = tr.x + tr.right[0]*side, mz = -s + tr.right[2]*side;
+    mb.addTransformedBox([mx, tr.y + 2.9, mz], tr.right, tr.up, tr.fwd, 0.20, 7.4, 0.20, [0.32, 0.35, 0.38], 3.0, 0.5);
+    mb.addTransformedBox([mx, tr.y - 0.55, mz], tr.right, tr.up, tr.fwd, 0.52, 0.9, 0.52, [0.42, 0.42, 0.40], 6.0, 0.4);
+    mb.addTransformedBox([tr.x + tr.right[0]*(side*0.48), tr.y + wireHeight + 0.55, -s + tr.right[2]*(side*0.48)], tr.right, tr.up, tr.fwd, side*1.1, 0.08, 0.08, [0.36, 0.39, 0.43], 3.0, 0.5);
+    mb.addTransformedBox([tr.x + tr.right[0]*(side*0.55), tr.y + wireHeight + 0.95, -s + tr.right[2]*(side*0.55)], tr.right, tr.up, tr.fwd, side*0.95, 0.05, 0.05, [0.34, 0.37, 0.41], 3.0, 0.5);
+    mb.addTransformedBox([tr.x + tr.right[0]*1.65, tr.y + wireHeight + 0.55, -s + tr.right[2]*1.65], tr.right, tr.up, tr.fwd, 0.20, 0.14, 0.14, [0.48, 0.24, 0.16], 3.0, 0.5);
+  }
+  for (const wh of [wireHeight, messHeight]) {
+    addExtrudedRibbon([[-0.022, wh,-1,0,0],[0, wh+0.022,0,1,0.5],[0.022, wh,1,0,1]], 0, LOOP_LEN, 10.0, [0.12, 0.13, 0.15], 3.0, 0.2);
+  }
+  return mb.upload();
+}
+
+function buildTunnelsAndGallery() {
+  const mb = new MeshBuilder();
+  const buildTunnelSpan = (sA, sB) => {
+    const steps = Math.max(16, Math.round((sB - sA) / 5.0));
+    const arcN = 16, rx = 3.18, ry = 3.50, centerY = 2.15;
+
+    // Textured Dark Granite / Shotcrete Vaulted Tunnel Lining
+    const base = mb.vcount();
+    for (let i = 0; i <= steps; i++) {
+      const s = mix(sA, sB, i / steps);
+      const tr = evalTrack(s);
+      for (let j = 0; j <= arcN; j++) {
+        const a = mix(-0.18 * Math.PI, 1.18 * Math.PI, j / arcN);
+        const lx = Math.cos(a) * rx, ly = centerY + Math.sin(a) * ry;
+        const nlx = -Math.cos(a), nly = -Math.sin(a);
+        mb.addVert(
+          tr.x + tr.right[0]*lx + tr.up[0]*ly, tr.y + tr.right[1]*lx + tr.up[1]*ly, -s + tr.right[2]*lx + tr.up[2]*ly,
+          tr.right[0]*nlx + tr.up[0]*nly, tr.right[1]*nlx + tr.up[1]*nly, tr.right[2]*nlx + tr.up[2]*nly,
+          j / arcN * 4.0, s * 0.25, 0.14, 0.145, 0.16, 4.0
+        );
+      }
+    }
+    for (let i = 0; i < steps; i++)
+      for (let j = 0; j < arcN; j++) { const a = base + i*(arcN+1) + j; mb.addQuad(a, a+arcN+1, a+arcN+2, a+1); }
+
+    // Ribbed Dark Stone Support Arches every 6.5m + Horizontal Cable Trays along side walls (high-speed streaking texture!)
+    for (let s = sA + 3; s <= sB - 3; s += 6.5) {
+      const tr = evalTrack(s);
+      for (let j = 0; j < 10; j++) {
+        const a = mix(0.0, Math.PI, (j + 0.5) / 10);
+        const lx = Math.cos(a)*(rx - 0.18), ly = centerY + Math.sin(a)*(ry - 0.18);
+        mb.addTransformedBox([tr.x + tr.right[0]*lx + tr.up[0]*ly, tr.y + tr.right[1]*lx + tr.up[1]*ly, -s + tr.right[2]*lx + tr.up[2]*ly], tr.right, tr.up, tr.fwd, 0.42, 0.42, 0.56, [0.18, 0.185, 0.20], 4.0, 0.4);
+      }
+    }
+    // Continuous recessed tunnel side inspection ledge & conduit pipes
+    for (const side of [-1, 1]) {
+      for (let s = sA + 2; s < sB - 2; s += 8.0) {
+        const tr = evalTrack(s + 4.0);
+        mb.addTransformedBox([tr.x + tr.right[0]*(side*(rx - 0.22)), tr.y + 1.12, -(s+4) + tr.right[2]*(side*(rx - 0.22))], tr.right, tr.up, tr.fwd, 0.26, 0.14, 8.1, [0.22, 0.22, 0.24], 4.0, 0.5);
+      }
+    }
+
+    // Crisp Warm Amber Recessed Tunnel Emergency Wall Lamps every 22m!
+    for (const side of [-1, 1]) {
+      for (let s = sA + 10; s <= sB - 10; s += 22.0) {
+        const tr = evalTrack(s);
+        const lx = side * (rx - 0.22), ly = 1.65;
+        const pos = [tr.x + tr.right[0]*lx + tr.up[0]*ly, tr.y + tr.right[1]*lx + tr.up[1]*ly, -s + tr.right[2]*lx + tr.up[2]*ly];
+        mb.addTransformedBox(pos, tr.right, tr.up, tr.fwd, 0.10, 0.14, 0.65, [1.0, 0.62, 0.20], 5.0, 1.0);
+        mb.addTransformedBox([tr.x + tr.right[0]*(lx + side*0.08), tr.y + ly, -s + tr.right[2]*(lx + side*0.08)], tr.right, tr.up, tr.fwd, 0.10, 0.24, 0.80, [0.04, 0.04, 0.05], 3.0, 1.0);
+      }
+    }
+
+    // Dressed-Granite Tunnel Portals embedded cleanly into sheer mountain cliffs
+    for (const sp of [sA, sB]) {
+      const tr = evalTrack(sp);
+      for (const side of [-1, 1]) mb.addTransformedBox([tr.x + tr.right[0]*(side*7.2), tr.y + 4.8, -sp + tr.right[2]*(side*7.2)], tr.right, tr.up, tr.fwd, 8.2, 14.5, 4.4, [0.36, 0.35, 0.33], 1.0, 0.15);
+      mb.addTransformedBox([tr.x, tr.y + 8.8, -sp], tr.right, tr.up, tr.fwd, 22.0, 6.6, 4.6, [0.34, 0.33, 0.31], 1.0, 0.15);
+      for (let k = 0; k < 11; k++) {
+        const a = mix(0.05*Math.PI, 0.95*Math.PI, k / 10);
+        const lx = Math.cos(a)*(rx + 0.45), ly = centerY + Math.sin(a)*(ry + 0.35);
+        mb.addTransformedBox([tr.x + tr.right[0]*lx, tr.y + ly, -sp + tr.right[2]*lx], tr.right, tr.up, tr.fwd, 1.15, 1.05, 4.9, [0.46, 0.44, 0.40], 1.0, 0.2);
+      }
+    }
+  };
+  buildTunnelSpan(TUNNEL1_A, TUNNEL1_B);
+  buildTunnelSpan(TUNNEL2_A, TUNNEL2_B);
+
+  // SWISS ALPINE AVALANCHE GALLERY (s = 2015..2180) — clean low concrete curb + bold rushing weathered colonnade pillars!
+  const galSteps = 32;
+  for (let i = 0; i < galSteps; i++) {
+    const s0 = mix(GALLERY_A, GALLERY_B, i / galSteps), s1 = mix(GALLERY_A, GALLERY_B, (i + 1) / galSteps);
+    const sM = 0.5 * (s0 + s1), len = (s1 - s0) + 0.22, tr = evalTrack(sM);
+    mb.addTransformedBox([tr.x, tr.y + 5.6, -sM], tr.right, tr.up, tr.fwd, 8.2, 1.0, len, [0.40, 0.41, 0.43], 6.0, 0.2);
+    mb.addTransformedBox([tr.x - tr.right[0]*3.4, tr.y + 2.6, -sM - tr.right[2]*3.4], tr.right, tr.up, tr.fwd, 1.0, 6.2, len, [0.34, 0.35, 0.36], 6.0, 0.2);
+    mb.addTransformedBox([tr.x + tr.right[0]*3.18, tr.y + 4.85, -sM + tr.right[2]*3.18], tr.right, tr.up, tr.fwd, 0.72, 1.1, len, [0.38, 0.39, 0.41], 6.0, 0.2);
+    // Low weathered dark concrete sill staying cleanly below window view!
+    mb.addTransformedBox([tr.x + tr.right[0]*3.18, tr.y - 0.55, -sM + tr.right[2]*3.18], tr.right, tr.up, tr.fwd, 0.72, 0.85, len, [0.34, 0.35, 0.37], 6.0, 0.2);
+  }
+  for (let s = GALLERY_A + 2; s <= GALLERY_B - 2; s += 8.8) {
+    const tr = evalTrack(s);
+    mb.addTransformedBox([tr.x + tr.right[0]*3.18, tr.y + 2.35, -s + tr.right[2]*3.18], tr.right, tr.up, tr.fwd, 0.76, 5.2, 0.76, [0.40, 0.41, 0.43], 6.0, 0.25);
+  }
+  return mb.upload();
+}
+
+function buildForwardCoachMesh() {
+  const mb = new MeshBuilder();
+  const L = 19.2, W = 2.78;
+  // Gleaming Swiss Glacier Express Ruby-Crimson Coach Body + White Waist Band + Panoramic Windows
+  mb.addBox(0, 1.18, 0, W, 1.28, L, [0.68, 0.045, 0.065], 9.0, 0.2);
+  mb.addBox(0, 1.72, 0, W + 0.04, 0.18, L + 0.02, [0.95, 0.94, 0.92], 9.0, 0.2);
+  mb.addBox(0, 2.48, 0, W - 0.04, 1.32, L - 0.6, [0.10, 0.12, 0.16], 10.0, 0.3);
+  for (let z = -8.4; z <= 8.4; z += 2.8) mb.addBox(0, 2.48, z, W + 0.03, 1.38, 0.24, [0.10, 0.11, 0.14], 3.0, 0.5);
+  mb.addBox(0, 3.30, 0, W - 0.45, 0.42, L - 0.2, [0.58, 0.60, 0.64], 3.0, 0.2);
+  mb.addBox(0, 3.56, -3.5, 1.3, 0.24, 3.8, [0.44, 0.46, 0.50], 3.0, 0.3);
+  mb.addBox(0, 3.56,  3.5, 1.3, 0.24, 3.8, [0.44, 0.46, 0.50], 3.0, 0.3);
+  mb.addBox(0, 0.42, 0, W - 0.35, 0.48, L - 1.2, [0.09, 0.10, 0.12], 3.0, 0.5);
+  for (const bz of [-6.4, 6.4]) mb.addBox(0, 0.28, bz, W - 0.5, 0.45, 2.6, [0.08, 0.09, 0.10], 3.0, 0.5);
+  mb.addBox(0, 1.85,  L*0.5 + 0.35, 1.9, 2.35, 0.7, [0.07, 0.07, 0.08], 3.0, 0.5);
+  mb.addBox(0, 1.85, -L*0.5 - 0.35, 1.9, 2.35, 0.7, [0.07, 0.07, 0.08], 3.0, 0.5);
+  return mb.upload();
+}
+
+function buildAlpineVillages() {
+  const mb = new MeshBuilder();
+  const rng = mulberry32(445566);
+
+  const addChalet = (wx, wy, wz, yaw, w, d, h, timberCol) => {
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const R = [c, 0, -s], U = [0, 1, 0], F = [s, 0, c];
+    const hStone = h * 0.36, hWood = h * 0.64;
+
+    // Deeply grounded dark Alpine fieldstone cellar base (anchors naturally into shaded hillside without glaring white edges!)
+    mb.addTransformedBox([wx, wy - 2.3 + hStone * 0.5, wz], R, U, F, w * 1.02, hStone + 4.8, d * 1.02, [0.24, 0.23, 0.21], 1.0, 0.35);
+    // Rich dark weathered Alpine larch timber upper stories
+    mb.addTransformedBox([wx, wy + hStone + hWood * 0.5, wz], R, U, F, w, hWood, d, timberCol, 7.0, 0.35);
+    // Overhanging wooden chalet balcony
+    mb.addTransformedBox([wx - R[0]*(w*0.54), wy + hStone + 0.5, wz - R[2]*(w*0.54)], R, U, F, 0.85, 0.80, d * 0.76, [timberCol[0]*0.78, timberCol[1]*0.74, timberCol[2]*0.70], 7.0, 0.5);
+
+    const roofY = wy + h, ridgeH = w * 0.35, overW = w * 0.68, overD = d * 0.62;
+    const toW = (lx, ly, lz) => [wx + R[0]*lx - F[0]*lz, roofY + ly, wz + R[2]*lx - F[2]*lz];
+    for (const sign of [-1, 1]) {
+      const b = mb.vcount();
+      const pts = [toW(0, ridgeH, -overD), toW(0, ridgeH, overD), toW(sign * overW, -0.35, overD), toW(sign * overW, -0.35, -overD)];
+      const nl = Math.hypot(ridgeH + 0.35, overW);
+      const nW = [R[0]*(sign*(ridgeH+0.35)/nl), overW/nl, R[2]*(sign*(ridgeH+0.35)/nl)];
+      const uvs = [[0,0],[overD*0.5,0],[overD*0.5,overW*0.5],[0,overW*0.5]];
+      for (let i = 0; i < 4; i++) mb.addVert(pts[i][0], pts[i][1], pts[i][2], nW[0], nW[1], nW[2], uvs[i][0], uvs[i][1], 0.13, 0.14, 0.17, 8.0);
+      if (sign > 0) mb.addQuad(b, b+3, b+2, b+1); else mb.addQuad(b, b+1, b+2, b+3);
+
+      const g1 = mb.vcount();
+      for (const gp of [toW(0, ridgeH, -d*0.5), toW(overW*0.76, 0, -d*0.5), toW(-overW*0.76, 0, -d*0.5)]) mb.addVert(gp[0], gp[1], gp[2], F[0], 0, F[2], 0.5, 0.5, timberCol[0], timberCol[1], timberCol[2], 7.0);
+      mb.addTri(g1, g1+1, g1+2);
+      const g2 = mb.vcount();
+      for (const gp of [toW(0, ridgeH, d*0.5), toW(-overW*0.76, 0, d*0.5), toW(overW*0.76, 0, d*0.5)]) mb.addVert(gp[0], gp[1], gp[2], -F[0], 0, -F[2], 0.5, 0.5, timberCol[0], timberCol[1], timberCol[2], 7.0);
+      mb.addTri(g2, g2+1, g2+2);
+    }
+    mb.addTransformedBox(toW(w * 0.16, ridgeH * 0.72 + 1.0, d * 0.18), R, U, F, 0.9, 2.2, 0.9, [0.34, 0.32, 0.30], 1.0, 0.5);
+  };
+
+  // Iconic Warm Cream-Plaster Swiss Alpine Church with Dark Slate Spire!
+  const addSwissChurch = (sPos, uPos) => {
+    const tr = evalTrack(sPos);
+    const wx = tr.x + uPos, wz = -sPos, wy = terrainHeight(sPos, uPos);
+    const R = [1, 0, 0], U = [0, 1, 0], F = [0, 0, 1];
+    // Warm weathered alpine lime-plaster nave (balanced photographic plaster tone with rich shadow modeling!)
+    mb.addTransformedBox([wx, wy + 1.5, wz], R, U, F, 11.5, 17.5, 20.0, [0.44, 0.41, 0.37], 1.0, 0.18);
+    const ry = wy + 10.0, topY = wy + 16.8;
+    for (const side of [-1, 1]) {
+      const b = mb.vcount();
+      const nx = side * 0.72, ny = 0.69;
+      mb.addVert(wx, topY, wz - 10.8, nx, ny, 0, 0, 0, 0.13, 0.14, 0.17, 8.0);
+      mb.addVert(wx, topY, wz + 10.8, nx, ny, 0, 1, 0, 0.13, 0.14, 0.17, 8.0);
+      mb.addVert(wx + side * 6.8, ry, wz + 10.8, nx, ny, 0, 1, 1, 0.13, 0.14, 0.17, 8.0);
+      mb.addVert(wx + side * 6.8, ry, wz - 10.8, nx, ny, 0, 0, 1, 0.13, 0.14, 0.17, 8.0);
+      if (side > 0) mb.addQuad(b, b+3, b+2, b+1); else mb.addQuad(b, b+1, b+2, b+3);
+    }
+    const tx = wx - 1.5, tz = wz - 11.5;
+    mb.addTransformedBox([tx, wy + 8.5, tz], R, U, F, 6.2, 32.0, 6.2, [0.46, 0.43, 0.39], 1.0, 0.18);
+    // Dark wooden belfry louvers with soft warm lantern glow inside
+    mb.addTransformedBox([tx - 3.14, wy + 20.5, tz], R, U, F, 0.18, 2.8, 1.8, [0.82, 0.52, 0.18], 5.0, 1.0);
+    mb.addTransformedBox([tx, wy + 20.5, tz + 3.14], R, U, F, 1.8, 2.8, 0.18, [0.82, 0.52, 0.18], 5.0, 1.0);
+    // Dark gilded clock dial
+    mb.addTransformedBox([tx - 3.16, wy + 16.5, tz], R, U, F, 0.15, 2.1, 2.1, [0.09, 0.10, 0.13], 3.0, 1.0);
+    // Tall steep dark charcoal-slate pointed spire (minimal snow on steep spire!)
+    mb.addCylinder(tx, wy + 34.0, tz, 3.6, 0.08, 20.0, 8, [0.11, 0.12, 0.15], 3.0, true, false);
+  };
+
+  addSwissChurch(235, 322);
+
+  // Rich weathered dark alpine larch & chestnut timber tones!
+  const timberPalette = [
+    [0.18, 0.10, 0.055], [0.23, 0.13, 0.072], [0.14, 0.085, 0.050], [0.27, 0.16, 0.088], [0.12, 0.075, 0.045]
+  ];
+
+  // Village 1: Picturesque Lakeside Alpine Village (strictly grounded inland on dry peninsula!)
+  for (let i = 0; i < 36; i++) {
+    const sPos = 148 + (i / 36) * 248 + (rng() - 0.5) * 12;
+    const uPos = 304 + rng() * 124;
+    if (Math.hypot(sPos - 235, uPos - 322) < 25) continue;
+    const tr = evalTrack(sPos);
+    const wy = terrainHeight(sPos, uPos);
+    // Ensure ALL 4 footprint corners sit cleanly on dry hillside (zero overhanging lake wedges!)
+    if (wy < 7.8 || terrainHeight(sPos, uPos - 10) < 3.5 || terrainHeight(sPos - 10, uPos) < 3.5 || terrainHeight(sPos + 10, uPos) < 3.5) continue;
+    const w = 9.0 + rng() * 6.5, d = 10.5 + rng() * 7.5, h = 6.8 + rng() * 4.2;
+    const col = timberPalette[Math.floor(rng() * timberPalette.length)];
+    addChalet(tr.x + uPos, wy, -sPos, (rng() - 0.5) * 0.65, w, d, h, col);
+    if (i % 3 === 0) {
+      const lx = tr.x + uPos - w * 0.75, lz = -sPos + d * 0.4;
+      mb.addBox(lx, wy + 2.2, lz, 0.20, 4.4, 0.20, [0.12, 0.13, 0.15], 3.0, 1.0);
+      mb.addBox(lx, wy + 4.5, lz, 0.46, 0.46, 0.46, [1.0, 0.66, 0.24], 5.0, 1.0);
+    }
+  }
+
+  // Village 2: Cozy Upper Alpine Hamlet past Pine Forest Gorge (s = 1715..1915, u = 155..270)
+  for (let i = 0; i < 14; i++) {
+    const sPos = 1720 + (i / 14) * 190 + (rng() - 0.5) * 14;
+    const uPos = 158 + rng() * 105;
+    const tr = evalTrack(sPos);
+    const wy = terrainHeight(sPos, uPos);
+    const col = timberPalette[Math.floor(rng() * timberPalette.length)];
+    addChalet(tr.x + uPos, wy, -sPos, (rng() - 0.5) * 0.6, 8.5 + rng()*5, 9.5 + rng()*6, 6.2 + rng()*3.5, col);
+  }
+  return mb.upload();
+}
+
+function buildPineForest() {
+  const mb = new MeshBuilder();
+  mb.addCylinder(0, 0.28, 0, 0.044, 0.012, 0.56, 5, [0.16, 0.10, 0.065], 0.0, false, false);
+
+  const rngM = mulberry32(7731);
+  const TIERS = 8;
+  for (let t = 0; t < TIERS; t++) {
+    const f = t / (TIERS - 1);
+    const yBase = mix(0.14, 0.84, f), yTop = mix(0.36, 1.02, f);
+    const rad   = mix(0.24, 0.044, Math.pow(f, 0.88)) * (0.90 + 0.20 * rngM());
+    const droop = mix(0.068, 0.012, f);
+    const points = t < 5 ? 7 : 5, rotOff = t * 1.13;
+
+    const apexIdx = mb.addVert(0, yTop, 0, 0, 1, 0, 0.5, f, 0.0, f, 1.0, 1.0);
+    const ringStart = mb.vcount();
+    const totalPts = points * 2;
+    for (let k = 0; k <= totalPts; k++) {
+      const a = rotOff + (k / totalPts) * Math.PI * 2;
+      const isOuter = (k % 2 === 0);
+      const r = isOuter ? rad * (0.86 + 0.26 * rngM()) : rad * 0.42;
+      const y = isOuter ? (yBase - droop) : (yBase + droop * 0.35);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      mb.addVert(ca*r, y, sa*r, ca*0.62, 0.72, sa*0.62, k/totalPts, f, isOuter ? 1.0 : 0.22, f, isOuter ? 1.0 : 0.40, 1.0);
+    }
+    for (let k = 0; k < totalPts; k++) mb.addTri(apexIdx, ringStart + k + 1, ringStart + k);
+  }
+
+  const rng = mulberry32(99123);
+  const instData = [];
+
+  const tryPlaceTree = (s, u, extraScale = 1.0) => {
+    const sw = wrapS(s);
+    if (Math.abs(u) < 7.4) return;
+    if (getViaductFactor(sw) > 0.22 && Math.abs(u) < 55) return;
+    // Keep gorge viaduct bridge span clear of trees poking through piers/arches!
+    if (sw > 740 && sw < 1040 && u > 125 && u < 290) return;
+    if (getTunnelFactor(sw) > 0.04 && Math.abs(u) < 68) return;
+    if (getGalleryFactor(sw) > 0.15 && u < 30 && u > -45) return;
+    // Clear dramatic framing window right at the opening lake & village sightline (s=162..218)
+    if (sw > 162 && sw < 218 && u > 0 && u < 48 && rng() < 0.85) return;
+
+    const tr = evalTrack(sw);
+    const wy = terrainHeight(sw, u);
+    if (wy < 2.8 || wy > 335.0) return;
+
+    const dhU = Math.abs(terrainHeight(sw, u + 3.5) - wy) / 3.5;
+    const dhS = Math.abs(terrainHeight(sw + 4.0, u) - wy) / 4.0;
+    if (dhU > 0.92 || dhS > 0.92) return;
+
+    const inVillageCore = (sw > 132 && sw < 410 && u > 282 && u < 432);
+    if (inVillageCore && rng() < 0.74) return;
+    const inHamletCore = (sw > 1710 && sw < 1920 && u > 150 && u < 275);
+    if (inHamletCore && rng() < 0.74) return;
+
+    const hScale = (11.5 + rng() * 14.5) * extraScale * mix(1.0, 0.56, smoothstep(185, 330, wy));
+    const aspect = 0.74 + rng() * 0.36;
+    // Crown-radius clearance guarantee: NO pine bough can EVER clip into or smother the train window!
+    const crownRadius = hScale * aspect * 0.30;
+    if (Math.abs(u) < 9.5 + crownRadius) return;
+    const rotY = rng() * Math.PI * 2;
+    const colorVar = rng();
+    const snowAmt = clamp(smoothstep(75, 265, wy) * 0.54 + 0.07 + (rng() - 0.5) * 0.15, 0.03, 0.68);
+    instData.push(tr.x + u, wy - 2.2, -sw, hScale, aspect, rotY, colorVar, snowAmt);
+  };
+
+  // Band 0: Towering slender alpine spruces lining the Pine Forest Gorge (u = 16..62m — silky close parallax & motion blur with sunlit Alps visible between spires!)
+  for (let i = 0; i < 620; i++) {
+    const s = 1495 + rng() * 495;
+    const u = 16.5 + Math.pow(rng(), 1.35) * 48.0;
+    tryPlaceTree(s, u, 1.18);
+  }
+  // Band 1: Close-up foreground trackside pines on BOTH sides (gives opposite window lush conifers!)
+  for (let i = 0; i < 1350; i++) {
+    const s = rng() * LOOP_LEN;
+    const side = rng() < 0.58 ? 1 : -1;
+    const u = side * (8.5 + Math.pow(rng(), 1.35) * 52.0);
+    tryPlaceTree(s, u, 1.10);
+  }
+  // Band 2: Mid-near lush conifer slopes (both sides!)
+  for (let i = 0; i < 2300; i++) {
+    const s = rng() * LOOP_LEN;
+    const side = rng() < 0.68 ? 1 : -1;
+    const u = side * (36.0 + Math.pow(rng(), 1.25) * 280.0);
+    tryPlaceTree(s, u, 1.0);
+  }
+  // Band 3: Far hillside forest belt
+  for (let i = 0; i < 1400; i++) {
+    const s = rng() * LOOP_LEN;
+    const u = 280.0 + rng() * 490.0;
+    tryPlaceTree(s, u, 1.15);
+  }
+
+  const baseMesh = mb.upload();
+  gl.bindVertexArray(baseMesh.vao);
+  const instBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(instData), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(4, 1);
+  gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(5, 1);
+  gl.bindVertexArray(null);
+  return { vao: baseMesh.vao, count: baseMesh.count, idxType: baseMesh.idxType, instances: instData.length / 8 };
+}
+
+// ============================================================================
+// 10. FULL 360° LUXURY SWISS PANORAMIC CARRIAGE INTERIOR (V3: Ergonomic Reclined Seats & Rich Finishes!)
+// ============================================================================
+function buildCarriageInterior() {
+  const mb = new MeshBuilder();
+  const glassMb = new MeshBuilder();
+
+  const W_HALF = 1.40, SILL_Y = 0.80, WIN_TOP_Y = 1.96, ROOF_Y = 2.46, CEIL_HALF = 0.88;
+  const Z_FRONT = -5.35, Z_REAR = 4.15, Z_LEN = Z_REAR - Z_FRONT, Z_MID = 0.5 * (Z_FRONT + Z_REAR);
+
+  // Ribbed Charcoal Carpet + Subtle Warm Floor Guide Strips
+  mb.addBox(0, -0.04, Z_MID, W_HALF * 2.04, 0.08, Z_LEN, [0.10, 0.10, 0.12], 9.0, 1.5);
+  for (const sx of [-0.36, 0.36]) mb.addBox(sx, 0.014, Z_MID, 0.020, 0.014, Z_LEN - 0.6, [1.0, 0.66, 0.26], 6.0, 1.0);
+
+  // Lower Side Walls, Smoked Walnut Wainscot, Brushed Aluminum Sill & Cant Rails
+  for (const side of [-1, 1]) {
+    mb.addBox(side * (W_HALF + 0.02), 0.39, Z_MID, 0.05, 0.78, Z_LEN, [0.28, 0.25, 0.23], 0.0, 0.5);
+    mb.addBox(side * (W_HALF - 0.015), 0.71, Z_MID, 0.04, 0.12, Z_LEN, [0.95, 0.90, 0.84], 1.0, 0.8);
+    mb.addBox(side * (W_HALF - 0.055), SILL_Y, Z_MID, 0.14, 0.040, Z_LEN, [0.54, 0.56, 0.60], 4.0, 1.0);
+    mb.addBox(side * (W_HALF - 0.05), 0.10, Z_MID, 0.10, 0.18, Z_LEN - 0.4, [0.16, 0.17, 0.19], 4.0, 1.0);
+    mb.addBox(side * (W_HALF - 0.02), WIN_TOP_Y + 0.03, Z_MID, 0.09, 0.070, Z_LEN, [0.11, 0.12, 0.15], 0.0, 1.0);
+    mb.addBox(side * (CEIL_HALF + 0.02), ROOF_Y - 0.03, Z_MID, 0.10, 0.070, Z_LEN, [0.12, 0.13, 0.16], 0.0, 1.0);
+  }
+
+  // Acoustic Ceiling Spine & Warm Recessed Linear Cove Lights
+  mb.addBox(0, ROOF_Y + 0.02, Z_MID, CEIL_HALF * 2.02, 0.08, Z_LEN, [0.15, 0.16, 0.19], 0.0, 0.5);
+  mb.addBox(0, ROOF_Y - 0.022, Z_MID, 1.18, 0.025, Z_LEN - 0.3, [0.60, 0.56, 0.51], 0.0, 0.4);
+  for (const sx of [-0.66, 0.66]) mb.addBox(sx, ROOF_Y - 0.026, Z_MID, 0.052, 0.018, Z_LEN - 0.5, [1.0, 0.74, 0.42], 6.0, 1.0);
+  for (let z = Z_FRONT + 0.8; z < Z_REAR - 0.6; z += 1.05) mb.addBox(0, ROOF_Y - 0.036, z, 0.36, 0.015, 0.18, [0.09, 0.10, 0.12], 4.0, 1.0);
+
+  const pillarZs = [Z_FRONT, -3.55, -1.42, 0.92, 2.75, Z_REAR];
+  for (let i = 0; i < pillarZs.length; i++) {
+    const zp = pillarZs[i], pw = (i === 0 || i === pillarZs.length - 1) ? 0.26 : 0.16;
+    for (const side of [-1, 1]) {
+      mb.addBox(side * (W_HALF - 0.02), 1.38, zp, 0.11, 1.24, pw, [0.10, 0.11, 0.14], 0.0, 1.0);
+      mb.addBox(side * (W_HALF - 0.076), 1.38, zp, 0.022, 1.12, pw * 0.55, [0.48, 0.44, 0.40], 0.0, 1.0);
+      for (let r = 0; r < 4; r++) {
+        const t = (r + 0.5) / 4;
+        mb.addBox(side * mix(W_HALF - 0.02, CEIL_HALF + 0.02, t), mix(WIN_TOP_Y + 0.04, ROOF_Y - 0.03, Math.pow(t, 0.82)), zp, 0.11, 0.10, pw * 0.85, [0.11, 0.12, 0.15], 0.0, 1.0);
+      }
+      if (i > 0 && i < pillarZs.length - 1) {
+        for (const foldOff of [-0.095, -0.042, 0.042, 0.095]) {
+          if (i === 2 && side === 1 && foldOff > 0) mb.addBox(side * (W_HALF - 0.084), 1.39, zp + foldOff + 0.052, 0.040, 1.12, 0.048, [0.30, 0.26, 0.22], 10.0, 1.0);
+          else if (i !== 2 && i !== 3) mb.addBox(side * (W_HALF - 0.084), 1.39, zp + foldOff, 0.038, 1.12, 0.046, [0.30, 0.26, 0.22], 10.0, 1.0);
+        }
+        if (i === 2 && side === 1) mb.addBox(side * (W_HALF - 0.10), 1.16, zp + 0.10, 0.036, 0.026, 0.11, [0.84, 0.64, 0.28], 5.0, 1.0);
+      }
+    }
+  }
+
+  // Overhead Brushed Aluminum Luggage Racks + Dark Leather Weekender Bags
+  for (const side of [-1, 1]) {
+    mb.addBox(side * 0.90, 2.03, Z_MID, 0.040, 0.036, Z_LEN - 0.4, [0.60, 0.62, 0.66], 4.0, 1.0);
+    mb.addBox(side * 1.12, 2.03, Z_MID, 0.030, 0.022, Z_LEN - 0.4, [0.54, 0.56, 0.60], 4.0, 1.0);
+    mb.addBox(side * 1.31, 2.03, Z_MID, 0.040, 0.036, Z_LEN - 0.4, [0.54, 0.56, 0.60], 4.0, 1.0);
+    for (const zp of pillarZs) mb.addBox(side * 1.12, 2.01, zp, 0.48, 0.040, 0.052, [0.52, 0.54, 0.58], 4.0, 1.0);
+    mb.addBox(side * 1.10, 2.16, -2.55, 0.34, 0.22, 0.58, [0.16, 0.09, 0.06], 3.0, 1.0);
+    if (side === -1) mb.addBox(side * 1.12, 2.17, 0.15, 0.36, 0.24, 0.62, [0.11, 0.13, 0.17], 3.0, 1.0);
+  }
+
+  // Panoramic Window Glass & Curved Roof Skylight Glass
+  for (let i = 0; i < pillarZs.length - 1; i++) {
+    const z0 = pillarZs[i] + 0.062, z1 = pillarZs[i + 1] - 0.062;
+    for (const side of [-1, 1]) {
+      const gx = side * WIN_PLANE_X, nx = -side, b = glassMb.vcount();
+      if (side > 0) {
+        glassMb.addVert(gx, SILL_Y+0.01, z0, nx,0,0, 0,0, side,0,0,1);
+        glassMb.addVert(gx, SILL_Y+0.01, z1, nx,0,0, 1,0, side,0,0,1);
+        glassMb.addVert(gx, WIN_TOP_Y+0.01, z1, nx,0,0, 1,1, side,0,0,1);
+        glassMb.addVert(gx, WIN_TOP_Y+0.01, z0, nx,0,0, 0,1, side,0,0,1);
+      } else {
+        glassMb.addVert(gx, SILL_Y+0.01, z1, nx,0,0, 0,0, side,0,0,1);
+        glassMb.addVert(gx, SILL_Y+0.01, z0, nx,0,0, 1,0, side,0,0,1);
+        glassMb.addVert(gx, WIN_TOP_Y+0.01, z0, nx,0,0, 1,1, side,0,0,1);
+        glassMb.addVert(gx, WIN_TOP_Y+0.01, z1, nx,0,0, 0,1, side,0,0,1);
+      }
+      glassMb.addQuad(b, b+1, b+2, b+3);
+
+      const sBase = glassMb.vcount();
+      for (let k = 0; k <= 4; k++) {
+        const t = k / 4;
+        const px = side * mix(W_HALF - 0.01, CEIL_HALF + 0.02, t);
+        const py = mix(WIN_TOP_Y + 0.05, ROOF_Y - 0.02, Math.pow(t, 0.82));
+        const inNx = -side * mix(0.75, 0.35, t), inNy = -mix(0.65, 0.94, t);
+        const nl = Math.hypot(inNx, inNy);
+        glassMb.addVert(px, py, z0, inNx/nl, inNy/nl, 0, 0, t, side, 1, 0, 1);
+        glassMb.addVert(px, py, z1, inNx/nl, inNy/nl, 0, 1, t, side, 1, 0, 1);
+      }
+      for (let k = 0; k < 4; k++) { const a = sBase + k*2; if (side > 0) glassMb.addQuad(a, a+1, a+3, a+2); else glassMb.addQuad(a, a+2, a+3, a+1); }
+    }
+  }
+
+  // Sculpted Reclined Luxury Swiss 1st-Class Burgundy Seats with Dark Espresso Leather Headrests & Brushed Steel Grab Handles!
+  const addSwissSeat = (cx, cz, facingDir, side, skipHeadrest = false) => {
+    const seatW = 0.62, backZ = cz - facingDir * 0.25;
+    const tilt = facingDir * 0.16; // Ergonomic ~9° recline!
+    mb.addBox(cx, 0.20, cz - facingDir * 0.06, 0.14, 0.36, 0.28, [0.30, 0.32, 0.36], 4.0, 1.0);
+    mb.addBox(cx, 0.44, cz + facingDir * 0.04, seatW, 0.13, 0.52, [0.95, 0.90, 0.90], 2.0, 1.6);
+    mb.addBox(cx, 0.43, cz + facingDir * 0.29, seatW * 0.94, 0.10, 0.08, [0.92, 0.86, 0.86], 2.0, 1.6);
+    // Reclined contoured backrest + side bolsters + dark charcoal rear shell
+    mb.addTiltedBox(cx, 0.78, backZ, seatW, 0.62, 0.13, tilt, [0.94, 0.88, 0.88], 2.0, 1.6);
+    for (const bx of [-seatW * 0.46, seatW * 0.46]) {
+      mb.addTiltedBox(cx + bx, 0.79, backZ + facingDir * 0.05, 0.085, 0.54, 0.11, tilt, [0.86, 0.80, 0.80], 2.0, 1.6);
+    }
+    mb.addTiltedBox(cx, 0.80, backZ - facingDir * 0.075, seatW * 0.95, 0.68, 0.04, tilt, [0.11, 0.12, 0.14], 0.0, 1.0);
+    if (!skipHeadrest) {
+      const hz = backZ - facingDir * 0.08;
+      // Rich dark espresso-brown leather headrest bolster (NO pale beige!)
+      mb.addTiltedBox(cx, 1.15, hz, seatW * 0.84, 0.23, 0.12, tilt, [0.09, 0.06, 0.05], 3.0, 1.0);
+      for (const wx of [-seatW * 0.39, seatW * 0.39]) {
+        mb.addTiltedBox(cx + wx, 1.15, hz + facingDir * 0.04, 0.065, 0.20, 0.11, tilt, [0.09, 0.06, 0.05], 3.0, 1.0);
+      }
+      // Crisp white Swiss linen antimacassar headrest drape
+      mb.addTiltedBox(cx, 1.14, hz + facingDir * 0.055, seatW * 0.50, 0.18, 0.015, tilt, [0.82, 0.79, 0.74], 11.0, 1.0);
+      // Sleek brushed-stainless aisle grab handle on top of aisle-side headrest!
+      const aisleX = cx - side * (seatW * 0.34);
+      mb.addBox(aisleX, 1.29, hz - facingDir * 0.02, 0.16, 0.024, 0.024, [0.68, 0.70, 0.74], 4.0, 1.0);
+      mb.addBox(aisleX - 0.07, 1.26, hz - facingDir * 0.02, 0.022, 0.06, 0.022, [0.68, 0.70, 0.74], 4.0, 1.0);
+      mb.addBox(aisleX + 0.07, 1.26, hz - facingDir * 0.02, 0.022, 0.06, 0.022, [0.68, 0.70, 0.74], 4.0, 1.0);
+    }
+    for (const ax of [-seatW * 0.50, seatW * 0.50]) {
+      mb.addBox(cx + ax, 0.64, cz + facingDir * 0.03, 0.066, 0.052, 0.42, [0.09, 0.06, 0.05], 3.0, 1.0);
+      mb.addBox(cx + ax, 0.54, cz - facingDir * 0.06, 0.038, 0.18, 0.26, [0.12, 0.13, 0.15], 0.0, 1.0);
+    }
+  };
+
+  // Smoked Walnut Window Table + Warm Cream-Amber Brass Lamp + Porcelain Espresso Cup
+  const addWindowTableAndLamp = (side, zCenter, hasHeroProps = false) => {
+    const tx = side * 0.96, ty = 0.74;
+    mb.addBox(tx, ty, zCenter, 0.76, 0.034, 0.62, [0.96, 0.92, 0.86], 1.0, 1.4);
+    mb.addBox(tx, ty - 0.018, zCenter, 0.74, 0.018, 0.60, [0.14, 0.15, 0.17], 4.0, 1.0);
+    mb.addBox(side * 1.24, 0.37, zCenter, 0.08, 0.73, 0.14, [0.34, 0.36, 0.40], 4.0, 1.0);
+
+    const lx = side * 1.22, lz = zCenter;
+    mb.addCylinder(lx, ty + 0.030, lz, 0.058, 0.044, 0.030, 14, [0.84, 0.64, 0.28], 5.0, true, false);
+    mb.addCylinder(lx, ty + 0.155, lz, 0.013, 0.010, 0.22, 10, [0.86, 0.68, 0.32], 5.0, false, false);
+    // Warm amber-parchment lantern shade (matId 13 = warm shaded glowing parchment lamp!)
+    mb.addCylinder(lx, ty + 0.30,  lz, 0.066, 0.042, 0.105, 16, [0.96, 0.68, 0.30], 13.0, true, true);
+    mb.addCylinder(lx, ty + 0.249, lz, 0.068, 0.067, 0.010, 16, [0.84, 0.64, 0.28], 5.0, false, false);
+    mb.addCylinder(lx, ty + 0.354, lz, 0.045, 0.044, 0.008, 16, [0.84, 0.64, 0.28], 5.0, false, false);
+    mb.addCylinder(lx, ty + 0.368, lz, 0.040, 0.010, 0.022, 12, [0.84, 0.64, 0.28], 5.0, true, false);
+
+    if (hasHeroProps) {
+      const cx = side * 0.96, cz = zCenter + 0.12;
+      mb.addCylinder(cx, ty + 0.024, cz, 0.056, 0.072, 0.014, 16, [0.90, 0.88, 0.84], 7.0, true, false);
+      mb.addCylinder(cx, ty + 0.062, cz, 0.030, 0.040, 0.066, 16, [0.92, 0.90, 0.86], 7.0, false, false);
+      mb.addBox(cx - side * 0.046, ty + 0.066, cz, 0.024, 0.036, 0.012, [0.90, 0.88, 0.84], 7.0, 1.0);
+      mb.addCylinder(cx, ty + 0.088, cz, 0.036, 0.036, 0.006, 14, [0.13, 0.07, 0.038], 8.0, true, false);
+      mb.addBox(side * 0.88, ty + 0.022, zCenter - 0.12, 0.19, 0.010, 0.14, [0.84, 0.80, 0.73], 11.0, 1.0);
+      mb.addBox(side * 0.88, ty + 0.028, zCenter - 0.12, 0.035, 0.004, 0.035, [0.72, 0.10, 0.12], 0.0, 1.0);
+    }
+  };
+
+  const baySpecs = [
+    { tableZ: -2.48, seatBackZ: -1.78, seatFwdZ: -3.18, isHero: false },
+    { tableZ: -0.34, seatBackZ:  0.50, seatFwdZ: -1.08, isHero: true  },
+    { tableZ:  1.86, seatBackZ:  2.56, seatFwdZ:  1.22, isHero: false }
+  ];
+  for (const bay of baySpecs) {
+    for (const side of [-1, 1]) {
+      addSwissSeat(side * 0.86, bay.seatBackZ, -1, side, bay.isHero && side === 1);
+      addSwissSeat(side * 0.86, bay.seatFwdZ,  +1, side, false);
+      addWindowTableAndLamp(side, bay.tableZ, bay.isHero && side === 1);
+    }
+  }
+  for (const side of [-1, 1]) addSwissSeat(side * 0.86, -4.45, -1, side, false);
+
+  for (const bz of [Z_FRONT, Z_REAR]) {
+    const dir = bz < 0 ? 1 : -1;
+    for (const side of [-1, 1]) {
+      mb.addBox(side * 0.96, 1.22, bz, 0.94, 2.46, 0.10, [0.14, 0.15, 0.18], 0.0, 0.5);
+      mb.addBox(side * 0.96, 1.25, bz + dir * 0.055, 0.72, 1.45, 0.02, [0.92, 0.88, 0.82], 1.0, 1.2);
+    }
+    mb.addBox(0, 2.24, bz, 1.04, 0.44, 0.10, [0.12, 0.13, 0.16], 0.0, 1.0);
+    mb.addBox(-0.48, 1.02, bz + dir * 0.04, 0.05, 2.04, 0.06, [0.60, 0.62, 0.66], 4.0, 1.0);
+    mb.addBox( 0.48, 1.02, bz + dir * 0.04, 0.05, 2.04, 0.06, [0.60, 0.62, 0.66], 4.0, 1.0);
+    mb.addBox(0, 1.02, bz - dir * 0.22, 0.94, 2.04, 0.06, [0.05, 0.06, 0.08], 0.0, 1.0);
+    mb.addBox(0, 1.92, bz - dir * 0.16, 0.44, 0.06, 0.06, [1.0, 0.72, 0.36], 6.0, 1.0);
+
+    const sb = mb.vcount();
+    const sy0 = 2.08, sy1 = 2.34, sx = 0.62, sz = bz + dir * 0.062;
+    if (dir > 0) {
+      mb.addVert(-sx, sy0, sz, 0,0,1, 0,1, 1,1,1, 12.0); mb.addVert(sx, sy0, sz, 0,0,1, 1,1, 1,1,1, 12.0);
+      mb.addVert( sx, sy1, sz, 0,0,1, 1,0, 1,1,1, 12.0); mb.addVert(-sx, sy1, sz, 0,0,1, 0,0, 1,1,1, 12.0);
+    } else {
+      mb.addVert( sx, sy0, sz, 0,0,-1, 0,1, 1,1,1, 12.0); mb.addVert(-sx, sy0, sz, 0,0,-1, 1,1, 1,1,1, 12.0);
+      mb.addVert(-sx, sy1, sz, 0,0,-1, 1,0, 1,1,1, 12.0); mb.addVert( sx, sy1, sz, 0,0,-1, 0,0, 1,1,1, 12.0);
+    }
+    mb.addQuad(sb, sb+1, sb+2, sb+3);
+  }
+  return { interior: mb.upload(), glass: glassMb.upload() };
+}
+
+// ============================================================================
+// 11. V3 PHOTOREALISTIC GLSL ES 3.00 SHADERS
+// ============================================================================
+const COMMON_GLSL = `#version 300 es
+precision highp float;
+precision highp int;
+
+const vec3 SUN_DIR = normalize(vec3(0.34, 0.28, -0.898));
+const vec3 SUN_COL = vec3(2.95, 2.26, 1.50);
+const vec3 SKY_ZENITH = vec3(0.048, 0.155, 0.42);
+const vec3 SKY_HORIZON = vec3(0.50, 0.65, 0.82);
+const vec3 FOG_COL_SUN = vec3(0.92, 0.78, 0.58);
+const vec3 FOG_COL_SKY = vec3(0.30, 0.46, 0.70);
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float noise2(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x),
+             mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float noise3(vec3 p) {
+  vec3 i = floor(p), f = fract(p);
+  vec3 u = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash13(i), hash13(i+vec3(1,0,0)), u.x), mix(hash13(i+vec3(0,1,0)), hash13(i+vec3(1,1,0)), u.x), u.y),
+    mix(mix(hash13(i+vec3(0,0,1)), hash13(i+vec3(1,0,1)), u.x), mix(hash13(i+vec3(0,1,1)), hash13(i+vec3(1,1,1)), u.x), u.y),
+    u.z
+  );
+}
+float fbm2(vec2 p) {
+  float v = 0.0, a = 0.5;
+  mat2 m = mat2(0.80, 0.60, -0.60, 0.80);
+  for (int i = 0; i < 4; i++) { v += a * noise2(p); p = m * p * 2.04 + vec2(17.1, 31.7); a *= 0.5; }
+  return v;
+}
+float ridged3(vec3 p) {
+  float sum = 0.0, amp = 0.55, w = 1.0;
+  for (int i = 0; i < 4; i++) {
+    float n = 1.0 - abs(noise3(p) * 2.0 - 1.0);
+    n = n * n * w;
+    w = clamp(n * 1.75, 0.2, 1.0);
+    sum += n * amp;
+    p = p * 2.07 + vec3(13.1, 7.7, 19.3);
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+vec3 evalAlpineSky(vec3 dir, float time) {
+  vec3 d = normalize(dir);
+  float elev = clamp(d.y, -0.1, 1.0);
+  float horizonT = pow(1.0 - clamp(elev, 0.0, 1.0), 3.8);
+  vec3 sky = mix(SKY_ZENITH, SKY_HORIZON, horizonT);
+  float sunCos = max(dot(d, SUN_DIR), 0.0);
+  sky += vec3(1.0, 0.72, 0.40) * (pow(sunCos, 7.0) * 0.36 + pow(sunCos, 54.0) * 1.10) * (0.30 + 0.70 * horizonT);
+  sky = mix(sky, vec3(0.025, 0.09, 0.32), smoothstep(0.24, 0.88, elev) * 0.58);
+
+  if (d.y > 0.015) {
+    vec2 uvCir = d.xz / (d.y + 0.24) * 1.4 + vec2(time * 0.0022, -time * 0.0014);
+    float cir = fbm2(uvCir * vec2(1.9, 0.7) + fbm2(uvCir * 1.1) * 0.6);
+    float cirMask = smoothstep(0.58, 0.84, cir) * smoothstep(0.03, 0.20, d.y) * 0.30;
+    sky = mix(sky, mix(vec3(0.84, 0.88, 0.96), vec3(1.18, 0.94, 0.72), pow(sunCos, 2.0)), cirMask);
+
+    vec2 uvCum = d.xz / (d.y + 0.14) * 1.15 + vec2(time * 0.0036, time * 0.0010);
+    float c1 = fbm2(uvCum * 1.45), c2 = fbm2(uvCum * 3.2 + vec2(c1 * 0.78));
+    float cDens = smoothstep(0.54, 0.80, c1 * 0.65 + c2 * 0.35) * smoothstep(0.03, 0.14, d.y) * (1.0 - smoothstep(0.42, 0.82, d.y));
+    float cLit = clamp(0.40 + 0.60 * smoothstep(0.35, 0.75, fbm2(uvCum * 1.45 + SUN_DIR.xz * 0.18)) + pow(sunCos, 4.0) * 0.45, 0.0, 1.3);
+    vec3 cCol = mix(vec3(0.30, 0.38, 0.54), vec3(1.22, 1.08, 0.92) + vec3(0.45, 0.28, 0.10) * pow(sunCos, 8.0), clamp(cLit, 0.0, 1.0));
+    sky = mix(sky, cCol, cDens * 0.72);
+  }
+  sky += vec3(16.0, 11.5, 6.5) * smoothstep(0.9994, 0.99985, sunCos);
+  return sky;
+}
+
+vec3 applyAlpineFog(vec3 color, vec3 worldPos, vec3 camPos, float time) {
+  vec3 rel = worldPos - camPos;
+  float dist = length(rel);
+  vec3 dir = rel / max(dist, 0.0001);
+  float sunCos = max(dot(dir, SUN_DIR), 0.0);
+  float hAvg = max(0.0, 0.5 * (worldPos.y + camPos.y));
+  float heightDensity = exp(-hAvg * 0.0015);
+  float fogAmt = clamp(1.0 - exp(-dist * (0.000088 * heightDensity + 0.000024)), 0.0, 0.68);
+  vec3 fogCol = mix(FOG_COL_SKY, FOG_COL_SUN, pow(sunCos, 3.5) * 0.55);
+  fogCol = mix(fogCol, SKY_HORIZON * 0.86, smoothstep(160.0, 1100.0, worldPos.y) * 0.45);
+  return mix(color, fogCol, fogAmt);
+}
+`;
+
+const FS_QUAD_VS = `#version 300 es
+precision highp float;
+out vec2 vUv;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.9999, 1.0);
+}
+`;
+
+const SKY_FS = COMMON_GLSL + `
+in vec2 vUv;
+uniform mat4 uInvVP;
+uniform vec3 uCamPos;
+uniform float uTime;
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outVel;
+void main() {
+  vec4 wp = uInvVP * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+  outColor = vec4(evalAlpineSky(normalize(wp.xyz / wp.w - uCamPos), uTime), 1.0);
+  outVel = vec4(0.0, 0.0, 20000.0, 0.0);
+}
+`;
+
+const TERRAIN_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNor;
+layout(location = 2) in vec2 aUv;
+layout(location = 3) in vec4 aCol;
+
+uniform mat4 uCurrVP;
+uniform mat4 uPrevVP;
+uniform float uZShift;
+uniform vec3 uCamPos;
+
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec2 vSU;
+out vec2 vMeta;
+out vec4 vCurrClip;
+out vec4 vPrevClip;
+out float vViewDist;
+
+void main() {
+  vec3 wp = vec3(aPos.x, aPos.y, aPos.z + uZShift);
+  vWorldPos = wp; vNormal = normalize(aNor); vSU = aUv; vMeta = aCol.rg;
+  vViewDist = length(wp - uCamPos);
+  vCurrClip = uCurrVP * vec4(wp, 1.0);
+  vPrevClip = uPrevVP * vec4(wp, 1.0);
+  gl_Position = vCurrClip;
+}
+`;
+
+// V3 CRAGGY ALPINE MOUNTAIN SHADER (ZERO horizontal zebra rings — pure jagged glacial granite couloirs & ridges!)
+const TERRAIN_FS = COMMON_GLSL + `
+in vec3 vWorldPos;
+in vec3 vNormal;
+in vec2 vSU;
+in vec2 vMeta;
+in vec4 vCurrClip;
+in vec4 vPrevClip;
+in float vViewDist;
+
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uLoopLen;
+
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outVel;
+
+// Organic 3D jagged Alpine geology: vertical glacial couloirs + fractured tilted granite crags (ZERO horizontal sine banding!)
+float alpineMicroHeight(vec3 wp) {
+  // Elongate vertically slightly (0.45 on Y) to carve authentic steep glacial rock chutes & vertical arêtes!
+  vec3 p1 = vec3(wp.x * 0.0065, wp.y * 0.0032, wp.z * 0.0065);
+  vec3 warp = vec3(noise3(p1 * 1.4), noise3(p1 * 1.4 + 19.3), noise3(p1 * 1.4 + 41.7)) * 0.85;
+  float couloir = ridged3(p1 + warp * 0.55);
+  float crag    = ridged3(vec3(wp.x * 0.022, wp.y * 0.014, wp.z * 0.022) + warp * 0.4);
+  float grain   = noise3(wp * 0.085);
+  return couloir * 0.64 + crag * 0.28 + grain * 0.08;
+}
+
+void main() {
+  vec3 Ngeom = normalize(vNormal);
+  vec3 V = normalize(uCamPos - vWorldPos);
+  float dist = vViewDist;
+
+  float eps = clamp(dist * 0.0018, 0.35, 8.5);
+  float h0 = alpineMicroHeight(vWorldPos);
+  float hx = alpineMicroHeight(vWorldPos + vec3(eps, 0.0, 0.0));
+  float hy = alpineMicroHeight(vWorldPos + vec3(0.0, eps, 0.0));
+  float hz = alpineMicroHeight(vWorldPos + vec3(0.0, 0.0, eps));
+  vec3 grad = vec3(hx - h0, hy - h0, hz - h0) / eps;
+  float bumpStrength = mix(1.35, 0.95, smoothstep(1000.0, 8000.0, dist));
+  vec3 N = normalize(Ngeom - grad * bumpStrength);
+
+  float elev = vWorldPos.y;
+  float slope = 1.0 - clamp(N.y, 0.0, 1.0);
+  float macroNoise = fbm2(vWorldPos.xz * 0.0015);
+  float medNoise   = fbm2(vWorldPos.xz * 0.009);
+  float fineNoise  = noise2(vWorldPos.xz * 0.16 + vWorldPos.y * 0.08);
+  float rockFissure = ridged3(vec3(vWorldPos.x * 0.012, vWorldPos.y * 0.007, vWorldPos.z * 0.012));
+
+  // 1. Fractured Dark Charcoal-Slate Alpine Granite & Weathered Ochre Crags (Matterhorn/Eiger geology!)
+  vec3 rockDark  = vec3(0.055, 0.062, 0.076);
+  vec3 rockMid   = vec3(0.155, 0.160, 0.178);
+  vec3 rockWarm  = vec3(0.24, 0.205, 0.175);
+  vec3 rockCol   = mix(rockDark, rockMid, rockFissure * 0.72 + fineNoise * 0.28);
+  rockCol        = mix(rockCol, rockWarm, smoothstep(0.50, 0.84, medNoise) * 0.45);
+  rockCol       *= mix(0.58, 1.20, h0);
+
+  // 2. Alpine Meadow, Mossy Crags & Deep Dark Conifer Mountain Flank
+  vec3 meadowCol = mix(vec3(0.075, 0.122, 0.052), vec3(0.155, 0.168, 0.076), medNoise);
+  float canopyTex = fbm2(vWorldPos.xz * 0.11);
+  vec3 forestCol = mix(vec3(0.018, 0.048, 0.028), vec3(0.052, 0.095, 0.045), canopyTex);
+  float forestMask = smoothstep(8.0, 42.0, elev) * (1.0 - smoothstep(230.0, 340.0, elev)) * (1.0 - smoothstep(0.28, 0.52, slope));
+  vec3 lowVeg = mix(meadowCol, forestCol, forestMask * (0.50 + 0.50 * smoothstep(140.0, 460.0, dist)));
+
+  // Rocky shoreline pebble beach & mossy boulders near lake
+  float shoreMask = smoothstep(7.5, 0.4, elev) * vMeta.x;
+  lowVeg = mix(lowVeg, vec3(0.22, 0.21, 0.18) * (0.75 + 0.5 * fineNoise), shoreMask * 0.88);
+
+  // Opposite rocky mountainside (-u) shows more fractured granite rock ledges!
+  float rockBias = (vSU.y < -6.0) ? 0.14 : 0.0;
+  float vegMask = (1.0 - smoothstep(255.0, 385.0, elev + (medNoise - 0.5) * 95.0)) * (1.0 - smoothstep(0.24 - rockBias, 0.44 - rockBias, slope));
+  vec3 albedo = mix(rockCol, lowVeg, vegMask);
+
+  // 3. Translucent Hanging Glacier Cyan Ice in high gullies
+  float iceMask = smoothstep(480.0, 860.0, elev) * smoothstep(0.18, 0.44, slope) * smoothstep(0.55, 0.80, medNoise) * (1.0 - smoothstep(0.48, 0.66, slope));
+  albedo = mix(albedo, vec3(0.24, 0.50, 0.72), iceMask * 0.55);
+
+  // 4. Jagged Natural Alpine Snow Accumulation (wind-packed couloirs & ridges shedding off sheer dark rock walls!)
+  float snowLine = 250.0 + (macroNoise - 0.5) * 165.0 + (medNoise - 0.5) * 95.0;
+  float shadeBonus = clamp(-dot(N.xz, SUN_DIR.xz), 0.0, 1.0) * 105.0;
+  float elevSnow = smoothstep(snowLine - shadeBonus - 80.0, snowLine - shadeBonus + 185.0, elev);
+  float lowSnowPatch = smoothstep(0.66, 0.88, medNoise * 0.72 + fineNoise * 0.28) * (1.0 - smoothstep(0.14, 0.28, slope)) * 0.52;
+  // Snow catches naturally inside couloir concavities (1 - h0) and sheds cleanly off steep dark granite arête walls!
+  float couloirCatch = (1.0 - h0) * 0.14;
+  float slopeCap = 1.0 - smoothstep(0.16, 0.39, slope - couloirCatch);
+  float snowMask = clamp(max(elevSnow, lowSnowPatch) * slopeCap, 0.0, 1.0);
+  float summitSnow = smoothstep(620.0, 1180.0, elev) * (1.0 - smoothstep(0.24, 0.48, slope - couloirCatch * 1.15));
+  snowMask = clamp(max(snowMask, summitSnow), 0.0, 1.0);
+
+  vec3 snowAlbedo = mix(vec3(0.76, 0.82, 0.92), vec3(0.93, 0.95, 0.98), fineNoise);
+  albedo = mix(albedo, snowAlbedo, snowMask);
+
+  // 5. Dramatic Photographic Alpine Chiaroscuro Lighting!
+  float diffuse = max(dot(N, SUN_DIR), 0.0);
+  float geomSelf = smoothstep(-0.04, 0.18, dot(Ngeom, SUN_DIR));
+  float cloudShadow = mix(0.78, 1.0, smoothstep(0.30, 0.68, fbm2(vWorldPos.xz * 0.00038 + vec2(uTime * 0.003, 0.0))));
+  float sunVis = vMeta.y * geomSelf * cloudShadow;
+
+  vec3 directLight = SUN_COL * diffuse * sunVis;
+  float skyHemi = 0.5 + 0.5 * N.y;
+  float valleyAO = clamp(0.42 + 0.58 * smoothstep(-10.0, 480.0, elev), 0.0, 1.0);
+  vec3 skyBounce = mix(vec3(0.075, 0.135, 0.27), vec3(0.22, 0.38, 0.72), skyHemi) * valleyAO;
+  vec3 groundBounce = vec3(0.18, 0.17, 0.16) * max(-N.y * 0.5 + 0.5, 0.0) * 0.22;
+
+  vec3 H = normalize(SUN_DIR + V);
+  float spec = pow(max(dot(N, H), 0.0), mix(22.0, 64.0, snowMask)) * mix(0.04, 0.34, snowMask) * sunVis;
+  float alpen = smoothstep(680.0, 1300.0, elev) * snowMask * diffuse * sunVis;
+
+  vec3 color = albedo * (directLight + skyBounce + groundBounce) + SUN_COL * spec + vec3(0.30, 0.10, 0.03) * alpen;
+  color = applyAlpineFog(color, vWorldPos, uCamPos, uTime);
+
+  vec2 currNDC = vCurrClip.xy / max(vCurrClip.w, 0.0001);
+  vec2 prevNDC = vPrevClip.xy / max(vPrevClip.w, 0.0001);
+  outColor = vec4(color, 1.0);
+  outVel = vec4((currNDC - prevNDC) * 0.5, dist, 1.0);
+}
+`;
+
+const WATER_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNor;
+layout(location = 2) in vec2 aUv;
+layout(location = 3) in vec4 aCol;
+uniform mat4 uCurrVP; uniform mat4 uPrevVP; uniform float uZShift; uniform vec3 uCamPos;
+out vec3 vWorldPos; out vec3 vMeta; out vec4 vCurrClip; out vec4 vPrevClip; out float vViewDist;
+void main() {
+  vec3 wp = vec3(aPos.x, aPos.y, aPos.z + uZShift);
+  vWorldPos = wp; vMeta = aCol.rgb; vViewDist = length(wp - uCamPos);
+  vCurrClip = uCurrVP * vec4(wp, 1.0); vPrevClip = uPrevVP * vec4(wp, 1.0);
+  gl_Position = vCurrClip;
+}
+`;
+
+const WATER_FS = COMMON_GLSL + `
+in vec3 vWorldPos; in vec3 vMeta; in vec4 vCurrClip; in vec4 vPrevClip; in float vViewDist;
+uniform vec3 uCamPos; uniform float uTime;
+layout(location = 0) out vec4 outColor; layout(location = 1) out vec4 outVel;
+void main() {
+  vec3 V = normalize(uCamPos - vWorldPos);
+  float dist = vViewDist, depth = vMeta.r, isRiver = vMeta.g, sunShad = vMeta.b;
+  float flow = mix(0.25, 2.5, isRiver);
+  vec2 wp = vWorldPos.xz;
+  float windPatch = smoothstep(0.28, 0.74, fbm2(wp * 0.0068 + vec2(uTime * 0.015, 0.0)));
+  vec2 p1 = wp * 0.15 + vec2(uTime * 0.42 * flow, uTime * 0.20);
+  vec2 p2 = wp * 0.38 + vec2(-uTime * 0.30, uTime * 0.50 * flow);
+  vec2 p3 = wp * 0.92 + vec2(uTime * 0.65, -uTime * 0.45);
+
+  float h0 = noise2(p1)*0.55 + noise2(p2)*0.30 + noise2(p3)*0.15;
+  float hx = noise2(p1+vec2(0.18,0))*0.55 + noise2(p2+vec2(0.18,0))*0.30 + noise2(p3+vec2(0.18,0))*0.15;
+  float hz = noise2(p1+vec2(0,0.18))*0.55 + noise2(p2+vec2(0,0.18))*0.30 + noise2(p3+vec2(0,0.18))*0.15;
+  float rippleAmp = mix(0.04, 0.18, windPatch) * mix(1.0, 2.2, isRiver) * (1.0 - smoothstep(400.0, 1800.0, dist)*0.5);
+  vec3 N = normalize(vec3(-(hx-h0)*rippleAmp/0.18, 1.0, -(hz-h0)*rippleAmp/0.18));
+
+  float cosT = max(dot(N, V), 0.0);
+  float fresnel = 0.025 + 0.975 * pow(1.0 - cosT, 5.0);
+
+  vec3 R = reflect(-V, N); R.y = max(R.y, 0.005);
+  vec3 skyRefl = evalAlpineSky(R, uTime);
+  float mAng = atan(R.z, R.x);
+  float peakProf = 0.18 + 0.16 * fbm2(vec2(mAng * 4.2, 1.7)) + 0.10 * abs(sin(mAng * 8.5 + 0.5));
+  float inMtn = smoothstep(peakProf + 0.03, peakProf - 0.02, R.y);
+  float snowB = smoothstep(0.08, 0.24, R.y + 0.06 * fbm2(vec2(mAng * 14.0, R.y * 12.0)));
+  vec3 mtnRefl = mix(vec3(0.05, 0.09, 0.14), vec3(0.84, 0.86, 0.90), snowB * 0.78) * mix(0.45, 1.08, smoothstep(-0.2, 0.6, dot(normalize(vec3(R.x, 0.2, R.z)), SUN_DIR)));
+  vec3 reflCol = mix(skyRefl, mtnRefl, inMtn * (1.0 - isRiver * 0.6));
+
+  float depthT = clamp(depth / 9.5, 0.0, 1.0);
+  vec3 waterBody = mix(vec3(0.08, 0.39, 0.42), vec3(0.02, 0.15, 0.23), pow(depthT, 0.65)) * mix(0.65, 1.15, sunShad);
+  if (isRiver > 0.5) waterBody = mix(vec3(0.11, 0.38, 0.44), vec3(0.84, 0.89, 0.93), smoothstep(0.55, 0.82, h0));
+  waterBody = mix(waterBody, vec3(0.80, 0.85, 0.89), smoothstep(1.3, 0.05, depth) * smoothstep(0.35, 0.72, h0) * 0.52);
+
+  vec3 H = normalize(SUN_DIR + V);
+  float sunGlint = (pow(max(dot(N, H), 0.0), mix(380.0, 95.0, windPatch))*5.0 + pow(max(dot(N, H), 0.0), 42.0)*0.35) * sunShad;
+  vec3 color = applyAlpineFog(mix(waterBody, reflCol, clamp(fresnel * 0.80 + 0.05, 0.0, 0.86)) + SUN_COL * sunGlint, vWorldPos, uCamPos, uTime);
+
+  outColor = vec4(color, 1.0);
+  outVel = vec4((vCurrClip.xy/max(vCurrClip.w,0.0001) - vPrevClip.xy/max(vPrevClip.w,0.0001)) * 0.5, dist, 1.0);
+}
+`;
+
+const PINE_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos; layout(location = 1) in vec3 aNor; layout(location = 2) in vec2 aUv;
+layout(location = 3) in vec4 aCol; layout(location = 4) in vec4 iPosS; layout(location = 5) in vec4 iAttr;
+uniform mat4 uCurrVP; uniform mat4 uPrevVP; uniform float uTrainS; uniform float uLoopLen; uniform vec3 uCamPos; uniform float uTime;
+out vec3 vWorldPos; out vec3 vNormal; out vec4 vCol; out vec2 vInstMeta; out vec4 vCurrClip; out vec4 vPrevClip; out float vViewDist;
+void main() {
+  float treeS = -iPosS.z;
+  float relS = mod(treeS - uTrainS + uLoopLen * 0.5, uLoopLen) - uLoopLen * 0.5;
+  float worldZ = -(uTrainS + relS);
+  float hS = iPosS.w, rS = hS * iAttr.x, c = cos(iAttr.y), s = sin(iAttr.y);
+  float sway = sin(uTime * 1.35 + iPosS.x * 0.17 + iPosS.z * 0.13) * 0.022 * aPos.y * aPos.y * hS;
+  vec3 lp = vec3(aPos.x * rS + sway, aPos.y * hS, aPos.z * rS);
+  vec3 wp = vec3(iPosS.x + lp.x*c - lp.z*s, iPosS.y + lp.y, worldZ + lp.x*s + lp.z*c);
+  vWorldPos = wp; vNormal = normalize(vec3(aNor.x*c - aNor.z*s, aNor.y, aNor.x*s + aNor.z*c));
+  vCol = aCol; vInstMeta = iAttr.zw; vViewDist = length(wp - uCamPos);
+  vCurrClip = uCurrVP * vec4(wp, 1.0); vPrevClip = uPrevVP * vec4(wp, 1.0);
+  gl_Position = vCurrClip;
+}
+`;
+
+const PINE_FS = COMMON_GLSL + `
+in vec3 vWorldPos; in vec3 vNormal; in vec4 vCol; in vec2 vInstMeta; in vec4 vCurrClip; in vec4 vPrevClip; in float vViewDist;
+uniform vec3 uCamPos; uniform float uTime;
+layout(location = 0) out vec4 outColor; layout(location = 1) out vec4 outVel;
+void main() {
+  vec3 N = normalize(vNormal), V = normalize(uCamPos - vWorldPos);
+  float isFol = vCol.a, tip = vCol.r, hFrac = vCol.g;
+  float boughAO = mix(0.24, 1.0, vCol.b) * mix(0.46, 1.05, hFrac);
+
+  vec3 albedo; float snow = 0.0;
+  if (isFol < 0.5) {
+    albedo = mix(vec3(0.055, 0.036, 0.024), vec3(0.12, 0.08, 0.05), noise2(vec2(vWorldPos.x*3.0+vWorldPos.z*3.0, vWorldPos.y*1.6)));
+  } else {
+    float needleN = fbm2(vWorldPos.xz * 0.9 + vec2(vWorldPos.y * 0.7));
+    albedo = mix(vec3(0.014, 0.044, 0.026), mix(vec3(0.034, 0.088, 0.042), vec3(0.058, 0.110, 0.045), vInstMeta.x), needleN*0.65 + tip*0.35);
+    snow = smoothstep(0.65, 0.93, N.y + needleN * 0.22 + hFrac * 0.16 - (1.0 - vInstMeta.y) * 0.54);
+    albedo = mix(albedo, vec3(0.84, 0.89, 0.95), snow * 0.85);
+  }
+  float wrapDiff = clamp((dot(N, SUN_DIR) + 0.25) / 1.25, 0.0, 1.0);
+  float sss = pow(max(dot(-V, SUN_DIR), 0.0), 3.0) * isFol * (1.0 - snow) * tip * 0.34;
+  vec3 skyAmb = mix(vec3(0.04, 0.08, 0.14), vec3(0.18, 0.30, 0.52), 0.5 + 0.5 * N.y);
+  vec3 color = applyAlpineFog(albedo * (SUN_COL * wrapDiff * 0.88 + skyAmb) * boughAO + vec3(0.20, 0.32, 0.10) * SUN_COL * sss, vWorldPos, uCamPos, uTime);
+  outColor = vec4(color, 1.0);
+  outVel = vec4((vCurrClip.xy/max(vCurrClip.w,0.0001) - vPrevClip.xy/max(vPrevClip.w,0.0001)) * 0.5, vViewDist, 1.0);
+}
+`;
+
+const WORLD_PBR_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos; layout(location = 1) in vec3 aNor; layout(location = 2) in vec2 aUv; layout(location = 3) in vec4 aCol;
+uniform mat4 uModel; uniform mat4 uPrevModel; uniform mat4 uCurrVP; uniform mat4 uPrevVP; uniform vec3 uCamPos;
+out vec3 vWorldPos; out vec3 vNormal; out vec2 vUv; out vec4 vCol; out vec4 vCurrClip; out vec4 vPrevClip; out float vViewDist;
+void main() {
+  vec4 wp = uModel * vec4(aPos, 1.0), prevWp = uPrevModel * vec4(aPos, 1.0);
+  vWorldPos = wp.xyz; vNormal = normalize(mat3(uModel) * aNor); vUv = aUv; vCol = aCol;
+  vViewDist = length(wp.xyz - uCamPos);
+  vCurrClip = uCurrVP * wp; vPrevClip = uPrevVP * prevWp;
+  gl_Position = vCurrClip;
+}
+`;
+
+const WORLD_PBR_FS = COMMON_GLSL + `
+in vec3 vWorldPos; in vec3 vNormal; in vec2 vUv; in vec4 vCol; in vec4 vCurrClip; in vec4 vPrevClip; in float vViewDist;
+uniform vec3 uCamPos; uniform float uTime;
+layout(location = 0) out vec4 outColor; layout(location = 1) out vec4 outVel;
+
+void main() {
+  vec3 N = normalize(vNormal), V = normalize(uCamPos - vWorldPos);
+  int matId = int(vCol.a + 0.5);
+  vec3 albedo = vCol.rgb, emissive = vec3(0.0);
+  float rough = 0.74, metal = 0.0, sunScale = 1.0;
+
+  if (matId == 1) {
+    // Weathered Swiss Ashlar Limestone Masonry (Viaduct, Portals, Foundations)
+    vec2 buv = vUv * vec2(2.6, 1.35);
+    buv.x += mod(floor(buv.y), 2.0) * 0.5;
+    vec2 cell = floor(buv), f = fract(buv);
+    float mortar = smoothstep(0.0, 0.07, f.x) * smoothstep(1.0, 0.93, f.x) * smoothstep(0.0, 0.09, f.y) * smoothstep(1.0, 0.91, f.y);
+    float stain = fbm2(vWorldPos.xz * 0.08 + vec2(0.0, vWorldPos.y * 0.04));
+    albedo *= mix(0.72, 1.18, hash12(cell)) * mix(0.55, 1.0, mortar) * mix(0.72, 1.08, stain);
+    float topSnow = smoothstep(0.74, 0.96, N.y) * smoothstep(0.45, 0.76, stain);
+    albedo = mix(albedo, vec3(0.80, 0.85, 0.92), topSnow * 0.55);
+    rough = mix(0.88, 0.65, topSnow);
+  } else if (matId == 2) {
+    float gravel = noise2(vWorldPos.xz * 5.5)*0.5 + noise2(vWorldPos.xz * 14.0)*0.5;
+    float sleeper = smoothstep(0.32, 0.42, abs(fract(vUv.y * 4.5) - 0.5));
+    albedo = mix(vec3(0.16, 0.14, 0.13), albedo * (0.65 + 0.7 * gravel), sleeper);
+    albedo = mix(albedo, vec3(0.78, 0.83, 0.90), smoothstep(0.24, 0.04, min(vUv.x, 1.0 - vUv.x)) * 0.65);
+    rough = 0.92;
+  } else if (matId == 3) {
+    albedo *= mix(0.82, 1.14, noise2(vUv * vec2(22.0, 4.0)));
+    metal = 0.78; rough = 0.34;
+  } else if (matId == 4) {
+    // Deep Textured Charcoal-Basalt Ribbed Tunnel Rock (high contrast ribs rushing past behind crisp glass reflection!)
+    float rockN = fbm2(vUv * vec2(8.0, 3.8));
+    float ribCrev = pow(abs(sin(vUv.y * 3.14159 * 1.15)), 0.75);
+    float wet = smoothstep(0.50, 0.80, fbm2(vUv * vec2(3.4, 1.0)));
+    albedo = vec3(0.055, 0.060, 0.072) * mix(0.35, 1.35, rockN) * mix(0.45, 1.15, ribCrev);
+    rough = mix(0.88, 0.20, wet);
+    sunScale = 0.0;
+  } else if (matId == 5) {
+    emissive = albedo * 8.5;
+    albedo = vec3(1.0); rough = 0.2;
+  } else if (matId == 6) {
+    float form = fbm2(vWorldPos.xz * 0.18 + vWorldPos.y * 0.18);
+    float seam = smoothstep(0.0, 0.04, abs(fract(vWorldPos.y * 0.55) - 0.5));
+    albedo *= mix(0.70, 1.12, form) * mix(0.76, 1.0, seam);
+    rough = 0.86;
+  } else if (matId == 7) {
+    // Weathered Dark Alpine Larch Chalet Timber + Refined Cozy Multi-Pane Illuminated Windows!
+    albedo *= sin(vWorldPos.y * 14.0) * 0.09 + 0.91;
+    if (abs(N.y) < 0.35) {
+      vec2 wuv = vec2(vUv.x * 1.25, vUv.y * 1.05);
+      vec2 wCell = floor(wuv), wf = fract(wuv);
+      float inFrame = step(0.25, wf.x)*step(wf.x, 0.75)*step(0.28, wf.y)*step(wf.y, 0.76);
+      float inGlass = step(0.30, wf.x)*step(wf.x, 0.70)*step(0.33, wf.y)*step(wf.y, 0.71);
+      float muntin = step(abs(wf.x - 0.5), 0.028) + step(abs(wf.y - 0.52), 0.028);
+      if (inGlass * (1.0 - clamp(muntin, 0.0, 1.0)) > 0.5) {
+        float litRand = hash12(wCell + floor(vWorldPos.xz * 0.06));
+        if (litRand > 0.45) {
+          emissive = mix(vec3(1.85, 1.05, 0.36), vec3(2.55, 1.50, 0.55), hash12(wCell * 3.1));
+          albedo = vec3(0.18);
+        } else {
+          albedo = vec3(0.03, 0.05, 0.08); rough = 0.10;
+        }
+      } else if (inFrame > 0.5) {
+        albedo *= 0.45; // Dark carved timber window shutters/frames!
+      }
+    }
+  } else if (matId == 8) {
+    // Dark Charcoal-Slate Alpine Roofs with Selective Crisp White Snow Caps!
+    float tile = noise2(vUv * 9.0);
+    float roofSnow = smoothstep(0.46, 0.82, N.y + tile * 0.24);
+    albedo = mix(albedo * mix(0.75, 1.15, tile), vec3(0.84, 0.88, 0.94), roofSnow * 0.78);
+    rough = mix(0.58, 0.44, roofSnow);
+  } else if (matId == 9) {
+    rough = 0.18; metal = 0.25;
+  } else if (matId == 10) {
+    rough = 0.08; metal = 0.15;
+    emissive = vec3(0.65, 0.42, 0.16);
+  }
+
+  vec3 color;
+  if (matId == 4) {
+    // Crisp, moody subterranean tunnel wall lighting (ZERO beige washout — clear textured dark rock ribs + punchy amber beacon pools!)
+    float lampPhase = abs(fract(vUv.y / 5.5) - 0.5) * 2.0;
+    float lampFalloff = exp(-lampPhase * lampPhase * 62.0);
+    vec3 lampLight = vec3(1.25, 0.62, 0.18) * lampFalloff;
+    // Subtle neutral-warm carriage window spill illuminating passing wet stone ribs 1.8m outside glass
+    float trainSpill = exp(-vViewDist * 0.34) * 0.16;
+    vec3 spillCol = vec3(0.42, 0.34, 0.26) * trainSpill;
+    vec3 H = normalize(normalize(vec3(0.0, 0.22, 0.96)) + V);
+    float wetSpec = pow(max(dot(N, H), 0.0), mix(18.0, 64.0, 1.0 - rough)) * (0.08 + 0.92 * lampFalloff + trainSpill) * 0.42;
+    color = albedo * (vec3(0.022, 0.026, 0.036) + lampLight + spillCol) + vec3(0.95, 0.64, 0.30) * wetSpec;
+  } else {
+    float NdotL = max(dot(N, SUN_DIR), 0.0);
+    vec3 H = normalize(SUN_DIR + V);
+    float spec = pow(max(dot(N, H), 0.0), mix(128.0, 12.0, rough)) * mix(0.04, 0.85, max(metal, 1.0 - rough)) * NdotL;
+    vec3 skyAmb = mix(vec3(0.08, 0.13, 0.22), vec3(0.24, 0.38, 0.64), 0.5 + 0.5 * N.y);
+    vec3 envRefl = evalAlpineSky(reflect(-V, N), uTime) * mix(0.03, 0.42, max(metal, 1.0 - rough) * pow(1.0 - max(dot(N, V), 0.0), 3.0));
+    color = applyAlpineFog(albedo * (SUN_COL * NdotL * sunScale + skyAmb) + SUN_COL * spec * sunScale + envRefl + emissive, vWorldPos, uCamPos, uTime);
+  }
+  outColor = vec4(color, 1.0);
+  outVel = vec4((vCurrClip.xy/max(vCurrClip.w,0.0001) - vPrevClip.xy/max(vPrevClip.w,0.0001)) * 0.5, vViewDist, 1.0);
+}
+`;
+
+// V3 SILKY GAUSSIAN-WEIGHTED DEPTH-AWARE MOTION BLUR (Eliminates rectangular mast box artifact!)
+const TILE_MAX_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVelTex; uniform vec2 uTexelSize; uniform int uTileSize;
+out vec4 outColor;
+void main() {
+  vec2 baseUv = floor(gl_FragCoord.xy) * float(uTileSize) * uTexelSize;
+  vec2 maxV = vec2(0.0); float maxMag2 = 0.0, minD = 99999.0;
+  int stepPx = max(1, uTileSize / 4);
+  for (int y = 0; y < 4; y++) {
+    for (int x = 0; x < 4; x++) {
+      vec2 uv = baseUv + (vec2(float(x), float(y)) * float(stepPx) + 0.5) * uTexelSize;
+      vec4 vd = texture(uVelTex, clamp(uv, vec2(0.001), vec2(0.999)));
+      vec2 v = vd.xy * vd.a;
+      float m2 = dot(v, v);
+      if (m2 > maxMag2) { maxMag2 = m2; maxV = v; }
+      if (vd.a > 0.5) minD = min(minD, vd.z);
+    }
+  }
+  outColor = vec4(maxV, minD, 1.0);
+}
+`;
+
+const NEIGHBOR_MAX_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTileTex; uniform vec2 uTileTexel;
+out vec4 outColor;
+void main() {
+  vec2 maxV = vec2(0.0); float maxMag2 = 0.0, minD = 99999.0;
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      vec4 t = texture(uTileTex, clamp(vUv + vec2(float(x), float(y)) * uTileTexel, vec2(0.0), vec2(1.0)));
+      float m2 = dot(t.xy, t.xy);
+      if (m2 > maxMag2) { maxMag2 = m2; maxV = t.xy; }
+      minD = min(minD, t.z);
+    }
+  }
+  outColor = vec4(maxV, minD, 1.0);
+}
+`;
+
+const MOTION_BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uColorTex; uniform sampler2D uVelTex; uniform sampler2D uNeighborTex; uniform float uBlurScale;
+out vec4 outColor;
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+void main() {
+  vec4 centerCol = texture(uColorTex, vUv);
+  vec4 centerVD  = texture(uVelTex, vUv);
+  vec4 neigh     = texture(uNeighborTex, vUv);
+
+  // Tapered cinema shutter clamp (max ~4.4% viewport width => silky 55px streak on catenary masts, never a chunky box!)
+  vec2 vMax = neigh.xy * uBlurScale;
+  float maxLen = length(vMax);
+  if (maxLen > 0.044) { vMax *= (0.044 / maxLen); maxLen = 0.044; }
+  if (maxLen < 0.0012) { outColor = centerCol; return; }
+
+  vec2 vCenter = centerVD.xy * centerVD.a * uBlurScale;
+  float lenCenter = min(length(vCenter), 0.044);
+  float dCenter = centerVD.z;
+  float jitter = hash12(gl_FragCoord.xy) - 0.5;
+
+  const int SAMPLES = 17;
+  vec3 accum = centerCol.rgb * 1.2;
+  float wSum = 1.2;
+
+  for (int i = 0; i < SAMPLES; i++) {
+    float u = ((float(i) + 0.5 + jitter * 0.65) / float(SAMPLES)) - 0.5; // [-0.5, +0.5]
+    vec2 suv = clamp(vUv + vMax * u, vec2(0.001), vec2(0.999));
+    vec4 sCol = texture(uColorTex, suv);
+    vec4 sVD  = texture(uVelTex, suv);
+    float dS = sVD.z;
+    float lenS = min(length(sVD.xy * sVD.a * uBlurScale), 0.044);
+    float stepDist = abs(u) * maxLen;
+
+    // Smooth Gaussian shutter feathering so moving edges taper organically into background!
+    float gauss = exp(-u * u * 7.5);
+    float fg = clamp(1.0 - (dS - dCenter) / max(dCenter * 0.25, 1.8), 0.0, 1.0);
+    float bg = clamp(1.0 - (dCenter - dS) / max(dS * 0.25, 1.8), 0.0, 1.0);
+    float coneS = smoothstep(lenS + 0.002, 0.0, stepDist);
+    float coneC = smoothstep(lenCenter + 0.002, 0.0, stepDist);
+    float w = (fg * coneS + bg * coneC + 0.10 * coneS * coneC) * gauss;
+    accum += sCol.rgb * w;
+    wSum += w;
+  }
+  outColor = vec4(accum / max(wSum, 0.0001), 1.0);
+}
+`;
+
+const INTERIOR_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos; layout(location = 1) in vec3 aNor; layout(location = 2) in vec2 aUv; layout(location = 3) in vec4 aCol;
+uniform mat4 uVP;
+out vec3 vLocalPos; out vec3 vNormal; out vec2 vUv; out vec4 vCol;
+void main() { vLocalPos = aPos; vNormal = normalize(aNor); vUv = aUv; vCol = aCol; gl_Position = uVP * vec4(aPos, 1.0); }
+`;
+
+const INTERIOR_FS = COMMON_GLSL + `
+in vec3 vLocalPos; in vec3 vNormal; in vec2 vUv; in vec4 vCol;
+uniform sampler2D uTexWalnut; uniform sampler2D uTexFabric; uniform sampler2D uTexSign;
+uniform vec3 uCamLocal; uniform vec3 uSunLocal; uniform float uDaylight; uniform float uTreeStrobe;
+uniform float uTunnelLampFlash; uniform float uMirrorClip; uniform float uTime;
+out vec4 outColor;
+
+void main() {
+  if (uMirrorClip > 0.5 && vLocalPos.x > 1.392) discard;
+  if (uMirrorClip < -0.5 && vLocalPos.x < -1.392) discard;
+
+  vec3 N = normalize(vNormal), V = normalize(uCamLocal - vLocalPos);
+  int matId = int(vCol.a + 0.5);
+  vec3 albedo = vCol.rgb, emissive = vec3(0.0);
+  float rough = 0.65, metal = 0.0;
+
+  if (matId == 1) {
+    // True sRGB->Linear decode for sumptuous dark smoked European walnut!
+    vec4 wt = texture(uTexWalnut, vUv * 0.85);
+    albedo = pow(wt.rgb, vec3(2.2)) * vCol.rgb * 1.45; rough = mix(0.16, 0.30, wt.a);
+  } else if (matId == 2) {
+    // True sRGB->Linear decode for deep velvety Swiss First-Class burgundy-claret herringbone wool!
+    vec4 ft = texture(uTexFabric, vUv * 2.4);
+    albedo = pow(ft.rgb, vec3(2.2)) * vCol.rgb * 1.85; rough = 0.90;
+  } else if (matId == 3) {
+    float peb = noise2(vLocalPos.xz * 95.0 + vLocalPos.y * 95.0);
+    albedo = pow(albedo, vec3(1.6)) * mix(0.84, 1.14, peb); rough = mix(0.28, 0.42, peb);
+  } else if (matId == 4) {
+    albedo *= mix(0.88, 1.10, noise2(vec2(vLocalPos.z * 80.0, (vLocalPos.x + vLocalPos.y) * 14.0)));
+    metal = 0.84; rough = 0.25;
+  } else if (matId == 5) {
+    metal = 0.92; rough = 0.20;
+  } else if (matId == 6) {
+    emissive = albedo * mix(2.5, 1.6, uDaylight);
+    albedo = vec3(0.95, 0.80, 0.55); rough = 0.30;
+  } else if (matId == 13) {
+    // Rich Warm Pleated Amber-Parchment Train Table Lamp Shade (luminous honey core, darker golden-amber top/bottom rims!)
+    float shadeGrad = 1.0 - pow(abs(vUv.y - 0.48) * 1.9, 1.8);
+    float pleat = sin(vUv.x * 6.28318 * 18.0) * 0.08 + 0.92;
+    vec3 rimCol = vec3(0.55, 0.30, 0.11);
+    vec3 coreCol = vec3(1.15, 0.78, 0.36);
+    emissive = mix(rimCol, coreCol, clamp(shadeGrad, 0.0, 1.0)) * pleat * mix(2.2, 1.45, uDaylight);
+    albedo = vec3(0.65, 0.45, 0.24); rough = 0.55;
+  } else if (matId == 7) {
+    rough = 0.10;
+  } else if (matId == 8) {
+    float r = length(vLocalPos.xz - vec2(0.96, -0.22));
+    float rip = sin(r * 190.0 - uTime * 9.0) * 0.04;
+    N = normalize(N + vec3(rip, 0.0, rip)); rough = 0.05;
+  } else if (matId == 9) {
+    albedo *= (sin(vLocalPos.x * 160.0) * 0.14 + 0.86) * mix(0.82, 1.16, noise2(vLocalPos.xz * 45.0));
+    rough = 0.96;
+  } else if (matId == 10) {
+    albedo *= sin(vLocalPos.z * 68.0) * 0.15 + 0.85; rough = 0.92;
+  } else if (matId == 11) {
+    rough = 0.85;
+  } else if (matId == 12) {
+    vec3 st = texture(uTexSign, vUv).rgb;
+    emissive = st * mix(2.0, 1.2, uDaylight);
+    albedo = st * 0.18; rough = 0.15;
+  }
+
+  vec3 lighting = vec3(0.0), specAccum = vec3(0.0);
+  const vec3 lampCol = vec3(1.12, 0.64, 0.24);
+  float lampZ[3]; lampZ[0] = -2.48; lampZ[1] = -0.34; lampZ[2] = 1.86;
+  for (int i = 0; i < 3; i++) {
+    for (int s = 0; s < 2; s++) {
+      vec3 lp = vec3((s == 0) ? 1.22 : -1.22, 1.04, lampZ[i]);
+      vec3 toL = lp - vLocalPos;
+      float d2 = dot(toL, toL) + 0.07;
+      float d = sqrt(d2);
+      vec3 L = toL / d;
+      float atten = 0.36 / (d2 * (1.0 + 0.20 * d));
+      float ndl = max(dot(N, L), 0.0);
+      lighting += lampCol * ndl * atten;
+      vec3 H = normalize(L + V);
+      specAccum += lampCol * pow(max(dot(N, H), 0.0), mix(96.0, 12.0, rough)) * mix(0.04, 0.65, max(metal, 1.0 - rough)) * atten * ndl;
+    }
+  }
+  float ceilDist = abs(2.42 - vLocalPos.y) + 0.38;
+  float ceilAtten = 0.48 / (ceilDist * ceilDist * 0.38 + 0.58);
+  lighting += vec3(0.36, 0.26, 0.16) * ceilAtten * clamp(dot(N, vec3(0.0, 1.0, 0.0)) * 0.65 + 0.35, 0.0, 1.0);
+  vec3 Hc = normalize(vec3(0.0, 1.0, 0.0) + V);
+  specAccum += vec3(0.30, 0.22, 0.14) * pow(max(dot(N, Hc), 0.0), mix(64.0, 8.0, rough)) * (1.0 - rough) * 0.30 * ceilAtten;
+
+  if (uDaylight > 0.001) {
+    float rExp = smoothstep(-0.2, 1.35, vLocalPos.x) * 0.72 + 0.28;
+    float lExp = smoothstep( 0.2,-1.35, vLocalPos.x) * 0.52 + 0.18;
+    vec3 skyR = vec3(0.42, 0.58, 0.84) * max(dot(N, normalize(vec3(1.0, 0.38, 0.0))) * 0.75 + 0.25, 0.0) * rExp;
+    vec3 skyL = vec3(0.28, 0.40, 0.58) * max(dot(N, normalize(vec3(-1.0, 0.38, 0.0))) * 0.75 + 0.25, 0.0) * lExp;
+    lighting += (skyR + skyL) * uDaylight * mix(0.62, 1.0, uTreeStrobe);
+    float inWin = smoothstep(0.55, 0.95, vLocalPos.y) * smoothstep(2.45, 1.85, vLocalPos.y) + smoothstep(0.45, 1.25, vLocalPos.x) * 0.45;
+    float sunNdl = max(dot(N, uSunLocal), 0.0);
+    float shaft = clamp(inWin, 0.0, 1.0) * uDaylight * uTreeStrobe;
+    lighting += SUN_COL * 0.34 * sunNdl * shaft;
+    vec3 Hs = normalize(uSunLocal + V);
+    specAccum += SUN_COL * 0.48 * pow(max(dot(N, Hs), 0.0), mix(110.0, 16.0, rough)) * mix(0.05, 0.92, max(metal, 1.0 - rough)) * shaft * sunNdl;
+  }
+  if (uTunnelLampFlash > 0.001) {
+    lighting += vec3(0.88, 0.44, 0.12) * max(dot(N, vec3(1.0, 0.2, 0.0)), 0.0) * smoothstep(0.0, 1.38, vLocalPos.x) * uTunnelLampFlash * 0.90;
+  }
+
+  float ao = (smoothstep(0.0, 0.44, vLocalPos.y) * 0.45 + 0.55) * (1.0 - smoothstep(1.26, 1.41, abs(vLocalPos.x)) * 0.22);
+  vec3 color = (albedo * (1.0 - metal * 0.85) * lighting + specAccum * mix(vec3(1.0), albedo, metal)) * ao + emissive + albedo * vec3(0.016, 0.013, 0.011) * ao;
+  outColor = vec4(color, 1.0);
+}
+`;
+
+const GLASS_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos; layout(location = 1) in vec3 aNor; layout(location = 2) in vec2 aUv; layout(location = 3) in vec4 aCol;
+uniform mat4 uVP;
+out vec3 vLocalPos; out vec3 vNormal; out vec2 vUv; out float vSide; out float vIsSkylight;
+void main() { vLocalPos = aPos; vNormal = normalize(aNor); vUv = aUv; vSide = aCol.r; vIsSkylight = aCol.g; gl_Position = uVP * vec4(aPos, 1.0); }
+`;
+
+const GLASS_FS = COMMON_GLSL + `
+in vec3 vLocalPos; in vec3 vNormal; in vec2 vUv; in float vSide; in float vIsSkylight;
+uniform sampler2D uExteriorTex; uniform sampler2D uReflRightTex; uniform sampler2D uReflLeftTex; uniform sampler2D uGlassTex;
+uniform vec2 uResolution; uniform vec3 uCamLocal; uniform vec3 uSunLocal; uniform float uDaylight;
+out vec4 outColor;
+
+void main() {
+  vec2 screenUV = gl_FragCoord.xy / uResolution;
+  vec3 N = normalize(vNormal), V = normalize(uCamLocal - vLocalPos);
+  float cosT = clamp(abs(dot(N, V)), 0.0, 1.0);
+  vec4 gm = texture(uGlassTex, vUv);
+  float frit = gm.r, specks = gm.g, streak = gm.b;
+
+  float F0 = 0.044;
+  float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosT, 4.8);
+  vec3 extCol = texture(uExteriorTex, screenUV).rgb;
+  vec3 glassTint = (vIsSkylight > 0.5) ? vec3(0.82, 0.88, 0.92) : vec3(0.968, 0.990, 0.980);
+
+  vec2 ghostOff = vec2(vSide * 0.0038, 0.0026) * (1.25 - cosT);
+  vec2 wobble = vec2(streak - 0.5) * 0.0005;
+  vec3 refl1, refl2;
+  if (vSide > 0.0) {
+    refl1 = texture(uReflRightTex, clamp(screenUV + wobble, vec2(0.002), vec2(0.998))).rgb;
+    refl2 = texture(uReflRightTex, clamp(screenUV + ghostOff + wobble, vec2(0.002), vec2(0.998))).rgb;
+  } else {
+    refl1 = texture(uReflLeftTex, clamp(screenUV + wobble, vec2(0.002), vec2(0.998))).rgb;
+    refl2 = texture(uReflLeftTex, clamp(screenUV + ghostOff + wobble, vec2(0.002), vec2(0.998))).rgb;
+  }
+  vec3 interiorRefl = refl1 * 0.75 + refl2 * vec3(0.21, 0.26, 0.24);
+  if (vIsSkylight > 0.5) interiorRefl *= 0.45;
+
+  float reflScale = mix(1.48, 0.90, uDaylight);
+  float reflStrength = clamp(fresnel * reflScale, 0.038, 0.76);
+  vec3 col = extCol * glassTint * (1.0 - reflStrength * 0.24) + interiorRefl * reflStrength;
+
+  float sunGlance = pow(max(dot(-V, uSunLocal), 0.0), 6.0) * uDaylight;
+  col += vec3(1.0, 0.90, 0.76) * (specks * 0.12 + streak * 0.022) * (0.04 + 1.05 * sunGlance) * uDaylight;
+
+  vec3 fritCol = vec3(0.011, 0.012, 0.015) + interiorRefl * 0.04;
+  outColor = vec4(mix(col, fritCol, frit), 1.0);
+}
+`;
+
+const LUMA_REDUCE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel; uniform int uFirstPass;
+out vec4 outColor;
+void main() {
+  float sum = 0.0, wSum = 0.0;
+  for (int y = -1; y <= 2; y++) {
+    for (int x = -1; x <= 2; x++) {
+      vec2 uv = clamp(vUv + (vec2(float(x), float(y)) - 0.5) * uTexel, vec2(0.002), vec2(0.998));
+      vec4 s = texture(uTex, uv);
+      if (uFirstPass == 1) {
+        float lum = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec2 d = uv - 0.5;
+        float w = exp(-dot(d, d) * 4.2);
+        sum += log(clamp(lum, 0.003, 25.0)) * w; wSum += w;
+      } else { sum += s.r; wSum += 1.0; }
+    }
+  }
+  outColor = vec4(sum / max(wSum, 0.0001), 0.0, 0.0, 1.0);
+}
+`;
+
+const AUTO_EXPOSURE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uLumaTex; uniform sampler2D uPrevExpTex; uniform float uDt; uniform int uReset;
+out vec4 outColor;
+void main() {
+  float avgLog = 0.0;
+  for (int y = 0; y < 4; y++)
+    for (int x = 0; x < 4; x++)
+      avgLog += texture(uLumaTex, (vec2(float(x), float(y)) + 0.5) / 4.0).r;
+  float avgLum = exp(avgLog / 16.0);
+
+  // Rich photographic key value: balanced Alps snow & genuine moody dark tunnels that adapt smoothly!
+  float keyVal = 0.23;
+  float targetExp = clamp(keyVal / max(avgLum, 0.032), 0.18, 2.65);
+
+  if (uReset == 1) { outColor = vec4(targetExp, avgLum, targetExp, 1.0); return; }
+  float prevExp = texture(uPrevExpTex, vec2(0.5)).r;
+  if (prevExp <= 0.001 || isnan(prevExp)) prevExp = targetExp;
+
+  // Asymmetric cinema camera eye-adaptation:
+  // Entering tunnel -> slow dark adaptation (0.58/s) so entry feels dramatically dark before cabin & walls emerge!
+  // Exiting tunnel -> crisp bright adaptation (0.85/s) so tunnel exit blooms brilliantly in sunlight before settling!
+  float rate = (targetExp > prevExp) ? 0.58 : 0.85;
+  float adapted = mix(prevExp, targetExp, 1.0 - exp(-uDt * rate));
+  outColor = vec4(adapted, avgLum, targetExp, 1.0);
+}
+`;
+
+const BLOOM_DOWN_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel; uniform int uFirst; uniform sampler2D uExpTex;
+out vec4 outColor;
+vec3 prefilter(vec3 c, float expVal) {
+  vec3 ec = c * expVal;
+  float br = max(ec.r, max(ec.g, ec.b));
+  float thresh = 1.22, knee = 0.45;
+  float soft = clamp(br - thresh + knee, 0.0, 2.0 * knee);
+  soft = (soft * soft) / (4.0 * knee + 0.0001);
+  return max(c * (max(soft, br - thresh) / max(br, 0.0001)), vec3(0.0));
+}
+void main() {
+  vec3 avg = (texture(uTex, vUv).rgb * 4.0 +
+    texture(uTex, vUv + uTexel * vec2(-1.0, -1.0)).rgb + texture(uTex, vUv + uTexel * vec2( 1.0, -1.0)).rgb +
+    texture(uTex, vUv + uTexel * vec2(-1.0,  1.0)).rgb + texture(uTex, vUv + uTexel * vec2( 1.0,  1.0)).rgb) / 8.0;
+  if (uFirst == 1) avg = prefilter(avg, texture(uExpTex, vec2(0.5)).r);
+  outColor = vec4(avg, 1.0);
+}
+`;
+
+const BLOOM_UP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uSmallTex; uniform sampler2D uLargeTex; uniform vec2 uTexel;
+out vec4 outColor;
+void main() {
+  vec3 up =
+    (texture(uSmallTex, vUv + uTexel*vec2(-1,0)).rgb + texture(uSmallTex, vUv + uTexel*vec2(1,0)).rgb +
+     texture(uSmallTex, vUv + uTexel*vec2(0,-1)).rgb + texture(uSmallTex, vUv + uTexel*vec2(0,1)).rgb) * 2.0 +
+     texture(uSmallTex, vUv + uTexel*vec2(-1,-1)).rgb + texture(uSmallTex, vUv + uTexel*vec2(1,-1)).rgb +
+     texture(uSmallTex, vUv + uTexel*vec2(-1, 1)).rgb + texture(uSmallTex, vUv + uTexel*vec2(1, 1)).rgb;
+  outColor = vec4(texture(uLargeTex, vUv).rgb + (up / 12.0) * 0.78, 1.0);
+}
+`;
+
+const TONEMAP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uSceneTex; uniform sampler2D uBloomTex; uniform sampler2D uExpTex;
+uniform float uTime; uniform float uFovNorm;
+out vec4 outColor;
+vec3 acesFilm(vec3 x) {
+  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z);
+}
+void main() {
+  vec2 centered = vUv - 0.5;
+  float r2 = dot(centered, centered);
+  vec2 caDir = centered * ((0.0011 + 0.0010 * uFovNorm) * r2);
+  vec3 hdr = vec3(texture(uSceneTex, clamp(vUv+caDir,0.0,1.0)).r, texture(uSceneTex, vUv).g, texture(uSceneTex, clamp(vUv-caDir,0.0,1.0)).b);
+  float exposure = texture(uExpTex, vec2(0.5)).r;
+  vec3 col = acesFilm((hdr + texture(uBloomTex, vUv).rgb * 0.30) * exposure);
+  col = mix(col, col * col * (3.0 - 2.0 * col), 0.14);
+  float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col = mix(vec3(luma), col, 1.08) * clamp(1.0 - r2 * 0.42, 0.65, 1.0);
+  col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
+  outColor = vec4(clamp(col + (hash12(gl_FragCoord.xy + fract(uTime*17.3)*100.0) - 0.5) * 0.013, 0.0, 1.0), 1.0);
+}
+`;
+
+// ============================================================================
+// 12. COMPILE PROGRAMS, BUILD SCENE & ALLOCATE FBO PIPELINE
+// ============================================================================
+const progs = {
+  sky: createProgram(FS_QUAD_VS, SKY_FS), terrain: createProgram(TERRAIN_VS, TERRAIN_FS),
+  water: createProgram(WATER_VS, WATER_FS), pine: createProgram(PINE_VS, PINE_FS),
+  worldPbr: createProgram(WORLD_PBR_VS, WORLD_PBR_FS), tileMax: createProgram(FS_QUAD_VS, TILE_MAX_FS),
+  neighborMax: createProgram(FS_QUAD_VS, NEIGHBOR_MAX_FS), motionBlur: createProgram(FS_QUAD_VS, MOTION_BLUR_FS),
+  interior: createProgram(INTERIOR_VS, INTERIOR_FS), glass: createProgram(GLASS_VS, GLASS_FS),
+  lumaReduce: createProgram(FS_QUAD_VS, LUMA_REDUCE_FS), autoExp: createProgram(FS_QUAD_VS, AUTO_EXPOSURE_FS),
+  bloomDown: createProgram(FS_QUAD_VS, BLOOM_DOWN_FS), bloomUp: createProgram(FS_QUAD_VS, BLOOM_UP_FS),
+  tonemap: createProgram(FS_QUAD_VS, TONEMAP_FS)
+};
+
+const emptyVAO = gl.createVertexArray();
+const textures = createProceduralTextures();
+
+const terrainChunks = buildTerrainChunks();
+const lakeMesh      = buildLakeAndRiver();
+const viaductMesh   = buildViaductAndTrack();
+const tunnelMesh    = buildTunnelsAndGallery();
+const forwardCoach  = buildForwardCoachMesh();
+const villageMesh   = buildAlpineVillages();
+const pineForest    = buildPineForest();
+const carriageData  = buildCarriageInterior();
+
+const TILE_SIZE = 16; // Finer tiles for silky motion blur edges!
+let fboW = 0, fboH = 0, fbos = {};
+const expFBOs = [createFBO(1, 1, [{ filter: gl.NEAREST }], false), createFBO(1, 1, [{ filter: gl.NEAREST }], false)];
+let expIdx = 0, exposureNeedsReset = true;
+
+function resizePipeline() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+  const w = Math.max(64, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(64, Math.floor(window.innerHeight * dpr));
+  if (w === fboW && h === fboH) return;
+  fboW = w; fboH = h; canvas.width = w; canvas.height = h;
+  Object.values(fbos).forEach(f => { if (Array.isArray(f)) f.forEach(destroyFBO); else destroyFBO(f); });
+  const tw = Math.max(4, Math.ceil(w / TILE_SIZE)), th = Math.max(4, Math.ceil(h / TILE_SIZE));
+  const rw = Math.max(128, Math.floor(w * 0.5)), rh = Math.max(128, Math.floor(h * 0.5));
+  fbos = {
+    exterior: createFBO(w, h, [{}, { filter: gl.NEAREST }], true),
+    tileMax: createFBO(tw, th, [{ filter: gl.NEAREST }], false),
+    neighborMax: createFBO(tw, th, [{ filter: gl.NEAREST }], false),
+    extBlurred: createFBO(w, h, [{}], false),
+    reflRight: createFBO(rw, rh, [{}], true),
+    reflLeft: createFBO(rw, rh, [{}], true),
+    sceneHDR: createFBO(w, h, [{}], true),
+    luma64: createFBO(64, 64, [{}], false),
+    luma16: createFBO(16, 16, [{}], false),
+    luma4: createFBO(4, 4, [{}], false),
+    bloomDown: [
+      createFBO(Math.max(4, w>>1), Math.max(4, h>>1), [{}], false),
+      createFBO(Math.max(4, w>>2), Math.max(4, h>>2), [{}], false),
+      createFBO(Math.max(4, w>>3), Math.max(4, h>>3), [{}], false),
+      createFBO(Math.max(4, w>>4), Math.max(4, h>>4), [{}], false),
+      createFBO(Math.max(4, w>>5), Math.max(4, h>>5), [{}], false)
+    ],
+    bloomUp: [
+      createFBO(Math.max(4, w>>4), Math.max(4, h>>4), [{}], false),
+      createFBO(Math.max(4, w>>3), Math.max(4, h>>3), [{}], false),
+      createFBO(Math.max(4, w>>2), Math.max(4, h>>2), [{}], false),
+      createFBO(Math.max(4, w>>1), Math.max(4, h>>1), [{}], false)
+    ]
+  };
+}
+resizePipeline();
+window.addEventListener("resize", resizePipeline);
+
+// ============================================================================
+// 13. INTERACTIVE CAMERA (360° DRAG, ZOOM, TOUCH PINCH, AUTO-RETURN) & SWAY
+// ============================================================================
+const cam = {
+  yaw: HASH.yaw !== undefined ? parseFloat(HASH.yaw) * Math.PI / 180 : DEFAULT_YAW,
+  pitch: HASH.pitch !== undefined ? parseFloat(HASH.pitch) * Math.PI / 180 : DEFAULT_PITCH,
+  fov: HASH.fov !== undefined ? parseFloat(HASH.fov) : DEFAULT_FOV,
+  targetYaw: HASH.yaw !== undefined ? parseFloat(HASH.yaw) * Math.PI / 180 : DEFAULT_YAW,
+  targetPitch: HASH.pitch !== undefined ? parseFloat(HASH.pitch) * Math.PI / 180 : DEFAULT_PITCH,
+  targetFov: HASH.fov !== undefined ? parseFloat(HASH.fov) : DEFAULT_FOV,
+  idleSeconds: 0.0, autoReturning: false, isInteracting: false
+};
+const AUTO_RETURN_DELAY = 4.5;
+const hintEl = document.getElementById("hint");
+let hintDismissed = false;
+setTimeout(() => { if (!hintDismissed) hintEl.classList.add("hidden"); }, 5500);
+function markInteraction() {
+  cam.idleSeconds = 0.0; cam.autoReturning = false;
+  if (!hintDismissed) { hintDismissed = true; hintEl.classList.add("hidden"); }
+}
+
+const activePointers = new Map();
+let lastPinchDist = 0;
+canvas.addEventListener("pointerdown", (e) => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  cam.isInteracting = true; markInteraction();
+  canvas.classList.add("dragging");
+  if (activePointers.size === 2) {
+    const pts = Array.from(activePointers.values());
+    lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+  }
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!activePointers.has(e.pointerId)) return;
+  const prev = activePointers.get(e.pointerId);
+  const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  markInteraction();
+  if (activePointers.size === 1) {
+    const sens = (cam.fov / DEFAULT_FOV) * 0.0042;
+    cam.targetYaw -= dx * sens;
+    cam.targetPitch = clamp(cam.targetPitch + dy * sens, -1.32, 1.32);
+  } else if (activePointers.size === 2) {
+    const pts = Array.from(activePointers.values());
+    const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+    if (lastPinchDist > 5 && dist > 5) cam.targetFov = clamp(cam.targetFov * (lastPinchDist / dist), 18.0, 78.0);
+    lastPinchDist = dist;
+  }
+});
+function releasePointer(e) {
+  activePointers.delete(e.pointerId);
+  if (activePointers.size < 2) lastPinchDist = 0;
+  if (activePointers.size === 0) { cam.isInteracting = false; canvas.classList.remove("dragging"); }
+}
+canvas.addEventListener("pointerup", releasePointer);
+canvas.addEventListener("pointercancel", releasePointer);
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault(); markInteraction();
+  cam.targetFov = clamp(cam.targetFov * (1.0 + clamp(e.deltaY, -120, 120) * 0.0014), 18.0, 78.0);
+}, { passive: false });
+canvas.addEventListener("gesturestart", (e) => e.preventDefault(), { passive: false });
+canvas.addEventListener("dblclick", () => { cam.idleSeconds = AUTO_RETURN_DELAY; cam.autoReturning = true; });
+
+let trainS = HASH.s !== undefined ? wrapS(parseFloat(HASH.s)) : 190.0;
+let simTime = HASH.t !== undefined ? parseFloat(HASH.t) : 0.0;
+let paused = HASH.paused === "1";
+
+document.querySelectorAll("#hudDots .dot").forEach(btn => {
+  btn.addEventListener("click", () => { trainS = wrapS(parseFloat(btn.dataset.s)); });
+});
+window.addEventListener("keydown", (e) => {
+  const presets = { "1": 190, "2": 865, "3": 1210, "4": 1635, "5": 2068 };
+  if (presets[e.key] !== undefined) trainS = presets[e.key];
+  else if (e.key === " ") paused = !paused;
+  else if (e.key === "r" || e.key === "R") { cam.idleSeconds = AUTO_RETURN_DELAY; cam.autoReturning = true; }
+});
+
+function evalTrainSway(s, t, track) {
+  const lateral   = Math.sin(t * 1.18) * 0.011 + Math.sin(t * 2.47 + 1.3) * 0.0045;
+  const heave     = Math.sin(t * 1.72 + 0.6) * 0.0085 + Math.cos(t * 3.15) * 0.0035;
+  const swayRoll  = Math.sin(t * 0.94 + 0.4) * 0.0055 + Math.sin(t * 2.13) * 0.0022;
+  const swayPitch = Math.sin(t * 1.45 + 2.1) * 0.0025;
+  const railPhase = (s % 22.0) / 22.0;
+  const jolt = (Math.exp(-Math.pow((railPhase - 0.08) * 38.0, 2.0)) + Math.exp(-Math.pow((railPhase - 0.14) * 38.0, 2.0)) * 0.72) * 0.0048;
+  const microVib = (Math.sin(t * 19.7) * 0.5 + Math.sin(t * 31.3) * 0.5) * 0.0007;
+  return { dx: lateral, dy: heave - jolt + microVib, dz: 0.0, roll: swayRoll + track.bank * 0.35 + jolt * 0.45, pitch: swayPitch - jolt * 0.35 };
+}
+
+// ============================================================================
+// 14. MAIN MULTI-PASS RENDER FRAME
+// ============================================================================
+const matProj=Mat4.create(), matLocalView=Mat4.create(), matLocalVP=Mat4.create(),
+      matWorldView=Mat4.create(), matWorldVP=Mat4.create(), matPrevVP=Mat4.create(),
+      matInvVP=Mat4.create(), matCarWorld=Mat4.create(), matCarInv=Mat4.create(),
+      matMirror=Mat4.create(), matMirrorView=Mat4.create(), matMirrorVP=Mat4.create(),
+      matCoachCurr=Mat4.create(), matCoachPrev=Mat4.create();
+
+function drawMesh(m) { gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES, m.count, m.idxType, 0); }
+function drawFSQuad() { gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+
+const hudLocEl = document.getElementById("hudLoc"), hudMetaEl = document.getElementById("hudMeta");
+const hudDotEls = Array.from(document.querySelectorAll("#hudDots .dot"));
+let lastHudSection = "";
+
+function updateSimulation(dt) {
+  if (!paused) {
+    const speed = mix(BASE_SPEED, 22.5, getViaductFactor(trainS));
+    trainS = wrapS(trainS + speed * dt);
+    simTime += dt;
+  }
+  if (!cam.isInteracting) {
+    cam.idleSeconds += dt;
+    if (cam.idleSeconds >= AUTO_RETURN_DELAY) cam.autoReturning = true;
+  }
+  if (cam.autoReturning) {
+    cam.targetYaw = ((cam.targetYaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    const r = 1.0 - Math.exp(-dt * 1.65);
+    cam.targetYaw = mix(cam.targetYaw, DEFAULT_YAW, r);
+    cam.targetPitch = mix(cam.targetPitch, DEFAULT_PITCH, r);
+    cam.targetFov = mix(cam.targetFov, DEFAULT_FOV, r);
+    const diff = ((cam.targetYaw - cam.yaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    cam.yaw = cam.targetYaw - diff;
+  }
+  const damp = 1.0 - Math.exp(-dt * 11.0);
+  cam.yaw = mix(cam.yaw, cam.targetYaw, damp);
+  cam.pitch = mix(cam.pitch, cam.targetPitch, damp);
+  cam.fov = mix(cam.fov, cam.targetFov, damp);
+}
+
+function renderFrame(dt) {
+  resizePipeline();
+  const aspect = fboW / fboH;
+  const tr = evalTrack(trainS);
+  const sway = evalTrainSway(trainS, simTime, tr);
+
+  const camLocal = [CAM_SEAT_POS[0] + sway.dx, CAM_SEAT_POS[1] + sway.dy, CAM_SEAT_POS[2] + sway.dz];
+  const pitchEff = clamp(cam.pitch + sway.pitch, -1.42, 1.42);
+  const cp = Math.cos(pitchEff), sp = Math.sin(pitchEff), cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const lookLocal = [cy * cp, sp, sy * cp];
+  const upLocal = [-Math.sin(sway.roll) * sy, Math.cos(sway.roll), Math.sin(sway.roll) * cy];
+  const centerLocal = [camLocal[0] + lookLocal[0], camLocal[1] + lookLocal[1], camLocal[2] + lookLocal[2]];
+
+  const SHUTTER_DT = 1.0 / 54.0;
+  const currSpeed = mix(BASE_SPEED, 22.5, getViaductFactor(trainS));
+  const prevS = trainS - currSpeed * SHUTTER_DT;
+  const trPrev = evalTrack(prevS);
+
+  Mat4.fromBasis(matCarWorld, rotateVecByRoll(tr.right, tr.bank * 0.35), rotateVecByRoll(tr.up, tr.bank * 0.35), tr.fwd, [tr.x, tr.y, -trainS]);
+  Mat4.invertRigid(matCarInv, matCarWorld);
+
+  const matPrevCarWorld = Mat4.fromBasis(Mat4.create(), rotateVecByRoll(trPrev.right, trPrev.bank * 0.35), rotateVecByRoll(trPrev.up, trPrev.bank * 0.35), trPrev.fwd, [trPrev.x, trPrev.y, -prevS]);
+  const matPrevCarInv = Mat4.invertRigid(Mat4.create(), matPrevCarWorld);
+
+  Mat4.perspective(matProj, cam.fov * Math.PI / 180.0, aspect, 0.08, 16000.0);
+  Mat4.lookAt(matLocalView, camLocal, centerLocal, upLocal);
+  Mat4.multiply(matLocalVP, matProj, matLocalView);
+  Mat4.multiply(matWorldView, matLocalView, matCarInv);
+  Mat4.multiply(matWorldVP, matProj, matWorldView);
+  Mat4.invert4(matInvVP, matWorldVP);
+  Mat4.multiply(matPrevVP, matProj, Mat4.multiply(Mat4.create(), matLocalView, matPrevCarInv));
+
+  const camWorld = [
+    matCarWorld[0]*camLocal[0] + matCarWorld[4]*camLocal[1] + matCarWorld[8]*camLocal[2]  + matCarWorld[12],
+    matCarWorld[1]*camLocal[0] + matCarWorld[5]*camLocal[1] + matCarWorld[9]*camLocal[2]  + matCarWorld[13],
+    matCarWorld[2]*camLocal[0] + matCarWorld[6]*camLocal[1] + matCarWorld[10]*camLocal[2] + matCarWorld[14]
+  ];
+  const sunLocal = [
+    matCarInv[0]*SUN_WORLD[0] + matCarInv[4]*SUN_WORLD[1] + matCarInv[8]*SUN_WORLD[2],
+    matCarInv[1]*SUN_WORLD[0] + matCarInv[5]*SUN_WORLD[1] + matCarInv[9]*SUN_WORLD[2],
+    matCarInv[2]*SUN_WORLD[0] + matCarInv[6]*SUN_WORLD[1] + matCarInv[10]*SUN_WORLD[2]
+  ];
+
+  const tunFactor = getTunnelFactor(trainS);
+  const galFactor = getGalleryFactor(trainS);
+  const galPillarStrobe = 0.20 + 0.80 * smoothstep(0.18, 0.42, Math.abs(((trainS - GALLERY_A) % 8.8) / 8.8 - 0.5) * 2.0);
+  const inForestZone = smoothBox(trainS, 1485, 2010, 28.0);
+  const treeDapple = 0.58 + 0.42 * (0.5 + 0.5 * Math.sin(trainS * 0.48) * Math.cos(trainS * 0.19));
+  const daylight = (1.0 - tunFactor) * mix(1.0, 0.50, galFactor);
+  const treeStrobe = mix(mix(1.0, treeDapple, inForestZone), galPillarStrobe, galFactor);
+  const tunLampPhase = Math.abs(((trainS % 22.0) / 22.0) - 0.5) * 2.0;
+  const tunnelLampFlash = tunFactor * Math.exp(-tunLampPhase * tunLampPhase * 22.0);
+
+  // PASS 1: EXTERIOR WORLD
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.exterior.fbo);
+  gl.viewport(0, 0, fboW, fboH);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CCW);
+
+  // 1A. Alpine Sky & Sunlit Clouds
+  gl.depthMask(false); gl.disable(gl.CULL_FACE);
+  gl.useProgram(progs.sky.prog);
+  gl.uniformMatrix4fv(progs.sky.u.uInvVP, false, matInvVP);
+  gl.uniform3fv(progs.sky.u.uCamPos, camWorld);
+  gl.uniform1f(progs.sky.u.uTime, simTime);
+  drawFSQuad();
+  gl.depthMask(true); gl.enable(gl.CULL_FACE);
+
+  const zShifts = [0.0];
+  if (trainS < 1250.0) zShifts.push(LOOP_LEN);
+  if (trainS > LOOP_LEN - 1250.0) zShifts.push(-LOOP_LEN);
+
+  // 1B. Two-Zone Stitched Isotropic Alpine Terrain Chunks
+  gl.useProgram(progs.terrain.prog);
+  gl.uniformMatrix4fv(progs.terrain.u.uCurrVP, false, matWorldVP);
+  gl.uniformMatrix4fv(progs.terrain.u.uPrevVP, false, matPrevVP);
+  gl.uniform3fv(progs.terrain.u.uCamPos, camWorld);
+  gl.uniform1f(progs.terrain.u.uTime, simTime);
+  gl.uniform1f(progs.terrain.u.uLoopLen, LOOP_LEN);
+  for (let i = 0; i < terrainChunks.length; i++) {
+    const ch = terrainChunks[i];
+    const deltaS = wrapDeltaS(ch.sCenter - trainS);
+    gl.uniform1f(progs.terrain.u.uZShift, ch.sCenter - (trainS + deltaS));
+    drawMesh(ch.mesh);
+  }
+
+  // 1C. Glacial Turquoise Lake & Foaming Gorge Torrent River
+  gl.useProgram(progs.water.prog);
+  gl.uniformMatrix4fv(progs.water.u.uCurrVP, false, matWorldVP);
+  gl.uniformMatrix4fv(progs.water.u.uPrevVP, false, matPrevVP);
+  gl.uniform3fv(progs.water.u.uCamPos, camWorld);
+  gl.uniform1f(progs.water.u.uTime, simTime);
+  for (const zs of zShifts) { gl.uniform1f(progs.water.u.uZShift, zs); drawMesh(lakeMesh); }
+
+  // 1D. Hardware-Instanced Alpine Pine Forests
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progs.pine.prog);
+  gl.uniformMatrix4fv(progs.pine.u.uCurrVP, false, matWorldVP);
+  gl.uniformMatrix4fv(progs.pine.u.uPrevVP, false, matPrevVP);
+  gl.uniform1f(progs.pine.u.uTrainS, trainS);
+  gl.uniform1f(progs.pine.u.uLoopLen, LOOP_LEN);
+  gl.uniform3fv(progs.pine.u.uCamPos, camWorld);
+  gl.uniform1f(progs.pine.u.uTime, simTime);
+  gl.bindVertexArray(pineForest.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, pineForest.count, pineForest.idxType, 0, pineForest.instances);
+  gl.enable(gl.CULL_FACE);
+
+  // 1E. Viaducts, Track, Catenary Masts, Tunnels, Avalanche Gallery, Alpine Villages & Moving Red Swiss Train across the Gorge Viaduct!
+  gl.useProgram(progs.worldPbr.prog);
+  gl.uniformMatrix4fv(progs.worldPbr.u.uCurrVP, false, matWorldVP);
+  gl.uniformMatrix4fv(progs.worldPbr.u.uPrevVP, false, matPrevVP);
+  gl.uniform3fv(progs.worldPbr.u.uCamPos, camWorld);
+  gl.uniform1f(progs.worldPbr.u.uTime, simTime);
+
+  const matShift = Mat4.identity(Mat4.create());
+  for (const zs of zShifts) {
+    matShift[14] = zs;
+    gl.uniformMatrix4fv(progs.worldPbr.u.uModel, false, matShift);
+    gl.uniformMatrix4fv(progs.worldPbr.u.uPrevModel, false, matShift);
+    drawMesh(viaductMesh);
+    drawMesh(villageMesh);
+    gl.disable(gl.CULL_FACE);
+    drawMesh(tunnelMesh);
+    gl.enable(gl.CULL_FACE);
+
+    // 4-Car Gleaming Ruby-Red Glacier Express Train gliding gracefully across the Iconic Curved Stone Gorge Viaduct!!
+    // Timed naturally with trainS (or continuous loop across the viaduct) so it's curving heroically across the stone arches right as you pass!
+    const tLead = clamp(0.32 + ((trainS - 760.0) / 360.0) * 0.45 + Math.sin(simTime * 0.08) * 0.04, 0.14, 0.88);
+    const tPrevLead = tLead - (0.0022);
+    for (let k = 0; k < 4; k++) {
+      const tC = tLead - k * 0.078;
+      const tP = tPrevLead - k * 0.078;
+      if (tC < 0.03 || tC > 0.96) continue;
+      const frC = evalGorgeViaductFrame(tC);
+      const frP = evalGorgeViaductFrame(clamp(tP, 0.01, 0.98));
+      Mat4.fromBasis(matCoachCurr, frC.right, frC.up, frC.fwd, [frC.pos[0], frC.pos[1] + 0.55, frC.pos[2] + zs]);
+      Mat4.fromBasis(matCoachPrev, frP.right, frP.up, frP.fwd, [frP.pos[0], frP.pos[1] + 0.55, frP.pos[2] + zs]);
+      gl.uniformMatrix4fv(progs.worldPbr.u.uModel, false, matCoachCurr);
+      gl.uniformMatrix4fv(progs.worldPbr.u.uPrevModel, false, matCoachPrev);
+      drawMesh(forwardCoach);
+    }
+  }
+
+  // PASS 2 & 3: VELOCITY TILE-MAX -> NEIGHBOR-MAX -> GAUSSIAN DEPTH-AWARE MOTION BLUR
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.tileMax.fbo); gl.viewport(0, 0, fbos.tileMax.w, fbos.tileMax.h);
+  gl.useProgram(progs.tileMax.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.exterior.texs[1]);
+  gl.uniform1i(progs.tileMax.u.uVelTex, 0);
+  gl.uniform2f(progs.tileMax.u.uTexelSize, 1.0 / fboW, 1.0 / fboH);
+  gl.uniform1i(progs.tileMax.u.uTileSize, TILE_SIZE);
+  drawFSQuad();
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.neighborMax.fbo); gl.viewport(0, 0, fbos.neighborMax.w, fbos.neighborMax.h);
+  gl.useProgram(progs.neighborMax.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.tileMax.texs[0]);
+  gl.uniform1i(progs.neighborMax.u.uTileTex, 0);
+  gl.uniform2f(progs.neighborMax.u.uTileTexel, 1.0 / fbos.tileMax.w, 1.0 / fbos.tileMax.h);
+  drawFSQuad();
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.extBlurred.fbo); gl.viewport(0, 0, fboW, fboH);
+  gl.useProgram(progs.motionBlur.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.exterior.texs[0]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fbos.exterior.texs[1]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fbos.neighborMax.texs[0]);
+  gl.uniform1i(progs.motionBlur.u.uColorTex, 0);
+  gl.uniform1i(progs.motionBlur.u.uVelTex, 1);
+  gl.uniform1i(progs.motionBlur.u.uNeighborTex, 2);
+  gl.uniform1f(progs.motionBlur.u.uBlurScale, 1.15);
+  drawFSQuad();
+
+  // PASS 4: TRUE PLANAR MIRRORED INTERIOR REFLECTIONS
+  const setupInteriorUniforms = (vpMat, mirrorClip) => {
+    gl.useProgram(progs.interior.prog);
+    gl.uniformMatrix4fv(progs.interior.u.uVP, false, vpMat);
+    gl.uniform3fv(progs.interior.u.uCamLocal, camLocal);
+    gl.uniform3fv(progs.interior.u.uSunLocal, sunLocal);
+    gl.uniform1f(progs.interior.u.uDaylight, daylight);
+    gl.uniform1f(progs.interior.u.uTreeStrobe, treeStrobe);
+    gl.uniform1f(progs.interior.u.uTunnelLampFlash, tunnelLampFlash);
+    gl.uniform1f(progs.interior.u.uMirrorClip, mirrorClip);
+    gl.uniform1f(progs.interior.u.uTime, simTime);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, textures.walnut);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, textures.fabric);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, textures.sign);
+    gl.uniform1i(progs.interior.u.uTexWalnut, 0);
+    gl.uniform1i(progs.interior.u.uTexFabric, 1);
+    gl.uniform1i(progs.interior.u.uTexSign, 2);
+  };
+
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CW);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.reflRight.fbo); gl.viewport(0, 0, fbos.reflRight.w, fbos.reflRight.h);
+  gl.clearColor(0.010, 0.012, 0.016, 1.0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  Mat4.mirrorX(matMirror, WIN_PLANE_X); Mat4.multiply(matMirrorView, matLocalView, matMirror); Mat4.multiply(matMirrorVP, matProj, matMirrorView);
+  setupInteriorUniforms(matMirrorVP, 1.0); drawMesh(carriageData.interior);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.reflLeft.fbo); gl.viewport(0, 0, fbos.reflLeft.w, fbos.reflLeft.h);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  Mat4.mirrorX(matMirror, -WIN_PLANE_X); Mat4.multiply(matMirrorView, matLocalView, matMirror); Mat4.multiply(matMirrorVP, matProj, matMirrorView);
+  setupInteriorUniforms(matMirrorVP, -1.0); drawMesh(carriageData.interior);
+  gl.frontFace(gl.CCW);
+
+  // PASS 5: CARRIAGE INTERIOR + DOUBLE-GLAZED PANORAMIC GLASS COMPOSITING
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.sceneHDR.fbo); gl.viewport(0, 0, fboW, fboH);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fbos.extBlurred.fbo);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fbos.sceneHDR.fbo);
+  gl.blitFramebuffer(0, 0, fboW, fboH, 0, 0, fboW, fboH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.sceneHDR.fbo);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+  setupInteriorUniforms(matLocalVP, 0.0); drawMesh(carriageData.interior);
+
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progs.glass.prog);
+  gl.uniformMatrix4fv(progs.glass.u.uVP, false, matLocalVP);
+  gl.uniform2f(progs.glass.u.uResolution, fboW, fboH);
+  gl.uniform3fv(progs.glass.u.uCamLocal, camLocal);
+  gl.uniform3fv(progs.glass.u.uSunLocal, sunLocal);
+  gl.uniform1f(progs.glass.u.uDaylight, daylight);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.extBlurred.texs[0]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fbos.reflRight.texs[0]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fbos.reflLeft.texs[0]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, textures.glass);
+  gl.uniform1i(progs.glass.u.uExteriorTex, 0); gl.uniform1i(progs.glass.u.uReflRightTex, 1);
+  gl.uniform1i(progs.glass.u.uReflLeftTex, 2); gl.uniform1i(progs.glass.u.uGlassTex, 3);
+  drawMesh(carriageData.glass);
+
+  // PASS 6A: GPU TEMPORAL AUTO-EXPOSURE METERING
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  gl.useProgram(progs.lumaReduce.prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.luma64.fbo); gl.viewport(0, 0, 64, 64);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.sceneHDR.texs[0]);
+  gl.uniform1i(progs.lumaReduce.u.uTex, 0); gl.uniform2f(progs.lumaReduce.u.uTexel, 1/256, 1/256); gl.uniform1i(progs.lumaReduce.u.uFirstPass, 1);
+  drawFSQuad();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.luma16.fbo); gl.viewport(0, 0, 16, 16);
+  gl.bindTexture(gl.TEXTURE_2D, fbos.luma64.texs[0]); gl.uniform2f(progs.lumaReduce.u.uTexel, 1/64, 1/64); gl.uniform1i(progs.lumaReduce.u.uFirstPass, 0);
+  drawFSQuad();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.luma4.fbo); gl.viewport(0, 0, 4, 4);
+  gl.bindTexture(gl.TEXTURE_2D, fbos.luma16.texs[0]); gl.uniform2f(progs.lumaReduce.u.uTexel, 1/16, 1/16);
+  drawFSQuad();
+
+  const nextExpIdx = 1 - expIdx;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, expFBOs[nextExpIdx].fbo); gl.viewport(0, 0, 1, 1);
+  gl.useProgram(progs.autoExp.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.luma4.texs[0]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, expFBOs[expIdx].texs[0]);
+  gl.uniform1i(progs.autoExp.u.uLumaTex, 0); gl.uniform1i(progs.autoExp.u.uPrevExpTex, 1);
+  gl.uniform1f(progs.autoExp.u.uDt, Math.max(dt, 0.001)); gl.uniform1i(progs.autoExp.u.uReset, exposureNeedsReset ? 1 : 0);
+  drawFSQuad();
+  expIdx = nextExpIdx; exposureNeedsReset = false;
+
+  // PASS 6B: 5-LEVEL DUAL-KAWASE HDR BLOOM
+  gl.useProgram(progs.bloomDown.prog);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, expFBOs[expIdx].texs[0]);
+  gl.uniform1i(progs.bloomDown.u.uExpTex, 1);
+  let srcTex = fbos.sceneHDR.texs[0], srcW = fboW, srcH = fboH;
+  for (let i = 0; i < fbos.bloomDown.length; i++) {
+    const dst = fbos.bloomDown[i];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo); gl.viewport(0, 0, dst.w, dst.h);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.uniform1i(progs.bloomDown.u.uTex, 0); gl.uniform2f(progs.bloomDown.u.uTexel, 1/srcW, 1/srcH); gl.uniform1i(progs.bloomDown.u.uFirst, i === 0 ? 1 : 0);
+    drawFSQuad();
+    srcTex = dst.texs[0]; srcW = dst.w; srcH = dst.h;
+  }
+  gl.useProgram(progs.bloomUp.prog);
+  let smallTex = fbos.bloomDown[4].texs[0], smallW = fbos.bloomDown[4].w, smallH = fbos.bloomDown[4].h;
+  for (let i = 0; i < fbos.bloomUp.length; i++) {
+    const dst = fbos.bloomUp[i], large = fbos.bloomDown[3 - i];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo); gl.viewport(0, 0, dst.w, dst.h);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, smallTex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, large.texs[0]);
+    gl.uniform1i(progs.bloomUp.u.uSmallTex, 0); gl.uniform1i(progs.bloomUp.u.uLargeTex, 1); gl.uniform2f(progs.bloomUp.u.uTexel, 1/smallW, 1/smallH);
+    drawFSQuad();
+    smallTex = dst.texs[0]; smallW = dst.w; smallH = dst.h;
+  }
+
+  // PASS 7: FINAL ACES FILMIC TONE MAPPING
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, fboW, fboH);
+  gl.useProgram(progs.tonemap.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbos.sceneHDR.texs[0]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, smallTex);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, expFBOs[expIdx].texs[0]);
+  gl.uniform1i(progs.tonemap.u.uSceneTex, 0); gl.uniform1i(progs.tonemap.u.uBloomTex, 1); gl.uniform1i(progs.tonemap.u.uExpTex, 2);
+  gl.uniform1f(progs.tonemap.u.uTime, simTime);
+  gl.uniform1f(progs.tonemap.u.uFovNorm, clamp((DEFAULT_FOV - cam.fov) / 34.0, 0.0, 1.0));
+  drawFSQuad();
+
+  const sec = getSectionInfo(trainS);
+  const secKey = sec.name + sec.elev;
+  if (secKey !== lastHudSection) {
+    lastHudSection = secKey;
+    hudLocEl.textContent = sec.name;
+    hudMetaEl.textContent = sec.elev.toLocaleString("en-US") + " m";
+    hudDotEls.forEach((d, idx) => d.classList.toggle("active", idx === sec.idx));
+  }
+}
+
+// ============================================================================
+// 15. ANIMATION LOOP & VERIFICATION HOOKS
+// ============================================================================
+if (HASH.warmup !== undefined) {
+  const sFrom = parseFloat(HASH.warmup), sTo = parseFloat(HASH.s || "1160");
+  const steps = parseInt(HASH.steps || "18", 10);
+  trainS = wrapS(sFrom); exposureNeedsReset = true;
+  renderFrame(0.016);
+  const dtStep = Math.abs(wrapDeltaS(sTo - sFrom)) / (BASE_SPEED * Math.max(1, steps));
+  for (let i = 1; i <= steps; i++) {
+    trainS = wrapS(sFrom + wrapDeltaS(sTo - sFrom) * (i / steps));
+    simTime += dtStep;
+    renderFrame(dtStep);
+  }
+  paused = true;
+} else if (HASH.selftest === "1") {
+  renderFrame(0.016);
+  const startYaw = cam.yaw;
+  canvas.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 600, clientY: 360, bubbles: true }));
+  for (let i = 1; i <= 10; i++) {
+    canvas.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 600 - i * 45, clientY: 360 - i * 8, bubbles: true }));
+    updateSimulation(0.03);
+  }
+  canvas.dispatchEvent(new PointerEvent("pointerup", { pointerId: 1, clientX: 150, clientY: 280, bubbles: true }));
+  const afterDragYaw = cam.targetYaw, afterDragPitch = cam.targetPitch;
+  canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+  canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+  const afterWheelFov = cam.targetFov;
+  canvas.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 2, clientX: 400, clientY: 360, bubbles: true }));
+  canvas.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 3, clientX: 500, clientY: 360, bubbles: true }));
+  canvas.dispatchEvent(new PointerEvent("pointermove", { pointerId: 3, clientX: 460, clientY: 360, bubbles: true }));
+  canvas.dispatchEvent(new PointerEvent("pointerup", { pointerId: 2, clientX: 400, clientY: 360, bubbles: true }));
+  canvas.dispatchEvent(new PointerEvent("pointerup", { pointerId: 3, clientX: 460, clientY: 360, bubbles: true }));
+  const afterPinchFov = cam.targetFov;
+  for (let i = 0; i < 160; i++) updateSimulation(0.05);
+  const glErr = gl.getError();
+  const pass = (Math.abs(afterDragYaw - startYaw) > 1.2 && Math.abs(afterDragPitch) > 0.15 && afterWheelFov < DEFAULT_FOV - 5.0 && afterPinchFov > afterWheelFov + 3.0 && Math.abs(cam.yaw - DEFAULT_YAW) < 0.03 && Math.abs(cam.pitch - DEFAULT_PITCH) < 0.03 && Math.abs(cam.fov - DEFAULT_FOV) < 0.5 && glErr === gl.NO_ERROR);
+  document.title = `SELFTEST:${pass ? "PASS" : "FAIL"}|dragYaw=${afterDragYaw.toFixed(2)}|wheelFov=${afterWheelFov.toFixed(1)}|pinchFov=${afterPinchFov.toFixed(1)}|retYaw=${cam.yaw.toFixed(3)}|retFov=${cam.fov.toFixed(1)}|glErr=${glErr}`;
+  renderFrame(0.016);
+} else {
+  renderFrame(0.016);
+}
+
+window.__alps = {
+  setProgress(s) { trainS = wrapS(s); },
+  setCamera(yawDeg, pitchDeg, fovDeg) {
+    cam.yaw = cam.targetYaw = yawDeg * Math.PI / 180;
+    cam.pitch = cam.targetPitch = pitchDeg * Math.PI / 180;
+    cam.fov = cam.targetFov = fovDeg;
+    cam.autoReturning = false; cam.idleSeconds = 0;
+  },
+  setPaused(p) { paused = !!p; },
+  step(dt) { updateSimulation(dt); renderFrame(dt); },
+  getState() { return { trainS, simTime, yaw: cam.yaw, pitch: cam.pitch, fov: cam.fov, autoReturning: cam.autoReturning, glError: gl.getError() }; }
+};
+
+let lastTs = performance.now();
+function loop(ts) {
+  const dt = clamp((ts - lastTs) * 0.001, 0.001, 0.05);
+  lastTs = ts;
+  updateSimulation(dt);
+  renderFrame(dt);
+  requestAnimationFrame(loop);
+}
+if (!HASH.warmup && HASH.selftest !== "1" && HASH.paused !== "1") {
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>

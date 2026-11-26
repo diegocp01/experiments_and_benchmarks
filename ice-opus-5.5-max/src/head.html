@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>On the Rocks</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; cursor: grab; outline: none; }
+  canvas.drag { cursor: grabbing; }
+  #hint { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    font: 500 11px/1.4 ui-sans-serif, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    letter-spacing: .18em; text-transform: uppercase; color: rgba(255, 228, 196, .5);
+    pointer-events: none; transition: opacity 1.8s ease; white-space: nowrap; }
+  #hint.hide { opacity: 0; }
+  #err { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 2em;
+    color: #e8d2b8; font: 15px/1.5 ui-sans-serif, -apple-system, Arial, sans-serif; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<div id="hint">Drag to look around &nbsp;·&nbsp; Scroll or pinch to zoom</div>
+<div id="err" hidden></div>

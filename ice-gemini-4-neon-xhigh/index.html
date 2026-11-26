@@ -1,0 +1,2437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Whiskey on the Rocks — Cinematic Close-Up</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #040201;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas:active {
+    cursor: grabbing;
+  }
+  #hint {
+    position: fixed;
+    bottom: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(246, 214, 168, 0.46);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 1.8s ease;
+    text-shadow: 0 1px 10px rgba(0, 0, 0, 0.95);
+    white-space: nowrap;
+  }
+  #hint.hidden {
+    opacity: 0;
+  }
+  #err {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #0c0806;
+    color: #f3d2a8;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    text-align: center;
+    font-size: 15px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="hint">Drag to look around · Scroll or pinch to zoom</div>
+<div id="err"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('glcanvas');
+  const errEl = document.getElementById('err');
+  const hintEl = document.getElementById('hint');
+
+  setTimeout(() => hintEl.classList.add('hidden'), 4800);
+
+  const gl = canvas.getContext('webgl2', {
+    antialias: false,
+    alpha: false,
+    depth: false,
+    stencil: false,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: false
+  });
+
+  if (!gl) {
+    errEl.style.display = 'flex';
+    errEl.textContent = 'WebGL 2 is required to render this scene.';
+    return;
+  }
+
+  const extColorFloat = gl.getExtension('EXT_color_buffer_float');
+  const extColorHalf = gl.getExtension('EXT_color_buffer_half_float');
+  const extFloatLinear = gl.getExtension('OES_texture_float_linear');
+  const extHalfLinear = gl.getExtension('OES_texture_half_float_linear');
+  const useHalfFloat = !!(extColorFloat || extColorHalf);
+  const floatTexFilter = (useHalfFloat && (extHalfLinear || extFloatLinear)) ? gl.LINEAR : gl.NEAREST;
+
+  // =========================================================================
+  // SHADER UTILITIES
+  // =========================================================================
+  function compileShader(type, src, label) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      console.error(`Shader compile error [${label}]:\n${log}`);
+      errEl.style.display = 'flex';
+      errEl.textContent = `Shader error (${label}): ${log}`;
+      throw new Error(log);
+    }
+    return sh;
+  }
+
+  function createProgram(vsSrc, fsSrc, label) {
+    const p = gl.createProgram();
+    const vs = compileShader(gl.VERTEX_SHADER, vsSrc, label + ' VS');
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc, label + ' FS');
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(p);
+      console.error(`Program link error [${label}]:\n${log}`);
+      errEl.style.display = 'flex';
+      errEl.textContent = `Link error (${label}): ${log}`;
+      throw new Error(log);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return p;
+  }
+
+  function createTexture(w, h, internalFormat, format, type, filter = gl.LINEAR, wrapS = gl.CLAMP_TO_EDGE, wrapT = gl.CLAMP_TO_EDGE) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapS);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapT);
+    return tex;
+  }
+
+  function createFBO(tex) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error('FBO incomplete: ' + status);
+    }
+    return fbo;
+  }
+
+  // =========================================================================
+  // SHARED SCENE GEOMETRY GLSL (Caustic Photon Pass + Main Ray Tracer)
+  // =========================================================================
+  const SHARED_SCENE_GLSL = /* glsl */ `
+const float PI = 3.14159265359;
+const float TAU = 6.28318530718;
+
+const float GLASS_H = 2.34;
+const float GLASS_R_BOT = 0.94;
+const float GLASS_R_TOP = 1.07;
+const float GLASS_BASE_H = 0.50;
+
+const int MED_AIR = 0;
+const int MED_GLASS = 1;
+const int MED_WHISKEY = 2;
+const int MED_ICE = 3;
+
+uniform float uTime;
+uniform float uLiqLevel;
+uniform vec3 uLightPos;
+uniform vec4 uIcePos[3];   // xyz = pos, w = meltFactor [0..1]
+uniform vec4 uIceQuat[3];  // unit quaternion
+uniform vec4 uIceSize[3];  // xyz = half-extents, w = round radius
+uniform vec4 uRipple[3];   // xy = center xz, z = phase, w = amp
+
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float smax(float a, float b, float k) {
+  return -smin(-a, -b, k);
+}
+
+vec3 rotInvQuat(vec3 v, vec4 q) {
+  vec3 u = -q.xyz;
+  float s = q.w;
+  return v + 2.0 * cross(u, cross(u, v) + s * v);
+}
+
+float sdFrustum2D(vec2 p, float r1, float r2, float h) {
+  vec2 q = vec2(p.x, p.y - 0.5 * h);
+  float hh = 0.5 * h;
+  vec2 k1 = vec2(r2, hh);
+  vec2 k2 = vec2(r2 - r1, 2.0 * hh);
+  vec2 ca = vec2(q.x - min(q.x, (q.y < 0.0) ? r1 : r2), abs(q.y) - hh);
+  vec2 cb = q - k1 + k2 * clamp(dot(k1 - q, k2) / dot(k2, k2), 0.0, 1.0);
+  float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
+}
+
+float glassOuterR(float y) {
+  return mix(GLASS_R_BOT, GLASS_R_TOP, clamp(y / GLASS_H, 0.0, 1.0));
+}
+
+float glassInnerR(float y) {
+  float t = clamp((y - GLASS_BASE_H) / (GLASS_H - GLASS_BASE_H), 0.0, 1.0);
+  return mix(0.820, 1.002, t);
+}
+
+// Heavy crystal rocks glass outer profile (recessed underside foot ring, refined base bevels)
+float sdGlassOuter(vec3 p) {
+  float r = length(p.xz);
+  float bottomLift = 0.036 * smoothstep(0.76, 0.40, r);
+  float angle = atan(p.z, p.x);
+  // Subtle artisanal blown-glass surface contour + graceful low-base heavy facets
+  float subtleWave = 0.0018 * sin(angle * 4.0 + p.y * 1.9) * smoothstep(0.35, 1.3, p.y) * smoothstep(GLASS_H - 0.1, GLASS_H - 0.5, p.y);
+  float baseFacet = 0.0095 * cos(angle * 10.0) * smoothstep(0.76, 0.14, p.y) * smoothstep(0.02, 0.14, p.y);
+
+  float d = sdFrustum2D(vec2(r - subtleWave - baseFacet, p.y - bottomLift - 0.032),
+                        GLASS_R_BOT - 0.032, GLASS_R_TOP - 0.032, GLASS_H - 0.064) - 0.032;
+  return d * 0.92;
+}
+
+// Inner cavity with gracefully domed crystal punt
+float sdGlassInner(vec3 p) {
+  float r = length(p.xz);
+  float punt = 0.072 * exp(-r * r * 2.4);
+  float baseStart = GLASS_BASE_H + punt;
+  float h = (GLASS_H + 0.85) - baseStart;
+  float rBot = 0.820;
+  float rTop = mix(0.820, 1.002, (GLASS_H + 0.85 - GLASS_BASE_H) / (GLASS_H - GLASS_BASE_H));
+  float roundBottom = 0.115;
+  float d = sdFrustum2D(vec2(r, p.y - baseStart - roundBottom),
+                        rBot - roundBottom, rTop - roundBottom, h - roundBottom) - roundBottom;
+  return d * 0.92;
+}
+
+// Combined glass shell SDF with exact C-infinity smooth crystal drinking lip
+float sdGlass(vec3 p) {
+  float dOut = sdGlassOuter(p);
+  float dIn = sdGlassInner(p);
+  return smax(dOut, -dIn, 0.026);
+}
+
+// Sculpted artisanal melting ice cube SDF
+float sdSingleIce(vec3 p, int idx, out vec3 qOut) {
+  vec3 q = rotInvQuat(p - uIcePos[idx].xyz, uIceQuat[idx]);
+  qOut = q;
+  vec3 b = uIceSize[idx].xyz;
+  float rad = uIceSize[idx].w;
+  vec3 d = abs(q) - b;
+  float boxD = length(max(d, 0.0)) + min(max(d.x, max(d.y, d.z)), 0.0) - rad;
+
+  // Smooth organic warm-liquid melting hollows & hand-cut asymmetry
+  float fi = float(idx);
+  float melt = uIcePos[idx].w;
+  float n1 = sin(q.x * 6.4 + fi * 2.3) * cos(q.y * 6.8 - fi * 1.4) * sin(q.z * 6.2 + fi * 3.1);
+  float n2 = sin((q.x - q.z) * 10.8 + fi * 1.9) * cos((q.y + q.x) * 10.2 - fi * 2.7);
+  float faceScoop = -0.016 * (0.45 + 0.55 * melt) * (
+    exp(-dot(q.yz, q.yz) * 9.5) +
+    exp(-dot(q.xz, q.xz) * 9.5) +
+    exp(-dot(q.xy, q.xy) * 9.5)
+  );
+  float disp = 0.014 * n1 + 0.005 * n2 + faceScoop;
+  return (boxD + disp) * 0.82;
+}
+
+float sdIce(vec3 p, out int hitIdx, out vec3 localQ) {
+  vec3 q0, q1, q2;
+  float d0 = sdSingleIce(p, 0, q0);
+  float d1 = sdSingleIce(p, 1, q1);
+  float d2 = sdSingleIce(p, 2, q2);
+  hitIdx = 0;
+  localQ = q0;
+  float d = d0;
+  if (d1 < d) { d = d1; hitIdx = 1; localQ = q1; }
+  if (d2 < d) { d = d2; hitIdx = 2; localQ = q2; }
+  return d;
+}
+
+float sdIceSimple(vec3 p) {
+  int idx; vec3 lq;
+  return sdIce(p, idx, lq);
+}
+
+// Liquid surface with smooth capillary meniscus on glass wall & ice cubes + delicate ripples
+float liquidSurfaceY(vec2 xz) {
+  float r = length(xz);
+  float rWall = glassInnerR(uLiqLevel);
+  float wallGap = max(0.0, rWall - r);
+  float h = uLiqLevel + 0.055 * exp(-wallGap / 0.050);
+
+  float rip = 0.0;
+  for (int i = 0; i < 3; i++) {
+    vec2 dp = xz - uRipple[i].xy;
+    float dist = length(dp);
+    float cubeR = max(uIceSize[i].x, uIceSize[i].z) + uIceSize[i].w;
+    float edgeGap = max(0.0, dist - cubeR * 0.80);
+    float pierce = smoothstep(-0.28, 0.10, uIcePos[i].y + uIceSize[i].y + uIceSize[i].w - uLiqLevel);
+    // Smooth gentle capillary collar around emergent ice (prevents sharp triple-junction ridge!)
+    h += 0.018 * pierce * exp(-edgeGap / 0.068);
+    rip += uRipple[i].w * sin(dist * 23.0 - uRipple[i].z) * exp(-dist * 3.0) * smoothstep(0.05, 0.22, dist);
+  }
+  rip += 0.0016 * sin(r * 14.5 - uTime * 1.35) * exp(-r * 1.5);
+  return h + rip;
+}
+
+float sdLiquidTop(vec3 p) {
+  return (p.y - liquidSurfaceY(p.xz)) * 0.80;
+}
+
+float sdWhiskey(vec3 p) {
+  float dIn = sdGlassInner(p) - 0.006;
+  float dTop = sdLiquidTop(p);
+  return max(dIn, dTop);
+}
+
+// Strict dielectric priority: Glass > Ice > Whiskey > Air
+int queryMedium(vec3 p) {
+  if (sdGlass(p) < 0.0) return MED_GLASS;
+  if (sdIceSimple(p) < 0.0) return MED_ICE;
+  if (sdWhiskey(p) < 0.0) return MED_WHISKEY;
+  return MED_AIR;
+}
+
+vec2 intersectCyl(vec3 ro, vec3 rd, float rad, float yMin, float yMax) {
+  float a = dot(rd.xz, rd.xz);
+  float b = dot(ro.xz, rd.xz);
+  float c = dot(ro.xz, ro.xz) - rad * rad;
+  float tNear = -1e9;
+  float tFar = 1e9;
+  if (a > 1e-8) {
+    float disc = b * b - a * c;
+    if (disc < 0.0) return vec2(1e9, -1e9);
+    float sq = sqrt(disc);
+    tNear = (-b - sq) / a;
+    tFar = (-b + sq) / a;
+  } else if (c > 0.0) {
+    return vec2(1e9, -1e9);
+  }
+  if (abs(rd.y) > 1e-8) {
+    float ty0 = (yMin - ro.y) / rd.y;
+    float ty1 = (yMax - ro.y) / rd.y;
+    tNear = max(tNear, min(ty0, ty1));
+    tFar = min(tFar, max(ty0, ty1));
+  } else if (ro.y < yMin || ro.y > yMax) {
+    return vec2(1e9, -1e9);
+  }
+  return vec2(tNear, tFar);
+}
+
+float mapBoundary(vec3 p, int med, out int surfId) {
+  if (med == MED_AIR) {
+    float dg = sdGlass(p);
+    float di = sdIceSimple(p);
+    float dw = sdWhiskey(p);
+    float d = dg; surfId = 1;
+    if (di < d) { d = di; surfId = 3; }
+    if (dw < d) { d = dw; surfId = 2; }
+    return d;
+  } else if (med == MED_GLASS) {
+    surfId = 1;
+    return -sdGlass(p);
+  } else if (med == MED_WHISKEY) {
+    float dg = sdGlass(p);
+    float di = sdIceSimple(p);
+    float dt = -sdLiquidTop(p);
+    float d = dg; surfId = 1;
+    if (di < d) { d = di; surfId = 3; }
+    if (dt < d) { d = dt; surfId = 2; }
+    return d;
+  } else {
+    float dg = sdGlass(p);
+    float di = -sdIceSimple(p);
+    if (dg < di) { surfId = 1; return dg; }
+    surfId = 3;
+    return di;
+  }
+}
+
+vec3 calcSurfaceNormal(vec3 p, int surfId) {
+  const float e = 0.0008;
+  const vec2 k = vec2(1.0, -1.0);
+  if (surfId == 1) {
+    return normalize(
+      k.xyy * sdGlass(p + k.xyy * e) +
+      k.yyx * sdGlass(p + k.yyx * e) +
+      k.yxy * sdGlass(p + k.yxy * e) +
+      k.xxx * sdGlass(p + k.xxx * e)
+    );
+  } else if (surfId == 2) {
+    return normalize(
+      k.xyy * sdLiquidTop(p + k.xyy * e) +
+      k.yyx * sdLiquidTop(p + k.yyx * e) +
+      k.yxy * sdLiquidTop(p + k.yxy * e) +
+      k.xxx * sdLiquidTop(p + k.xxx * e)
+    );
+  } else {
+    return normalize(
+      k.xyy * sdIceSimple(p + k.xyy * e) +
+      k.yyx * sdIceSimple(p + k.yyx * e) +
+      k.yxy * sdIceSimple(p + k.yxy * e) +
+      k.xxx * sdIceSimple(p + k.xxx * e)
+    );
+  }
+}
+
+float getIOR(int med, float dispShift) {
+  if (med == MED_AIR) return 1.0;
+  // Subtle authentic lead-crystal dispersion (refined prism edge without RGB color breakup)
+  if (med == MED_GLASS) return 1.522 + dispShift * 0.0065;
+  if (med == MED_WHISKEY) return 1.362 + dispShift * 0.0035;
+  return 1.309 + dispShift * 0.0022;
+}
+
+// Rich jewel-like aged bourbon / single malt Beer-Lambert absorption!
+// Thin meniscus (d=0.25): radiant golden honey (0.95, 0.74, 0.37)
+// Mid glass body (d=0.95): fiery copper-amber (0.81, 0.31, 0.022)
+// Thick depths (d=1.95): deep velvety mahogany-ruby (0.65, 0.09, 0.0004)
+vec3 getAbsorption(int med) {
+  if (med == MED_AIR) return vec3(0.0);
+  if (med == MED_GLASS) return vec3(0.018, 0.016, 0.022);
+  if (med == MED_WHISKEY) return vec3(0.215, 1.22, 4.05);
+  return vec3(0.028, 0.024, 0.018); // Crystal-clear sparkling ice!
+}
+
+float fresnelDielectric(float cosI, float n1, float n2) {
+  float eta = n1 / n2;
+  float sinT2 = eta * eta * max(0.0, 1.0 - cosI * cosI);
+  if (sinT2 >= 1.0) return 1.0;
+  float cosT = sqrt(1.0 - sinT2);
+  float rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+  float rp = (n2 * cosI - n1 * cosT) / (n2 * cosI + n1 * cosT);
+  return clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+}
+`;
+
+  // =========================================================================
+  // PASS 0: CONDENSATION FROST / WET TRACKS / 16-BIT DROPLET HEIGHT MAP
+  // =========================================================================
+  const FULLSCREEN_VS = /* glsl */ `#version 300 es
+precision highp float;
+out vec2 vUv;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+  const FROST_DECAY_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uPrevFrost;
+uniform float uDt;
+uniform float uLiqNormY;
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(234.34, 435.345));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+void main() {
+  vec4 prev = texture(uPrevFrost, vUv);
+  float coldBot = smoothstep(0.17, 0.27, vUv.y);
+  float coldTop = 1.0 - smoothstep(uLiqNormY - 0.03, uLiqNormY + 0.09, vUv.y);
+  vec2 p = vec2(vUv.x * 16.0, vUv.y * 8.0);
+  float patchN = 0.68 + 0.32 * vnoise(vec2(mod(p.x, 16.0), p.y));
+  float targetFrost = coldBot * coldTop * patchN * 0.85;
+
+  float frost = prev.r + (targetFrost - prev.r) * clamp(uDt * 0.017, 0.0, 1.0);
+  float wet = max(0.0, prev.g - uDt * 0.028);
+  outColor = vec4(frost, wet, 0.0, 1.0);
+}
+`;
+
+  const FROST_WIPE_VS = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec4 aDrop;
+out float vSlide;
+void main() {
+  vSlide = aDrop.w;
+  if (aDrop.w <= 0.05) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    return;
+  }
+  gl_Position = vec4(aDrop.xy * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = clamp(aDrop.z * 512.0 * 2.35, 4.0, 32.0);
+}
+`;
+
+  const FROST_WIPE_FS = /* glsl */ `#version 300 es
+precision highp float;
+in float vSlide;
+out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  d.x *= 1.34;
+  float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  float mask = smoothstep(1.0, 0.22, r2);
+  outColor = vec4(0.0, 0.96, 0.0, mask * clamp(vSlide, 0.50, 1.0));
+}
+`;
+
+  const DROP_SPLAT_VS = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec4 aDrop;
+out float vSlide;
+out float vRad;
+void main() {
+  vSlide = aDrop.w;
+  vRad = aDrop.z;
+  gl_Position = vec4(aDrop.xy * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = clamp(aDrop.z * 512.0 * 2.55, 2.2, 34.0);
+}
+`;
+
+  const DROP_SPLAT_FS = /* glsl */ `#version 300 es
+precision highp float;
+in float vSlide;
+in float vRad;
+out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  d.y = -d.y;
+  d.x *= 1.34;
+  float slide = clamp(vSlide, 0.0, 1.0);
+  if (d.y > 0.0) {
+    d.x *= mix(1.0, 1.0 + 0.62 * d.y, slide);
+    d.y *= mix(1.0, 0.72, slide);
+  } else {
+    d.y *= mix(1.04, 1.24, slide);
+  }
+  float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  // Smooth C1 spherical-cap lens profile (with 16-bit float FBO -> zero faceting at extreme macro!)
+  float dome = pow(max(0.0, 1.0 - r2), 0.62) * smoothstep(1.0, 0.88, r2);
+  float h = dome * clamp(vRad * 38.0, 0.12, 1.0);
+  outColor = vec4(h, smoothstep(1.0, 0.74, r2), slide, 1.0);
+}
+`;
+
+  // =========================================================================
+  // PASS 1: REAL-TIME GPU PHOTON-SPLATTED CAUSTICS (Lockstep Spectral -> Zero RGB Noise!)
+  // =========================================================================
+  const CAUSTIC_VS = /* glsl */ `#version 300 es
+precision highp float;
+${SHARED_SCENE_GLSL}
+
+uniform float uCausticExtent;
+uniform int uGridSize;
+
+out vec3 vColor;
+
+bool tracePhotonBoundary(vec3 ro, vec3 rd, int med, float tMax, out float tHit, out int surfId) {
+  float t = 0.0020;
+  for (int i = 0; i < 48; i++) {
+    vec3 p = ro + rd * t;
+    float d = mapBoundary(p, med, surfId);
+    if (d < 0.0011) {
+      tHit = t;
+      return true;
+    }
+    t += max(d * 0.94, 0.0022);
+    if (t > tMax) break;
+  }
+  return false;
+}
+
+void main() {
+  int totalPerCh = uGridSize * uGridSize;
+  int ch = gl_VertexID / totalPerCh; // 0=R, 1=G, 2=B
+  int idx = gl_VertexID - ch * totalPerCh;
+  int ix = idx % uGridSize;
+  int iy = idx / uGridSize;
+
+  vec2 uv = (vec2(float(ix), float(iy)) + 0.5) / float(uGridSize);
+  // CRITICAL: IDENTICAL stratified jitter across R, G, B so channels stay 100% locked
+  // except for smooth physical crystal dispersion -> ZERO red/green RGB speckle noise!
+  float j1 = fract(sin(float(idx) * 12.9898 + 4.1414) * 43758.5453);
+  float j2 = fract(sin(float(idx) * 39.3468 + 9.2653) * 24634.6345);
+  uv += (vec2(j1, j2) - 0.5) / float(uGridSize);
+
+  vec3 glassCenter = vec3(0.0, 1.12, 0.0);
+  vec3 toGlass = normalize(glassCenter - uLightPos);
+  vec3 right = normalize(cross(toGlass, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(right, toGlass);
+
+  vec2 disk = (uv * 2.0 - 1.0) * vec2(1.18, 1.32);
+  vec3 targetPt = glassCenter + right * disk.x + up * disk.y;
+  vec3 rd = normalize(targetPt - uLightPos);
+  vec3 ro = uLightPos;
+
+  vec2 bc = intersectCyl(ro, rd, 1.15, 0.0, GLASS_H + 0.06);
+  if (bc.x > bc.y || bc.y < 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    vColor = vec3(0.0);
+    return;
+  }
+
+  float dispShift = (ch == 0) ? -1.0 : ((ch == 2) ? 1.0 : 0.0);
+  vec3 chMask = (ch == 0) ? vec3(1.0, 0.0, 0.0) : ((ch == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+
+  ro = ro + rd * max(0.0, bc.x - 0.01);
+  int med = MED_AIR;
+  vec3 throughput = vec3(1.0);
+  bool hitGlass = false;
+
+  for (int b = 0; b < 12; b++) {
+    vec2 cyl = intersectCyl(ro, rd, 1.18, -0.02, GLASS_H + 0.12);
+    float tMax = (med == MED_AIR) ? min(cyl.y, 5.5) : 3.4;
+    if (med == MED_AIR && rd.y < -0.001) {
+      float tFloor = -ro.y / rd.y;
+      if (tFloor > 0.0 && tFloor < tMax) tMax = tFloor;
+    }
+
+    float tHit;
+    int surfId;
+    if (!tracePhotonBoundary(ro, rd, med, tMax, tHit, surfId)) {
+      break;
+    }
+
+    hitGlass = true;
+    vec3 p = ro + rd * tHit;
+    throughput *= exp(-getAbsorption(med) * tHit);
+    if (med == MED_ICE) {
+      throughput *= 0.90;
+    }
+
+    vec3 n = calcSurfaceNormal(p, surfId);
+    if (dot(rd, n) > 0.0) n = -n;
+
+    vec3 pNext = p - n * 0.0030;
+    int nextMed = queryMedium(pNext);
+    if (nextMed == med) {
+      pNext = p - n * 0.0072;
+      nextMed = queryMedium(pNext);
+    }
+    if (nextMed == med) {
+      ro = p + rd * 0.006;
+      continue;
+    }
+
+    float n1 = getIOR(med, dispShift);
+    float n2 = getIOR(nextMed, dispShift);
+    float cosI = clamp(-dot(rd, n), 0.0, 1.0);
+    float F = fresnelDielectric(cosI, n1, n2);
+    vec3 refr = refract(rd, n, n1 / n2);
+
+    if (dot(refr, refr) < 0.001 || F > 0.96) {
+      rd = reflect(rd, n);
+      ro = p + n * 0.003;
+      throughput *= 0.94;
+    } else {
+      throughput *= (1.0 - F);
+      rd = normalize(refr);
+      ro = pNext;
+      med = nextMed;
+    }
+
+    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) break;
+  }
+
+  if (!hitGlass || med != MED_AIR || rd.y >= -0.02) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    vColor = vec3(0.0);
+    return;
+  }
+
+  float tPlane = -ro.y / rd.y;
+  if (tPlane < 0.0 || tPlane > 16.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    vColor = vec3(0.0);
+    return;
+  }
+
+  vec3 hitPos = ro + rd * tPlane;
+  vec2 ndc = hitPos.xz / uCausticExtent;
+  if (abs(ndc.x) > 1.02 || abs(ndc.y) > 1.02) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    vColor = vec3(0.0);
+    return;
+  }
+
+  float distLight = length(hitPos - uLightPos);
+  float atten = 38.0 / (distLight * distLight + 4.2);
+  vec3 lampWarm = vec3(1.0, 0.72, 0.36);
+  // Crisp overlapping Gaussian splat merges lockstep photons into sculptural golden ribbons!
+  float splatPx = clamp(2.5 + tPlane * 0.40, 2.5, 5.6);
+  float densityNorm = 270.0 / float(uGridSize * uGridSize);
+  float areaNorm = 11.2 / (splatPx * splatPx);
+
+  vColor = throughput * chMask * lampWarm * atten * densityNorm * areaNorm * 14.5;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  gl_PointSize = splatPx;
+}
+`;
+
+  const CAUSTIC_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec3 vColor;
+out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  float w = exp(-r2 * 3.6) * (1.0 - r2);
+  outColor = vec4(vColor * w, 1.0);
+}
+`;
+
+  // =========================================================================
+  // PASS 2: MAIN PHOTOREALISTIC MULTI-BOUNCE DIELECTRIC RAY TRACER
+  // =========================================================================
+  const MAIN_FS = /* glsl */ `#version 300 es
+precision highp float;
+${SHARED_SCENE_GLSL}
+
+in vec2 vUv;
+out vec4 outColor;
+
+uniform vec2 uResolution;
+uniform vec3 uCamPos;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform vec3 uCamFwd;
+uniform float uTanHalfFov;
+uniform float uCausticExtent;
+
+uniform sampler2D uCausticTex;
+uniform sampler2D uDropTex;   // RGBA16F: R = drop height, G = drop mask, B = slide
+uniform sampler2D uFrostTex;  // R = frost density, G = wet trail
+
+const vec3 LAMP_COLOR = vec3(1.0, 0.69, 0.34) * 30.0;
+const float LAMP_RADIUS = 0.38;
+
+// =========================================================================
+// NOISE HELPERS & HAND-RUBBED DARK AMERICAN WALNUT BAR
+// =========================================================================
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+float vnoise2(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x),
+    mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x),
+    u.y
+  );
+}
+
+float vnoise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(i);
+  float n100 = hash13(i + vec3(1, 0, 0));
+  float n010 = hash13(i + vec3(0, 1, 0));
+  float n110 = hash13(i + vec3(1, 1, 0));
+  float n001 = hash13(i + vec3(0, 0, 1));
+  float n101 = hash13(i + vec3(1, 0, 1));
+  float n011 = hash13(i + vec3(0, 1, 1));
+  float n111 = hash13(i + vec3(1, 1, 1));
+  return mix(
+    mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+    mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y),
+    f.z
+  );
+}
+
+float fbm2(vec2 p) {
+  float s = 0.0, a = 0.5;
+  mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+  for (int i = 0; i < 4; i++) {
+    s += a * vnoise2(p);
+    p = rot * p * 2.03 + vec2(13.7, 7.1);
+    a *= 0.5;
+  }
+  return s;
+}
+
+float fbm3(vec3 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) {
+    s += a * vnoise3(p);
+    p = p * 2.04 + vec3(17.1, 9.3, 23.7);
+    a *= 0.5;
+  }
+  return s;
+}
+
+float woodHeightField(vec2 xz, out float grainOut, out float fiberOut, out float seamOut, out float pSeedOut) {
+  float plankW = 2.85;
+  float plankId = floor((xz.y + 1.42) / plankW);
+  float plankV = fract((xz.y + 1.42) / plankW);
+  float seamDist = min(plankV, 1.0 - plankV);
+  seamOut = smoothstep(0.0, 0.0075, seamDist);
+
+  pSeedOut = hash12(vec2(plankId, 19.37));
+  vec2 wp = xz + vec2(pSeedOut * 31.0, pSeedOut * 11.0);
+
+  float warp = fbm2(vec2(wp.x * 0.22, wp.y * 0.95)) * 2.6;
+  float fineWarp = vnoise2(vec2(wp.x * 1.1, wp.y * 5.2)) * 0.28;
+  float rings = sin((wp.y * 3.4 + warp * 3.0 + fineWarp) * PI);
+  grainOut = smoothstep(-0.70, 0.82, rings);
+
+  float fiber1 = vnoise2(vec2(wp.x * 1.8, wp.y * 26.0));
+  float fiber2 = vnoise2(vec2(wp.x * 4.2, wp.y * 62.0));
+  fiberOut = fiber1 * 0.65 + fiber2 * 0.35;
+
+  return grainOut * 0.0032 + fiberOut * 0.0020 - (1.0 - seamOut) * 0.020;
+}
+
+void evalWoodMaterial(vec2 xz, out vec3 albedo, out float rough, out vec3 normal) {
+  float grain, fiber, seamMask, pSeed;
+  float h0 = woodHeightField(xz, grain, fiber, seamMask, pSeed);
+
+  vec3 deepWalnut = vec3(0.032, 0.016, 0.008);
+  vec3 richWalnut = vec3(0.098, 0.048, 0.021);
+  vec3 warmHoney  = vec3(0.155, 0.078, 0.033);
+  vec3 woodCol = mix(deepWalnut, richWalnut, grain);
+  woodCol = mix(woodCol, warmHoney, smoothstep(0.52, 0.95, grain) * 0.42);
+  woodCol *= (0.82 + 0.36 * fiber);
+  woodCol *= (0.88 + 0.24 * pSeed);
+  woodCol *= mix(0.20, 1.0, seamMask);
+
+  float patina = fbm2(xz * 0.75 + 4.2);
+
+  // Subtle damp condensation ring right around heavy crystal glass base
+  float rGlass = length(xz);
+  float dampRing = exp(-pow((rGlass - 0.98) / 0.13, 2.0)) * 0.85
+                 + smoothstep(1.04, 0.88, rGlass) * 0.30;
+  float dampNoise = 0.68 + 0.32 * vnoise2(xz * 7.2);
+  float wetness = clamp(dampRing * dampNoise, 0.0, 1.0);
+
+  albedo = woodCol * mix(1.0, 0.64, wetness);
+  rough = mix(0.165 + 0.11 * (1.0 - grain) + 0.08 * patina + 0.045 * (1.0 - fiber), 0.045, wetness);
+  rough = clamp(rough, 0.045, 0.40);
+
+  float eps = 0.014;
+  float g1, f1, s1, ps1;
+  float hx = woodHeightField(xz + vec2(eps, 0.0), g1, f1, s1, ps1);
+  float hz = woodHeightField(xz + vec2(0.0, eps), g1, f1, s1, ps1);
+  float bumpScale = mix(0.55, 0.16, wetness);
+  normal = normalize(vec3((h0 - hx) / eps * bumpScale, 1.0, (h0 - hz) / eps * bumpScale));
+}
+
+// =========================================================================
+// VELVETY DARK MOODY BAR ENVIRONMENT (Single Warm Pendant Light Only)
+// =========================================================================
+vec3 evalEnvironment(vec3 ro, vec3 rd, bool isPrimaryBg) {
+  vec3 toL = uLightPos - ro;
+  float tL = dot(toL, rd);
+
+  // Deep dramatic chiaroscuro bar lounge darkness (keeps glowing glass & amber the hero!)
+  float up = clamp(rd.y, -1.0, 1.0);
+  vec3 lowBounce = vec3(0.014, 0.0065, 0.0028);
+  vec3 horizon   = vec3(0.0065, 0.0036, 0.0020);
+  vec3 ceiling   = vec3(0.0022, 0.0014, 0.0009);
+  vec3 col = (up > 0.0) ? mix(horizon, ceiling, pow(up, 0.6)) : mix(horizon, lowBounce, pow(-up, 0.55));
+
+  // Tight, tasteful atmospheric warm haze near the single pendant light
+  vec3 lDir = normalize(toL);
+  float lCos = max(0.0, dot(rd, lDir));
+  float bgScale = isPrimaryBg ? 0.32 : 1.0;
+  col += vec3(1.0, 0.54, 0.18) * (0.025 * pow(lCos, 7.0) + 0.14 * pow(lCos, 32.0)) * bgScale;
+
+  // Direct glowing warm Edison/pendant filament reflection in crystal glass, whiskey & ice!
+  if (tL > 0.0) {
+    vec3 closest = ro + rd * tL;
+    float d2 = dot(closest - uLightPos, closest - uLightPos);
+    float r2 = LAMP_RADIUS * LAMP_RADIUS;
+    float bulb = exp(-d2 / (r2 * 1.10));
+    float core = smoothstep(r2 * 1.1, r2 * 0.12, d2);
+    float shadeMask = smoothstep(0.20, -0.24, normalize(closest - uLightPos + vec3(0.0, -0.06, 0.0)).y);
+    col += vec3(1.0, 0.76, 0.40) * (bulb * 6.5 + core * 20.0) * (0.35 + 0.65 * shadeMask) * (isPrimaryBg ? 0.45 : 1.0);
+  }
+
+  // Ultra-subtle moody dark wood back-bar depth
+  float azL = max(0.0, dot(normalize(rd.xz + 1e-5), normalize(uLightPos.xz)));
+  float subtleWall = exp(-pow(rd.y - 0.025, 2.0) * 20.0) * (0.15 + 0.85 * pow(azL, 2.4));
+  col += vec3(0.020, 0.009, 0.0035) * subtleWall;
+
+  return col;
+}
+
+// =========================================================================
+// GGX MICROFACET SPECULAR (Single Warm Finite-Radius Bar Pendant Lamp)
+// =========================================================================
+float D_GGX(float NoH, float a) {
+  float a2 = a * a;
+  float d = (NoH * a2 - NoH) * NoH + 1.0;
+  return a2 / (PI * d * d + 1e-6);
+}
+
+float V_SmithGGX(float NoV, float NoL, float a) {
+  float a2 = a * a;
+  float gv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
+  float gl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
+  return 0.5 / (gv + gl + 1e-5);
+}
+
+vec3 evalDirectLampSpecular(vec3 p, vec3 N, vec3 V, float rough, float F0) {
+  vec3 toL = uLightPos - p;
+  float dist = length(toL);
+
+  vec3 R = reflect(-V, N);
+  vec3 centerToRay = dot(toL, R) * R - toL;
+  vec3 closestPt = toL + centerToRay * clamp(LAMP_RADIUS / max(length(centerToRay), 1e-5), 0.0, 1.0);
+  vec3 Lrep = normalize(closestPt);
+
+  float NoL = max(0.0, dot(N, Lrep));
+  float NoV = max(0.001, dot(N, V));
+  if (NoL <= 0.0) return vec3(0.0);
+
+  vec3 H = normalize(V + Lrep);
+  float NoH = max(0.0, dot(N, H));
+  float VoH = max(0.0, dot(V, H));
+
+  float alpha = clamp(rough * rough, 0.0020, 1.0);
+  float alphaPrime = clamp(alpha + LAMP_RADIUS / (2.2 * dist), 0.0036, 1.0);
+  float sphereNorm = (alpha * alpha) / (alphaPrime * alphaPrime);
+
+  float D = D_GGX(NoH, alphaPrime) * sphereNorm;
+  float Vis = V_SmithGGX(NoV, NoL, alpha);
+  float F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+
+  vec3 fromLamp = normalize(p - uLightPos);
+  float cone = smoothstep(-0.08, -0.55, fromLamp.y);
+  float atten = (0.30 + 0.70 * cone) / (dist * dist + 1.6);
+
+  return LAMP_COLOR * (D * Vis * F * NoL * atten);
+}
+
+// =========================================================================
+// CONDENSATION DROPLETS (16-BIT SMOOTH LENSES), CHILLED MIST & WIPED TRACKS
+// =========================================================================
+vec2 glassOuterUV(vec3 p) {
+  float u = fract(atan(p.z, p.x) / TAU + 0.5);
+  float v = clamp((p.y - 0.05) / (GLASS_H - 0.12), 0.0, 1.0);
+  return vec2(u, v);
+}
+
+void sampleCondensation(vec3 p, vec3 baseN, bool includeMicroFrost, out vec3 pertN, out float roughOut, out float dropMask, out float frostOut, out float dropSlopeY) {
+  float r = length(p.xz);
+  float rOut = glassOuterR(p.y);
+  // Keep condensation strictly on exterior side wall, cleanly below dry top drinking rim!
+  float isOuterSide = smoothstep(0.06, 0.16, p.y) * (1.0 - smoothstep(GLASS_H - 0.34, GLASS_H - 0.20, p.y))
+                    * smoothstep(rOut - 0.030, rOut - 0.006, r);
+
+  if (isOuterSide < 0.01) {
+    pertN = baseN;
+    roughOut = 0.013;
+    dropMask = 0.0;
+    frostOut = 0.0;
+    dropSlopeY = 0.0;
+    return;
+  }
+
+  vec2 uv = glassOuterUV(p);
+  vec4 dCenter = texture(uDropTex, uv);
+  vec4 fCenter = texture(uFrostTex, uv);
+
+  vec2 texel = vec2(1.05 / 1024.0, 1.05 / 512.0);
+  float hL = texture(uDropTex, vec2(fract(uv.x - texel.x), uv.y)).r;
+  float hR = texture(uDropTex, vec2(fract(uv.x + texel.x), uv.y)).r;
+  float hD = texture(uDropTex, vec2(uv.x, clamp(uv.y - texel.y, 0.0, 1.0))).r;
+  float hU = texture(uDropTex, vec2(uv.x, clamp(uv.y + texel.y, 0.0, 1.0))).r;
+
+  vec3 T = normalize(vec3(-p.z, 0.0, p.x));
+  vec3 B = normalize(cross(baseN, T));
+
+  float dropGradStrength = 2.05 * isOuterSide;
+  vec2 grad = vec2(hR - hL, hU - hD) * dropGradStrength;
+  float gLen = length(grad);
+  if (gLen > 0.66) grad *= 0.66 / gLen;
+  dropSlopeY = grad.y;
+
+  float frost = fCenter.r * isOuterSide * (1.0 - smoothstep(0.05, 0.28, dCenter.g));
+  float wetTrail = fCenter.g * isOuterSide;
+
+  vec2 microGrad = vec2(0.0);
+  if (includeMicroFrost && frost > 0.02) {
+    vec2 mp = vec2(uv.x * 460.0, uv.y * 185.0);
+    float m0 = vnoise2(mp);
+    float mx = vnoise2(mp + vec2(0.32, 0.0));
+    float my = vnoise2(mp + vec2(0.0, 0.32));
+    microGrad = vec2(mx - m0, my - m0) * (0.24 * frost);
+  }
+
+  pertN = normalize(baseN - T * (grad.x + microGrad.x) - B * (grad.y + microGrad.y));
+  dropMask = dCenter.g * isOuterSide;
+  frostOut = frost;
+  roughOut = mix(0.013, 0.19, frost * (1.0 - wetTrail * 0.92));
+  roughOut = mix(roughOut, 0.010, dropMask);
+}
+
+// =========================================================================
+// CRYSTAL-CLEAR VOLUMETRIC ICE OPTICS (Glass-Clear Rind + Frosty Core + Crisp Cracks!)
+// =========================================================================
+void evalIceInterior(vec3 pStart, vec3 rd, float segLen, out vec3 scatterCol, out vec3 transMod) {
+  scatterCol = vec3(0.0);
+  transMod = vec3(1.0);
+  if (segLen < 0.005) return;
+
+  const int STEPS = 9;
+  float ds = min(segLen, 0.90) / float(STEPS);
+  vec3 pCenter = pStart + rd * (0.5 * segLen);
+  vec3 lDir = normalize(uLightPos - pCenter);
+  float cosTh = dot(rd, lDir);
+  float phase = 0.48 + 0.68 * pow(max(0.0, cosTh * 0.5 + 0.5), 2.8);
+
+  for (int i = 0; i < STEPS; i++) {
+    float t = (float(i) + 0.5) * ds;
+    vec3 p = pStart + rd * t;
+    int idx;
+    vec3 q;
+    float dIce = sdIce(p, idx, q);
+    float depth = max(0.0, -dIce);
+
+    // Thick crystal-clear wet melted outer rind (~0.075), frosty frozen heart strictly inside!
+    float coreMask = smoothstep(0.068, 0.185, depth);
+    float fi = float(idx);
+    float radDist = length(q);
+
+    // 1. Delicate wispy frosty white-ice cloud concentrated near cube center (NOT opaque wax!)
+    float centerFocus = exp(-radDist * radDist * 22.0);
+    float cloud = fbm3(q * 11.5 + vec3(fi * 3.1, fi * 1.7, fi * 4.3));
+    float fineFrost = vnoise3(q * 28.0 + vec3(fi * 7.3));
+    float milkyCore = smoothstep(0.38, 0.78, cloud * 0.72 + fineFrost * 0.28 + centerFocus * 0.35) * coreMask * 0.68;
+
+    // 2. Fine crisp radial trapped-air freezing needles (high-freq straight micro-filaments, NOT marble swirls!)
+    vec3 radDir = q / max(radDist, 0.015);
+    float needleAng = vnoise3(radDir * 24.0 + vec3(fi * 4.1, fi * 2.3, fi * 6.7));
+    float needleBreak = vnoise3(q * 32.0 + vec3(fi * 1.9));
+    float needles = smoothstep(0.72, 0.91, needleAng) * smoothstep(0.32, 0.75, needleBreak)
+                  * smoothstep(0.055, 0.14, depth) * smoothstep(0.24, 0.03, radDist) * 1.35;
+
+    // 3. Sparkling microscopic frozen air specks inside the core
+    float microSpec = smoothstep(0.84, 0.96, vnoise3(q * 52.0 + vec3(fi * 9.1))) * coreMask * 1.45;
+
+    // 4. Crisp angular crystal stress-fracture planes catching bright icy-ivory & golden highlights!
+    vec3 nCrack1 = normalize(vec3(0.62, 0.72, -0.32 + 0.35 * fi));
+    vec3 nCrack2 = normalize(vec3(-0.48, 0.56, 0.67 - 0.25 * fi));
+    float c1 = abs(dot(q, nCrack1) + 0.018 * sin(q.x * 16.0 + q.z * 14.0 + fi));
+    float c2 = abs(dot(q, nCrack2) - 0.022 + 0.015 * cos(q.y * 15.0 - q.x * 13.0));
+    float crackMask = smoothstep(0.030, 0.10, depth) * smoothstep(0.27, 0.12, radDist);
+    float crack = (smoothstep(0.0085, 0.0012, c1) + 0.65 * smoothstep(0.0075, 0.0012, c2)) * crackMask;
+
+    float totalDens = milkyCore + needles + microSpec * 0.5 + crack * 1.2;
+    if (totalDens < 0.004) continue;
+
+    // Submerged portion illuminates with warm glowing amber-gold whiskey light;
+    // Emergent crown catches crisp bright cool-champagne tungsten light!
+    float submerge = max(0.0, uLiqLevel - p.y);
+    float sideDist = max(0.0, glassInnerR(p.y) - length(p.xz));
+    float liqPath = submerge * 0.95 + sideDist * 0.42;
+    vec3 amberLight = vec3(1.0, 0.78, 0.48) * 2.25 * exp(-getAbsorption(MED_WHISKEY) * (liqPath + 0.10));
+    // Crisp cool-ivory top-lit icy gleam contrasting against deep warm amber whiskey!
+    float emergent = smoothstep(-0.10, 0.14, p.y - uLiqLevel);
+    vec3 crownLight = vec3(1.0, 0.92, 0.80) * (0.45 + 1.75 * emergent);
+    vec3 localLight = amberLight + crownLight;
+
+    float glint = (crack * 1.35 + microSpec * 0.95) * (0.45 + 1.25 * pow(max(0.0, cosTh * 0.5 + 0.5), 4.5));
+    vec3 stepScatter = localLight * ((milkyCore * 0.55 + needles * 0.72) * phase + glint) * ds;
+
+    scatterCol += transMod * stepScatter;
+    // Keep ice ~70% optically transparent so refracted whiskey & wood shimmer right through it!
+    transMod *= exp(-vec3(0.40, 0.44, 0.50) * totalDens * ds * 0.65);
+  }
+}
+
+// =========================================================================
+// JEWEL-LIKE AMBER WHISKEY INTERNAL TRANSLUCENCY (Pure Deep Copper-Gold Glow)
+// =========================================================================
+vec3 evalWhiskeyInternalGlow(vec3 ro, vec3 rd, float segLen) {
+  if (segLen < 0.004) return vec3(0.0);
+  vec3 pMid = ro + rd * (0.5 * segLen);
+  vec3 toL = uLightPos - pMid;
+  float dL = length(toL);
+  vec3 L = toL / dL;
+
+  float rWall = glassInnerR(clamp(pMid.y, GLASS_BASE_H, GLASS_H));
+  float horizDist = max(0.04, rWall - dot(pMid.xz, normalize(L.xz + 1e-5)) * 0.55);
+  float topDist = max(0.04, (uLiqLevel - pMid.y) / max(0.25, L.y));
+  float lightDepthInWhiskey = min(horizDist, topDist) * 0.95;
+
+  // Deep glowing bourbon amber filtered strictly by Beer-Lambert absorption
+  vec3 filteredAmber = vec3(1.0, 0.68, 0.30) * exp(-getAbsorption(MED_WHISKEY) * (lightDepthInWhiskey + 0.30));
+
+  float cosL = dot(rd, L);
+  float backlit = 0.35 + 1.05 * pow(max(0.0, cosL * 0.5 + 0.5), 3.0);
+  float opticalWeight = 1.0 - exp(-segLen * 1.05);
+
+  float atten = 12.0 / (dL * dL + 3.0);
+  return filteredAmber * backlit * opticalWeight * atten * 0.30;
+}
+
+// =========================================================================
+// BAR TABLE SHADING (Dark Walnut + Smooth Golden GPU Caustics + Feathered Shadow)
+// =========================================================================
+vec3 sampleCausticsSmooth(vec2 xz) {
+  vec2 uv = xz / uCausticExtent * 0.5 + 0.5;
+  // Smoothly feather caustic texture border so NO rectangular edge ever appears on wood!
+  float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  float borderMask = smoothstep(0.0, 0.09, edge);
+  if (borderMask <= 0.001) return vec3(0.0);
+  return texture(uCausticTex, uv).rgb * borderMask;
+}
+
+// Smoothly feathered glass shadow on wood bar (zero sharp rectangular cutoffs!)
+float evalGlassShadow(vec3 p) {
+  vec3 toL = uLightPos - p;
+  float distL = length(toL);
+  vec3 L = toL / distL;
+
+  // Closest point along shadow ray to glass axis (x=0, z=0)
+  float a = dot(L.xz, L.xz);
+  float tAxis = (a > 1e-5) ? clamp(-dot(p.xz, L.xz) / a, 0.0, distL) : 0.0;
+  vec3 q = p + L * tAxis;
+
+  float radialDist = length(q.xz);
+  float glassR = mix(0.95, 1.06, clamp(q.y / GLASS_H, 0.0, 1.0));
+  float penumbra = 0.14 + 0.085 * tAxis;
+
+  // Smooth radial AND smooth top-of-glass shadow transition!
+  float horizBlock = 1.0 - smoothstep(glassR - penumbra * 0.45, glassR + penumbra, radialDist);
+  float vertBlock  = smoothstep(-0.10, 0.15, q.y) * (1.0 - smoothstep(GLASS_H - 0.12, GLASS_H + penumbra * 1.5, q.y));
+  float block = horizBlock * vertBlock;
+
+  return mix(1.0, 0.04, block);
+}
+
+vec3 shadeBarTableBase(vec3 p, vec3 V, out vec3 woodN, out float woodRough, out float woodF0) {
+  vec3 albedo;
+  evalWoodMaterial(p.xz, albedo, woodRough, woodN);
+  woodF0 = 0.055;
+
+  vec3 toL = uLightPos - p;
+  float distL = length(toL);
+  vec3 L = toL / distL;
+
+  vec3 fromLamp = -L;
+  float lampPool = smoothstep(-0.08, -0.52, fromLamp.y);
+  float atten = (0.14 + 0.86 * lampPool) / (distL * distL + 1.8);
+  float NoL = max(0.0, dot(woodN, L));
+
+  float shadow = evalGlassShadow(p);
+
+  // Heavy physical contact shadow anchoring the glass firmly onto the dark walnut
+  float r = length(p.xz);
+  float contactAO = smoothstep(0.84, 1.24, r);
+  float footSeal = 1.0 - 0.86 * exp(-pow((r - 0.86) / 0.14, 2.0));
+  float underGlass = smoothstep(0.95, 0.72, r);
+  float ao = mix(0.24 + 0.76 * contactAO, 0.36, underGlass) * footSeal;
+
+  vec3 diff = (albedo / PI) * LAMP_COLOR * NoL * atten * shadow * ao;
+  vec3 spec = evalDirectLampSpecular(p, woodN, V, woodRough, woodF0) * shadow * (0.20 + 0.80 * ao);
+
+  // SILKY GPU-TRACED GOLDEN AMBER CAUSTICS on dark walnut wood!
+  vec3 caustics = sampleCausticsSmooth(p.xz);
+  // Warm walnut wood glows golden-amber where focused caustic ribbons strike
+  vec3 causticTint = mix(albedo * 6.8, vec3(0.46, 0.24, 0.09), 0.38);
+  vec3 causticDiffuse = caustics * causticTint * 1.48;
+  vec3 causticGlint = caustics * (0.090 + 0.14 * (1.0 - woodRough));
+
+  vec3 ambient = albedo * vec3(0.052, 0.026, 0.011) * (0.26 + 0.74 * exp(-r * 0.15)) * ao;
+  float underGlow = exp(-r * r * 0.56) * 0.24;
+  ambient += albedo * vec3(1.0, 0.40, 0.05) * underGlow;
+
+  return diff + spec + causticDiffuse + causticGlint + ambient;
+}
+
+// =========================================================================
+// RAY MARCHING & MULTI-BOUNCE DIELECTRIC TRACER
+// =========================================================================
+bool marchGlassBoundary(vec3 ro, vec3 rd, int med, float tMin, float tMax, int maxSteps, out float tHit, out int surfId) {
+  float t = tMin;
+  for (int i = 0; i < 96; i++) {
+    if (i >= maxSteps) break;
+    vec3 p = ro + rd * t;
+    float d = mapBoundary(p, med, surfId);
+    if (d < 0.00034) {
+      tHit = t;
+      return true;
+    }
+    t += max(d * 0.88, 0.00065);
+    if (t > tMax) break;
+  }
+  return false;
+}
+
+// Graceful physical termination for deep TIR light-pipe rays inside glass wall/rim!
+vec3 finishTrappedRay(vec3 ro, vec3 rd, int med) {
+  if (med == MED_GLASS) {
+    // Fiber-optic light piping in crystal glass carries warm golden amber glow up from whiskey + lamp!
+    float rimGlow = smoothstep(GLASS_H - 0.35, GLASS_H, ro.y);
+    vec3 pipeAmber = vec3(0.42, 0.17, 0.032) * (0.45 + 0.55 * rimGlow);
+    vec3 env = evalEnvironment(ro, rd, false) * 0.75;
+    return pipeAmber + env;
+  }
+  vec3 env = (rd.y < -0.02)
+    ? vec3(0.12, 0.05, 0.016) * (0.5 + 0.5 * exp(-length(ro.xz) * 0.25))
+    : evalEnvironment(ro, rd, false);
+  return env * exp(-getAbsorption(med) * 0.45);
+}
+
+vec3 traceSecondary(vec3 ro, vec3 rd, int startMed, int maxBounces) {
+  vec3 col = vec3(0.0);
+  vec3 throughput = vec3(1.0);
+  int med = startMed;
+  bool exited = false;
+
+  for (int b = 0; b < 7; b++) {
+    if (b >= maxBounces) break;
+
+    float tTable = (med == MED_AIR && rd.y < -0.0005) ? (-ro.y / rd.y) : 1e9;
+    if (tTable < 0.001) tTable = 1e9;
+
+    vec2 cyl = intersectCyl(ro, rd, 1.18, -0.02, GLASS_H + 0.12);
+    bool canHitGlass = (cyl.x < cyl.y && cyl.y > 0.001);
+    float tStart = (med == MED_AIR) ? max(0.0016, cyl.x) : 0.0016;
+    float tLimit = (med == MED_AIR) ? min(cyl.y, tTable) : 3.5;
+
+    float tHit = 1e9;
+    int surfId = 0;
+    bool hitGlass = false;
+
+    if (canHitGlass && tStart < tLimit) {
+      hitGlass = marchGlassBoundary(ro, rd, med, tStart, tLimit, 48, tHit, surfId);
+    }
+
+    if (!hitGlass) {
+      exited = true;
+      if (med == MED_AIR && tTable < 30.0) {
+        vec3 pt = ro + rd * tTable;
+        vec3 wn; float wr, wf;
+        col += throughput * shadeBarTableBase(pt, -rd, wn, wr, wf);
+      } else if (med == MED_AIR) {
+        col += throughput * evalEnvironment(ro, rd, false);
+      } else {
+        col += throughput * finishTrappedRay(ro, rd, med);
+      }
+      break;
+    }
+
+    vec3 p = ro + rd * tHit;
+    vec3 absCol = exp(-getAbsorption(med) * tHit);
+    if (med == MED_ICE) {
+      vec3 iceScat, iceTrans;
+      evalIceInterior(ro, rd, tHit, iceScat, iceTrans);
+      col += throughput * iceScat;
+      throughput *= iceTrans;
+    } else if (med == MED_WHISKEY) {
+      col += throughput * evalWhiskeyInternalGlow(ro, rd, tHit);
+    }
+    throughput *= absCol;
+
+    vec3 n = calcSurfaceNormal(p, surfId);
+    if (dot(rd, n) > 0.0) n = -n;
+
+    float surfRough = 0.013;
+    if (surfId == 1 && med == MED_AIR) {
+      float dm, fr, sy;
+      sampleCondensation(p, n, false, n, surfRough, dm, fr, sy);
+    }
+
+    vec3 pNext = p - n * 0.0025;
+    int nextMed = queryMedium(pNext);
+    if (nextMed == med) {
+      pNext = p - n * 0.0065;
+      nextMed = queryMedium(pNext);
+    }
+    if (nextMed == med) {
+      ro = p + rd * 0.006;
+      continue;
+    }
+
+    float n1 = getIOR(med, 0.0);
+    float n2 = getIOR(nextMed, 0.0);
+    float cosI = clamp(-dot(rd, n), 0.0, 1.0);
+    float F = fresnelDielectric(cosI, n1, n2);
+
+    if (med == MED_AIR) {
+      col += throughput * evalDirectLampSpecular(p, n, -rd, surfRough, F);
+    }
+
+    vec3 refr = refract(rd, n, n1 / n2);
+    if (dot(refr, refr) < 0.001) {
+      rd = reflect(rd, n);
+      ro = p + n * 0.0024;
+      throughput *= 0.96;
+    } else {
+      if (F > 0.035 && med == MED_AIR) {
+        col += throughput * F * evalEnvironment(p, reflect(rd, n), false);
+      }
+      throughput *= (1.0 - F);
+      rd = normalize(refr);
+      ro = pNext;
+      med = nextMed;
+    }
+
+    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.012) {
+      exited = true;
+      break;
+    }
+  }
+
+  if (!exited) {
+    col += throughput * finishTrappedRay(ro, rd, med);
+  }
+  return col;
+}
+
+// Trace a single primary camera ray; outputs HDR radiance, depth, and AA tier (0=none, 1=2x edge, 2=4x crystal rim)
+vec3 tracePrimaryRay(vec3 ro, vec3 rd, out float primaryDepth, out int aaLevel) {
+  vec3 totalCol = vec3(0.0);
+  vec3 throughput = vec3(1.0);
+  int med = MED_AIR;
+  primaryDepth = 25.0;
+  bool setPrimaryDepth = false;
+  bool exited = false;
+  aaLevel = 0;
+
+  vec3 reflRo[3];
+  vec3 reflRd[3];
+  vec3 reflW[3];
+  int reflMed[3];
+  int reflCount = 0;
+
+  for (int b = 0; b < 14; b++) {
+    float tTable = (med == MED_AIR && rd.y < -0.0005) ? (-ro.y / rd.y) : 1e9;
+    if (tTable < 0.001) tTable = 1e9;
+
+    vec2 cyl = intersectCyl(ro, rd, 1.18, -0.02, GLASS_H + 0.12);
+    bool canHitGlass = (cyl.x < cyl.y && cyl.y > 0.001);
+    float tStart = (med == MED_AIR) ? max(0.0013, cyl.x) : 0.0014;
+    float tLimit = (med == MED_AIR) ? min(cyl.y, tTable) : 3.8;
+
+    float tHit = 1e9;
+    int surfId = 0;
+    bool hitGlass = false;
+
+    if (canHitGlass && tStart < tLimit) {
+      hitGlass = marchGlassBoundary(ro, rd, med, tStart, tLimit, (b < 4) ? 92 : 56, tHit, surfId);
+    }
+
+    if (!hitGlass) {
+      exited = true;
+      if (med == MED_AIR && tTable < 34.0) {
+        vec3 pt = ro + rd * tTable;
+        if (!setPrimaryDepth) { primaryDepth = tTable; setPrimaryDepth = true; }
+        float barEdge = smoothstep(13.0, 10.6, length(pt.xz));
+        if (barEdge < 0.01) {
+          totalCol += throughput * evalEnvironment(ro, rd, b == 0);
+          break;
+        }
+        vec3 wn; float wr, wf;
+        vec3 woodCol = shadeBarTableBase(pt, -rd, wn, wr, wf);
+
+        vec3 rDir = reflect(rd, wn);
+        float NoV = max(0.0, dot(wn, -rd));
+        float Fwood = wf + (1.0 - wf) * pow(1.0 - NoV, 4.5);
+        float glossScale = mix(0.95, 0.28, smoothstep(0.04, 0.38, wr));
+
+        vec3 tableRefl = evalEnvironment(pt, rDir, false);
+        if (b == 0 && length(pt.xz) < 7.2 && rDir.y > 0.0) {
+          vec2 rc = intersectCyl(pt + wn * 0.004, rDir, 1.16, 0.0, GLASS_H + 0.08);
+          if (rc.x < rc.y && rc.y > 0.0) {
+            vec3 glassRefl = traceSecondary(pt + wn * 0.004, rDir, MED_AIR, 5);
+            tableRefl = mix(tableRefl, glassRefl, mix(0.94, 0.56, smoothstep(0.05, 0.34, wr)));
+          }
+        }
+        woodCol += tableRefl * (Fwood * glossScale * 1.25);
+        totalCol += throughput * mix(evalEnvironment(ro, rd, b == 0), woodCol, barEdge);
+      } else if (med == MED_AIR) {
+        if (!setPrimaryDepth) { primaryDepth = 28.0; setPrimaryDepth = true; }
+        totalCol += throughput * evalEnvironment(ro, rd, b == 0);
+      } else {
+        totalCol += throughput * finishTrappedRay(ro, rd, med);
+      }
+      break;
+    }
+
+    if (!setPrimaryDepth) { primaryDepth = tHit; setPrimaryDepth = true; }
+    vec3 p = ro + rd * tHit;
+
+    // Flag crystal lip for 4x rotated-grid AA, and lower bevel/grazing silhouette for 2x AA
+    if (b == 0 && surfId == 1) {
+      if (p.y > GLASS_H - 0.16) aaLevel = 2;
+      else if (p.y < 0.18) aaLevel = max(aaLevel, 1);
+    }
+
+    // Media optical transport
+    vec3 absCol = exp(-getAbsorption(med) * tHit);
+    if (med == MED_ICE) {
+      vec3 iceScat, iceTrans;
+      evalIceInterior(ro, rd, tHit, iceScat, iceTrans);
+      totalCol += throughput * iceScat;
+      throughput *= iceTrans;
+    } else if (med == MED_WHISKEY) {
+      totalCol += throughput * evalWhiskeyInternalGlow(ro, rd, tHit);
+    }
+    throughput *= absCol;
+
+    // Cleanly resolve Air-Whiskey-Ice triple junction right where meniscus meets emergent ice!
+    if (surfId == 2 && sdIceSimple(p) < 0.005) {
+      surfId = 3;
+    }
+
+    vec3 n = calcSurfaceNormal(p, surfId);
+    if (dot(rd, n) > 0.0) n = -n;
+
+    if (b == 0 && abs(dot(rd, n)) < 0.24) {
+      aaLevel = max(aaLevel, 1);
+    }
+
+    float surfRough = 0.013;
+    float dropMask = 0.0;
+    float frostAmt = 0.0;
+    float dropSlopeY = 0.0;
+    // Apply micro-frost only on direct exterior hits; inside crystal wall TIR bounces skip high-freq frost
+    // so looking down through the top rim stays liquid-smooth without fiber-optic speckle aliasing!
+    bool isDirectOuter = (surfId == 1 && med == MED_AIR);
+    bool isEarlyInnerOuter = (surfId == 1 && med == MED_GLASS && b <= 2 && length(p.xz) > glassOuterR(p.y) - 0.03);
+    if (isDirectOuter || isEarlyInnerOuter) {
+      vec3 baseOutN = isDirectOuter ? n : -n;
+      vec3 pertOutN;
+      sampleCondensation(p, baseOutN, isDirectOuter, pertOutN, surfRough, dropMask, frostAmt, dropSlopeY);
+      n = isDirectOuter ? pertOutN : -pertOutN;
+    } else if (surfId == 3) {
+      surfRough = 0.024; // Wet glistening melting ice
+    } else if (surfId == 2) {
+      surfRough = 0.008; // Mirror-smooth amber whiskey surface
+    }
+
+    vec3 pNext = p - n * 0.0024;
+    int nextMed = queryMedium(pNext);
+    if (nextMed == med) {
+      pNext = p - n * 0.0060;
+      nextMed = queryMedium(pNext);
+    }
+    if (nextMed == med) {
+      // Grazing skim past rounded silhouette -> glide cleanly forward with ZERO dark line!
+      ro = p + rd * 0.0065;
+      continue;
+    }
+
+    float n1 = getIOR(med, 0.0);
+    float n2 = getIOR(nextMed, 0.0);
+    float cosI = clamp(-dot(rd, n), 0.0, 1.0);
+    float F = fresnelDielectric(cosI, n1, n2);
+
+    if (med == MED_AIR) {
+      vec3 directSpec = evalDirectLampSpecular(p, n, -rd, surfRough, F);
+      directSpec *= (1.0 + dropMask * 1.25);
+      totalCol += throughput * directSpec;
+
+      // Subtle glowing inverted amber crescent inside the lower half of each condensation bead
+      if (dropMask > 0.05) {
+        float lowerCrescent = smoothstep(0.06, 0.52, dropSlopeY);
+        float inWhiskeyZone = smoothstep(uLiqLevel + 0.14, uLiqLevel - 0.08, p.y);
+        vec3 dropTint = mix(vec3(1.0, 0.78, 0.46), vec3(1.0, 0.50, 0.10), inWhiskeyZone);
+        totalCol += throughput * dropTint * (dropMask * lowerCrescent * 0.24);
+      }
+
+      // Delicate translucent chilled glass mist (lets rich jewel-like amber whiskey shine vividly!)
+      if (frostAmt > 0.02) {
+        vec3 toL = normalize(uLightPos - p);
+        float wrapL = max(0.0, dot(n, toL) * 0.50 + 0.50);
+        float rimF = pow(1.0 - cosI, 2.4);
+        vec3 mistCol = vec3(0.95, 0.70, 0.42) * frostAmt * (0.018 * wrapL + 0.075 * rimF);
+        totalCol += throughput * mistCol;
+      }
+    } else if (med == MED_GLASS && nextMed == MED_AIR) {
+      vec3 backSpec = evalDirectLampSpecular(p, -n, -rd, 0.022, F * 0.5);
+      totalCol += throughput * backSpec * 0.45;
+    }
+
+    vec3 refr = refract(rd, n, n1 / n2);
+    if (dot(refr, refr) < 0.001) {
+      // Total Internal Reflection!
+      // Prevent thin crystal rim light-pipe bounce noise: after 4 rapid rim bounces, softly pipe golden glow
+      if (med == MED_GLASS && b >= 5 && tHit < 0.12 && p.y > GLASS_H - 0.45) {
+        totalCol += throughput * finishTrappedRay(p, reflect(rd, n), MED_GLASS);
+        exited = true;
+        break;
+      }
+      rd = reflect(rd, n);
+      ro = p + n * 0.0022;
+      throughput *= 0.98;
+    } else {
+      if (reflCount < 3 && F > 0.016 && (med == MED_AIR || (med == MED_GLASS && b < 4))) {
+        reflRo[reflCount] = p + n * 0.0024;
+        reflRd[reflCount] = reflect(rd, n);
+        reflW[reflCount] = throughput * F * (1.0 - frostAmt * 0.30);
+        reflMed[reflCount] = med;
+        reflCount++;
+      } else if (F > 0.02 && med == MED_AIR) {
+        totalCol += throughput * F * evalEnvironment(p, reflect(rd, n), false);
+      }
+
+      if (med == MED_GLASS && nextMed == MED_AIR && (p.y < 0.68 || p.y > GLASS_H - 0.16) && cosI < 0.72) {
+        vec3 refrR = refract(rd, n, getIOR(MED_GLASS, -1.0));
+        vec3 refrB = refract(rd, n, getIOR(MED_GLASS,  1.0));
+        if (dot(refrR, refrR) > 0.001 && dot(refrB, refrB) > 0.001) {
+          float dispAmt = (1.0 - cosI) * 0.34;
+          vec3 envR = evalEnvironment(pNext, normalize(refrR), false);
+          vec3 envB = evalEnvironment(pNext, normalize(refrB), false);
+          totalCol += throughput * (1.0 - F) * vec3(envR.r - envB.r, 0.0, envB.b - envR.b) * dispAmt;
+        }
+      }
+
+      throughput *= (1.0 - F);
+      rd = normalize(refr);
+      ro = pNext;
+      med = nextMed;
+    }
+
+    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.008) {
+      exited = true;
+      break;
+    }
+  }
+
+  if (!exited) {
+    totalCol += throughput * finishTrappedRay(ro, rd, med);
+  }
+
+  for (int r = 0; r < 3; r++) {
+    if (r >= reflCount) break;
+    totalCol += reflW[r] * traceSecondary(reflRo[r], reflRd[r], reflMed[r], (r == 0) ? 5 : 3);
+  }
+
+  return max(totalCol, vec3(0.0));
+}
+
+void main() {
+  float aspect = uResolution.x / uResolution.y;
+  vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
+  vec3 rd = normalize(
+    uCamFwd +
+    uCamRight * (ndc.x * aspect * uTanHalfFov) +
+    uCamUp * (ndc.y * uTanHalfFov)
+  );
+
+  float depth;
+  int aaLevel;
+  vec3 col = tracePrimaryRay(uCamPos, rd, depth, aaLevel);
+
+  // Selective rotated-grid supersampling: 4x on narrow crystal rim (<1.5% pixels), 2x on grazing edges!
+  if (aaLevel == 1) {
+    vec2 subNdc = ((gl_FragCoord.xy + vec2(0.42, -0.38)) / uResolution) * 2.0 - 1.0;
+    vec3 rd2 = normalize(uCamFwd + uCamRight * (subNdc.x * aspect * uTanHalfFov) + uCamUp * (subNdc.y * uTanHalfFov));
+    float d2; int dummy;
+    col = 0.5 * (col + tracePrimaryRay(uCamPos, rd2, d2, dummy));
+  } else if (aaLevel == 2) {
+    vec2 offs[3] = vec2[3](vec2(0.38, -0.18), vec2(-0.18, -0.38), vec2(-0.38, 0.24));
+    vec3 acc = col;
+    for (int s = 0; s < 3; s++) {
+      vec2 subNdc = ((gl_FragCoord.xy + offs[s]) / uResolution) * 2.0 - 1.0;
+      vec3 rds = normalize(uCamFwd + uCamRight * (subNdc.x * aspect * uTanHalfFov) + uCamUp * (subNdc.y * uTanHalfFov));
+      float ds; int dummy;
+      acc += tracePrimaryRay(uCamPos, rds, ds, dummy);
+    }
+    col = acc * 0.25;
+  }
+
+  outColor = vec4(col, depth);
+}
+`;
+
+  // =========================================================================
+  // PASS 3: BLOOM & CINEMATIC POST-PROCESSING (FXAA + DOF + HALATION + ACES)
+  // =========================================================================
+  const BLOOM_EXTRACT_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uSceneTex;
+void main() {
+  vec3 c = texture(uSceneTex, vUv).rgb;
+  float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float soft = smoothstep(0.75, 2.35, luma);
+  vec3 b = min(c * soft, vec3(7.5));
+  outColor = vec4(b, 1.0);
+}
+`;
+
+  const BLUR_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform vec2 uDir;
+void main() {
+  vec3 sum = texture(uTex, vUv).rgb * 0.227027;
+  sum += texture(uTex, vUv + uDir * 1.384615).rgb * 0.316216;
+  sum += texture(uTex, vUv - uDir * 1.384615).rgb * 0.316216;
+  sum += texture(uTex, vUv + uDir * 3.230769).rgb * 0.070270;
+  sum += texture(uTex, vUv - uDir * 3.230769).rgb * 0.070270;
+  outColor = vec4(sum, 1.0);
+}
+`;
+
+  const COMPOSITE_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+
+uniform sampler2D uSceneTex;
+uniform sampler2D uBloomTex;
+uniform vec2 uResolution;
+uniform float uFocusDist;
+uniform float uTime;
+
+vec3 acesToneMap(vec3 x) {
+  const float a = 2.51;
+  const float b = 0.03;
+  const float c = 2.43;
+  const float d = 0.59;
+  const float e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+float luma(vec3 c) {
+  return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+vec3 sampleAntiAliased(vec2 uv, vec2 invRes) {
+  vec3 rgbM  = texture(uSceneTex, uv).rgb;
+  vec3 rgbNW = texture(uSceneTex, uv + vec2(-1.0, -1.0) * invRes).rgb;
+  vec3 rgbNE = texture(uSceneTex, uv + vec2( 1.0, -1.0) * invRes).rgb;
+  vec3 rgbSW = texture(uSceneTex, uv + vec2(-1.0,  1.0) * invRes).rgb;
+  vec3 rgbSE = texture(uSceneTex, uv + vec2( 1.0,  1.0) * invRes).rgb;
+
+  float lM  = luma(rgbM  / (1.0 + rgbM));
+  float lNW = luma(rgbNW / (1.0 + rgbNW));
+  float lNE = luma(rgbNE / (1.0 + rgbNE));
+  float lSW = luma(rgbSW / (1.0 + rgbSW));
+  float lSE = luma(rgbSE / (1.0 + rgbSE));
+
+  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+  if (lMax - lMin < 0.035) return rgbM;
+
+  vec2 dir;
+  dir.x = -((lNW + lNE) - (lSW + lSE));
+  dir.y =  ((lNW + lSW) - (lNE + lSE));
+  float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+  dir = clamp(dir * rcpDirMin, vec2(-4.0), vec2(4.0)) * invRes;
+
+  vec3 rgbA = 0.5 * (
+    texture(uSceneTex, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+    texture(uSceneTex, uv + dir * (2.0 / 3.0 - 0.5)).rgb
+  );
+  vec3 rgbB = rgbA * 0.5 + 0.25 * (
+    texture(uSceneTex, uv + dir * -0.5).rgb +
+    texture(uSceneTex, uv + dir *  0.5).rgb
+  );
+  float lB = luma(rgbB / (1.0 + rgbB));
+  return (lB < lMin || lB > lMax) ? rgbA : rgbB;
+}
+
+void main() {
+  vec2 invRes = 1.0 / uResolution;
+  vec4 center = texture(uSceneTex, vUv);
+  float depth = center.a;
+
+  vec3 hdr = sampleAntiAliased(vUv, invRes);
+
+  // Subtle cinematic shallow Depth of Field focused tightly on the glass, droplets & ice
+  float coc = clamp((abs(depth - uFocusDist) - 1.45) * 0.17, 0.0, 1.0);
+  if (coc > 0.025) {
+    vec2 px = invRes * (coc * 5.0);
+    vec3 acc = hdr;
+    float wSum = 1.0;
+    const float golden = 2.39996323;
+    for (int i = 1; i <= 8; i++) {
+      float fi = float(i);
+      float r = sqrt(fi / 8.0);
+      float ang = fi * golden;
+      vec2 off = vec2(cos(ang), sin(ang)) * r * px;
+      vec4 s = texture(uSceneTex, vUv + off);
+      float sCoc = clamp((abs(s.a - uFocusDist) - 1.45) * 0.17, 0.0, 1.0);
+      float w = smoothstep(0.0, 0.16, sCoc) * (s.a >= depth - 0.8 ? 1.0 : 0.15);
+      acc += s.rgb * w;
+      wSum += w;
+    }
+    hdr = acc / wSum;
+  }
+
+  // Warm cinema lens halation
+  vec3 bloom = texture(uBloomTex, vUv).rgb;
+  hdr += bloom * vec3(0.28, 0.18, 0.10);
+
+  // Filmic exposure & rich jewel-like amber contrast
+  hdr *= 1.20;
+  vec3 col = acesToneMap(hdr);
+
+  // Warm-cinema contrast curve
+  col = pow(col, vec3(0.96, 1.00, 1.06));
+
+  // Natural lens vignette
+  vec2 vig = vUv * 2.0 - 1.0;
+  float vigFactor = 1.0 - dot(vig * vec2(0.56, 0.70), vig * vec2(0.56, 0.70)) * 0.44;
+  col *= clamp(vigFactor, 0.44, 1.0);
+
+  // sRGB encode
+  col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+
+  // Fine photographic film grain
+  float grain = (hash12(gl_FragCoord.xy + fract(uTime) * 137.0) - 0.5) * 0.014;
+  col = clamp(col + grain, 0.0, 1.0);
+
+  outColor = vec4(col, 1.0);
+}
+`;
+
+  // =========================================================================
+  // COMPILE PROGRAMS
+  // =========================================================================
+  const progFrostDecay = createProgram(FULLSCREEN_VS, FROST_DECAY_FS, 'FrostDecay');
+  const progFrostWipe  = createProgram(FROST_WIPE_VS, FROST_WIPE_FS, 'FrostWipe');
+  const progDropSplat  = createProgram(DROP_SPLAT_VS, DROP_SPLAT_FS, 'DropSplat');
+  const progCaustic    = createProgram(CAUSTIC_VS, CAUSTIC_FS, 'Caustic');
+  const progMain       = createProgram(FULLSCREEN_VS, MAIN_FS, 'Main');
+  const progBloomExt   = createProgram(FULLSCREEN_VS, BLOOM_EXTRACT_FS, 'BloomExtract');
+  const progBlur       = createProgram(FULLSCREEN_VS, BLUR_FS, 'Blur');
+  const progComposite  = createProgram(FULLSCREEN_VS, COMPOSITE_FS, 'Composite');
+
+  const emptyVao = gl.createVertexArray();
+
+  // =========================================================================
+  // RENDER TARGETS
+  // =========================================================================
+  const HDR_IFMT = useHalfFloat ? gl.RGBA16F : gl.RGBA8;
+  const HDR_TYPE = useHalfFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+  const HDR_FILT = useHalfFloat ? floatTexFilter : gl.LINEAR;
+
+  // Caustic FBO + Ping-pong blur target for silky, noise-free golden caustic filaments!
+  const CAUSTIC_RES = 512;
+  const CAUSTIC_EXTENT = 5.4;
+  const CAUSTIC_GRID = 192; // 192*192*3 = 110,592 crisp lockstep chromatic photons!
+  const texCaustic     = createTexture(CAUSTIC_RES, CAUSTIC_RES, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT);
+  const fboCaustic     = createFBO(texCaustic);
+  const texCausticTmp  = createTexture(CAUSTIC_RES, CAUSTIC_RES, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT);
+  const fboCausticTmp  = createFBO(texCausticTmp);
+
+  // Condensation FBOs: 16-bit half-float droplet dome height eliminates macro quantization facets!
+  const COND_W = 1024, COND_H = 512;
+  const texFrostA = createTexture(COND_W, COND_H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT, gl.CLAMP_TO_EDGE);
+  const texFrostB = createTexture(COND_W, COND_H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT, gl.CLAMP_TO_EDGE);
+  const fboFrostA = createFBO(texFrostA);
+  const fboFrostB = createFBO(texFrostB);
+  let frostPing = 0;
+
+  const texDrop = createTexture(COND_W, COND_H, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT, gl.REPEAT, gl.CLAMP_TO_EDGE);
+  const fboDrop = createFBO(texDrop);
+
+  let renderW = 0, renderH = 0, bloomW = 0, bloomH = 0;
+  let texScene = null, fboScene = null;
+  let texBloomA = null, fboBloomA = null;
+  let texBloomB = null, fboBloomB = null;
+
+  function resizeFBOs(w, h) {
+    if (w === renderW && h === renderH) return;
+    renderW = w;
+    renderH = h;
+    bloomW = Math.max(64, Math.floor(w / 4));
+    bloomH = Math.max(64, Math.floor(h / 4));
+
+    if (texScene) {
+      gl.deleteTexture(texScene); gl.deleteFramebuffer(fboScene);
+      gl.deleteTexture(texBloomA); gl.deleteFramebuffer(fboBloomA);
+      gl.deleteTexture(texBloomB); gl.deleteFramebuffer(fboBloomB);
+    }
+    texScene  = createTexture(renderW, renderH, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT);
+    fboScene  = createFBO(texScene);
+    texBloomA = createTexture(bloomW, bloomH, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT);
+    fboBloomA = createFBO(texBloomA);
+    texBloomB = createTexture(bloomW, bloomH, HDR_IFMT, gl.RGBA, HDR_TYPE, HDR_FILT);
+    fboBloomB = createFBO(texBloomB);
+  }
+
+  // =========================================================================
+  // CONDENSATION DROPLET PHYSICS (Multi-Scale Beads, Coalescence, Running Trails)
+  // =========================================================================
+  const MAX_DROPS = 620;
+  const drops = [];
+  const dropData = new Float32Array(MAX_DROPS * 4);
+  const dropVao = gl.createVertexArray();
+  const dropVbo = gl.createBuffer();
+  gl.bindVertexArray(dropVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, dropVbo);
+  gl.bufferData(gl.ARRAY_BUFFER, dropData.byteLength, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  const LIQ_LEVEL_BASE = 1.44;
+  const LIQ_NORM_Y = (LIQ_LEVEL_BASE - 0.05) / (2.34 - 0.12); // ~0.626
+
+  function spawnDrop(d, initial = false) {
+    d.u = Math.random();
+    const tier = Math.random();
+    if (tier < 0.86) {
+      // Cold whiskey zone: realistic distribution of delicate pinhead beads & plump drops
+      d.v = 0.18 + Math.random() * (LIQ_NORM_Y - 0.14);
+      d.r = initial
+        ? (0.0028 + Math.pow(Math.random(), 3.0) * 0.0125)
+        : (0.0025 + Math.random() * 0.0022);
+    } else {
+      // Very fine tiny condensation mist beads just above the meniscus
+      d.v = LIQ_NORM_Y + 0.01 + Math.random() * 0.08;
+      d.r = 0.0024 + Math.pow(Math.random(), 2.8) * 0.0045;
+    }
+    d.growth = (0.00018 + Math.random() * 0.00038) * (d.v < LIQ_NORM_Y + 0.01 ? 1.25 : 0.16);
+    d.critR = 0.0132 + Math.random() * 0.0046;
+    d.sliding = false;
+    d.vy = 0;
+    d.wobblePhase = Math.random() * Math.PI * 2;
+    d.wobbleFreq = 1.6 + Math.random() * 2.4;
+    d.slideAmt = 0;
+  }
+
+  for (let i = 0; i < MAX_DROPS; i++) {
+    const d = {};
+    spawnDrop(d, true);
+    if (i < 20) {
+      d.v = 0.24 + Math.random() * (LIQ_NORM_Y - 0.22);
+      d.r = 0.0132 + Math.random() * 0.0048;
+      d.sliding = true;
+      d.vy = 0.018 + Math.random() * 0.026;
+      d.slideAmt = 0.85;
+    }
+    drops.push(d);
+  }
+
+  function stepCondensation(dt) {
+    const clampedDt = Math.min(dt, 0.05);
+    for (let i = 0; i < MAX_DROPS; i++) {
+      const d = drops[i];
+      if (!d.sliding) {
+        const inCold = (d.v > 0.17 && d.v < LIQ_NORM_Y + 0.02) ? 1.0 : 0.12;
+        d.r += d.growth * inCold * clampedDt;
+        d.slideAmt = Math.max(0, d.slideAmt - clampedDt * 2.0);
+        if (d.r >= d.critR && d.v < LIQ_NORM_Y + 0.03) {
+          d.sliding = true;
+          d.vy = 0.007 + Math.random() * 0.010;
+        }
+      } else {
+        d.wobblePhase += clampedDt * d.wobbleFreq;
+        const stickSlip = 0.56 + 0.44 * Math.sin(d.wobblePhase * 1.85);
+        const massBoost = Math.max(0.5, (d.r - 0.010) * 145.0);
+        d.vy = Math.min(0.10, d.vy + clampedDt * 0.028 * massBoost) * (0.97 + 0.03 * stickSlip);
+        d.v -= d.vy * stickSlip * clampedDt;
+        d.u = (d.u + Math.sin(d.wobblePhase * 2.2) * 0.0046 * clampedDt + 1.0) % 1.0;
+        d.slideAmt = Math.min(1.0, d.slideAmt + clampedDt * 3.5);
+
+        for (let j = 0; j < MAX_DROPS; j++) {
+          if (i === j) continue;
+          const o = drops[j];
+          if (o.sliding) continue;
+          let du = Math.abs(d.u - o.u);
+          if (du > 0.5) du = 1.0 - du;
+          const dv = d.v - o.v;
+          const dist = Math.hypot(du * 2.68, dv);
+          if (dist < (d.r + o.r) * 0.90) {
+            const vol = d.r * d.r * d.r + o.r * o.r * o.r;
+            d.r = Math.min(0.0195, Math.cbrt(vol));
+            d.vy += 0.006;
+            spawnDrop(o, false);
+          }
+        }
+
+        if (d.v < 0.07) {
+          spawnDrop(d, false);
+        }
+      }
+
+      const o4 = i * 4;
+      dropData[o4]     = d.u;
+      dropData[o4 + 1] = d.v;
+      dropData[o4 + 2] = d.r;
+      dropData[o4 + 3] = d.sliding ? d.slideAmt : 0.0;
+    }
+  }
+
+  // =========================================================================
+  // ICE CUBES PHYSICS: SLOW MELTING, BUOYANCY BOBBING, & OCCASIONAL SHIFTING
+  // =========================================================================
+  function quatFromEuler(rx, ry, rz) {
+    const cx = Math.cos(rx * 0.5), sx = Math.sin(rx * 0.5);
+    const cy = Math.cos(ry * 0.5), sy = Math.sin(ry * 0.5);
+    const cz = Math.cos(rz * 0.5), sz = Math.sin(rz * 0.5);
+    return [
+      sx * cy * cz - cx * sy * sz,
+      cx * sy * cz + sx * cy * sz,
+      cx * cy * sz - sx * sy * cz,
+      cx * cy * cz + sx * sy * sz
+    ];
+  }
+
+  const iceState = [
+    {
+      basePos: [-0.20, 1.28, 0.17],
+      baseSize: [0.242, 0.232, 0.238],
+      baseRound: 0.062,
+      baseRot: [0.34, 0.52, -0.26],
+      rotVel: [0.005, 0.017, -0.004],
+      shiftTargetRot: [0, 0, 0],
+      shiftCurRot: [0, 0, 0],
+      shiftNextTime: 7.0,
+      bobFreq: 0.72, bobPhase: 0.2,
+      rippleAmp: 0.0034, ripplePhase: 0.0
+    },
+    {
+      basePos: [0.26, 1.22, -0.13],
+      baseSize: [0.232, 0.222, 0.228],
+      baseRound: 0.058,
+      baseRot: [-0.40, -0.76, 0.38],
+      rotVel: [-0.005, -0.014, 0.006],
+      shiftTargetRot: [0, 0, 0],
+      shiftCurRot: [0, 0, 0],
+      shiftNextTime: 13.5,
+      bobFreq: 0.85, bobPhase: 2.1,
+      rippleAmp: 0.0029, ripplePhase: 1.5
+    },
+    {
+      basePos: [0.02, 0.84, -0.15],
+      baseSize: [0.228, 0.212, 0.224],
+      baseRound: 0.066,
+      baseRot: [0.20, 1.18, 0.26],
+      rotVel: [0.003, 0.010, -0.004],
+      shiftTargetRot: [0, 0, 0],
+      shiftCurRot: [0, 0, 0],
+      shiftNextTime: 20.0,
+      bobFreq: 0.58, bobPhase: 4.3,
+      rippleAmp: 0.0018, ripplePhase: 3.0
+    }
+  ];
+
+  const icePosFlat  = new Float32Array(12);
+  const iceQuatFlat = new Float32Array(12);
+  const iceSizeFlat = new Float32Array(12);
+  const rippleFlat  = new Float32Array(12);
+
+  function updateIceSimulation(t, dt) {
+    const meltCycle = (t % 200.0) / 200.0;
+    const melt = meltCycle < 0.90 ? (meltCycle / 0.90) : (1.0 - (meltCycle - 0.90) / 0.10);
+    const smoothMelt = melt * melt * (3.0 - 2.0 * melt);
+
+    for (let i = 0; i < 3; i++) {
+      const c = iceState[i];
+      if (t >= c.shiftNextTime) {
+        c.shiftNextTime = t + 10.0 + Math.random() * 8.0;
+        c.shiftTargetRot[0] += (Math.random() - 0.5) * 0.44;
+        c.shiftTargetRot[1] += (Math.random() - 0.5) * 0.56;
+        c.shiftTargetRot[2] += (Math.random() - 0.5) * 0.44;
+        c.rippleAmp = 0.0095;
+      }
+
+      const kLerp = 1.0 - Math.exp(-dt * 1.15);
+      c.shiftCurRot[0] += (c.shiftTargetRot[0] - c.shiftCurRot[0]) * kLerp;
+      c.shiftCurRot[1] += (c.shiftTargetRot[1] - c.shiftCurRot[1]) * kLerp;
+      c.shiftCurRot[2] += (c.shiftTargetRot[2] - c.shiftCurRot[2]) * kLerp;
+
+      c.rippleAmp += (0.0030 - c.rippleAmp) * (1.0 - Math.exp(-dt * 0.9));
+      c.ripplePhase += dt * 4.2;
+
+      const shrink = 1.0 - smoothMelt * 0.24;
+      const sx = c.baseSize[0] * shrink;
+      const sy = c.baseSize[1] * shrink;
+      const sz = c.baseSize[2] * shrink;
+      const rad = c.baseRound + smoothMelt * 0.045;
+
+      const swayAng = t * 0.065 + i * 2.1;
+      const bobY = Math.sin(t * c.bobFreq + c.bobPhase) * 0.016;
+      const driftR = 0.026 * Math.sin(t * 0.11 + i * 1.7);
+      const meltSink = (i < 2) ? (smoothMelt * 0.028) : (-smoothMelt * 0.030);
+      const px = c.basePos[0] * (1.0 - smoothMelt * 0.08) + Math.cos(swayAng) * driftR;
+      const py = c.basePos[1] + bobY + meltSink;
+      const pz = c.basePos[2] * (1.0 - smoothMelt * 0.08) + Math.sin(swayAng) * driftR;
+
+      const rx = c.baseRot[0] + c.shiftCurRot[0] + Math.sin(t * 0.52 + i * 1.4) * 0.065 + t * c.rotVel[0];
+      const ry = c.baseRot[1] + c.shiftCurRot[1] + t * c.rotVel[1];
+      const rz = c.baseRot[2] + c.shiftCurRot[2] + Math.cos(t * 0.46 + i * 2.3) * 0.065 + t * c.rotVel[2];
+      const q = quatFromEuler(rx, ry, rz);
+
+      const o = i * 4;
+      icePosFlat[o]     = px;
+      icePosFlat[o + 1] = py;
+      icePosFlat[o + 2] = pz;
+      icePosFlat[o + 3] = smoothMelt;
+
+      iceQuatFlat[o]     = q[0];
+      iceQuatFlat[o + 1] = q[1];
+      iceQuatFlat[o + 2] = q[2];
+      iceQuatFlat[o + 3] = q[3];
+
+      iceSizeFlat[o]     = sx;
+      iceSizeFlat[o + 1] = sy;
+      iceSizeFlat[o + 2] = sz;
+      iceSizeFlat[o + 3] = rad;
+
+      rippleFlat[o]     = px;
+      rippleFlat[o + 1] = pz;
+      rippleFlat[o + 2] = c.ripplePhase;
+      rippleFlat[o + 3] = c.rippleAmp;
+    }
+  }
+
+  // =========================================================================
+  // INTERACTIVE CAMERA: 360° DRAG, SCROLL ZOOM, TOUCH PINCH, SMOOTH AUTO-ORBIT
+  // =========================================================================
+  const LIGHT_POS = [3.75, 4.02, -2.05];
+  const AUTO_RESUME_DELAY = 3.8;
+  const AUTO_ORBIT_SPEED = 0.115;
+
+  const cam = {
+    yaw: -0.35,
+    pitch: 0.185,
+    dist: 5.35,
+    targetYaw: -0.35,
+    targetPitch: 0.185,
+    targetDist: 5.35,
+    velYaw: 0.0,
+    velPitch: 0.0,
+    lastInputTime: -999,
+    orbitBlend: 1.0,
+    isInteracting: false
+  };
+
+  function markInteraction(nowSec) {
+    cam.lastInputTime = nowSec;
+    cam.orbitBlend = 0.0;
+    hintEl.classList.add('hidden');
+  }
+
+  const activePointers = new Map();
+  let lastPinchDist = null;
+  let lastSinglePos = null;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    cam.isInteracting = true;
+    cam.velYaw = 0;
+    cam.velPitch = 0;
+    markInteraction(performance.now() * 0.001);
+
+    if (activePointers.size === 1) {
+      lastSinglePos = { x: e.clientX, y: e.clientY };
+      lastPinchDist = null;
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      lastPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      lastSinglePos = null;
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    markInteraction(performance.now() * 0.001);
+
+    if (activePointers.size === 1 && lastSinglePos) {
+      const dx = e.clientX - lastSinglePos.x;
+      const dy = e.clientY - lastSinglePos.y;
+      lastSinglePos = { x: e.clientX, y: e.clientY };
+
+      const sens = 0.0056;
+      cam.targetYaw -= dx * sens;
+      cam.targetPitch = Math.max(0.048, Math.min(1.36, cam.targetPitch + dy * sens));
+      cam.velYaw = -dx * sens * 0.45;
+      cam.velPitch = dy * sens * 0.45;
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (lastPinchDist && dist > 5) {
+        const scale = lastPinchDist / dist;
+        cam.targetDist = Math.max(2.65, Math.min(10.0, cam.targetDist * scale));
+      }
+      lastPinchDist = dist;
+    }
+  });
+
+  function endPointer(e) {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size === 1) {
+      const remaining = Array.from(activePointers.values())[0];
+      lastSinglePos = { x: remaining.x, y: remaining.y };
+      lastPinchDist = null;
+    } else if (activePointers.size === 0) {
+      cam.isInteracting = false;
+      lastSinglePos = null;
+      lastPinchDist = null;
+      cam.lastInputTime = performance.now() * 0.001;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('lostpointercapture', endPointer);
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    markInteraction(performance.now() * 0.001);
+    const scale = e.ctrlKey ? 0.011 : 0.0038;
+    const zoomStep = Math.sign(e.deltaY) * Math.min(Math.abs(e.deltaY), 140) * scale;
+    cam.targetDist = Math.max(2.65, Math.min(10.0, cam.targetDist * (1.0 + zoomStep)));
+  }, { passive: false });
+
+  canvas.addEventListener('gesturestart', (e) => e.preventDefault(), { passive: false });
+  canvas.addEventListener('gesturechange', (e) => e.preventDefault(), { passive: false });
+
+  // =========================================================================
+  // UNIFORM LOCATIONS
+  // =========================================================================
+  function getUniforms(prog, names) {
+    const map = {};
+    for (const n of names) map[n] = gl.getUniformLocation(prog, n);
+    return map;
+  }
+
+  const uFrostDecay = getUniforms(progFrostDecay, ['uPrevFrost', 'uDt', 'uLiqNormY']);
+  const uCaustic    = getUniforms(progCaustic, [
+    'uTime', 'uLiqLevel', 'uLightPos', 'uIcePos', 'uIceQuat', 'uIceSize', 'uRipple',
+    'uCausticExtent', 'uGridSize'
+  ]);
+  const uMain       = getUniforms(progMain, [
+    'uTime', 'uLiqLevel', 'uLightPos', 'uIcePos', 'uIceQuat', 'uIceSize', 'uRipple',
+    'uResolution', 'uCamPos', 'uCamRight', 'uCamUp', 'uCamFwd', 'uTanHalfFov',
+    'uCausticExtent', 'uCausticTex', 'uDropTex', 'uFrostTex'
+  ]);
+  const uBloomExt   = getUniforms(progBloomExt, ['uSceneTex']);
+  const uBlur       = getUniforms(progBlur, ['uTex', 'uDir']);
+  const uComposite  = getUniforms(progComposite, ['uSceneTex', 'uBloomTex', 'uResolution', 'uFocusDist', 'uTime']);
+
+  function uploadSharedUniforms(u, t) {
+    gl.uniform1f(u.uTime, t);
+    gl.uniform1f(u.uLiqLevel, LIQ_LEVEL_BASE);
+    gl.uniform3fv(u.uLightPos, LIGHT_POS);
+    gl.uniform4fv(u.uIcePos, icePosFlat);
+    gl.uniform4fv(u.uIceQuat, iceQuatFlat);
+    gl.uniform4fv(u.uIceSize, iceSizeFlat);
+    gl.uniform4fv(u.uRipple, rippleFlat);
+  }
+
+  // =========================================================================
+  // CONDENSATION PASS EXECUTION & PRE-WARM
+  // =========================================================================
+  function renderCondensationPasses(dt) {
+    stepCondensation(dt);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, dropVbo);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, dropData);
+
+    const srcFrostTex = frostPing === 0 ? texFrostA : texFrostB;
+    const dstFrostFbo = frostPing === 0 ? fboFrostB : fboFrostA;
+    frostPing = 1 - frostPing;
+
+    gl.viewport(0, 0, COND_W, COND_H);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFrostFbo);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progFrostDecay);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, srcFrostTex);
+    gl.uniform1i(uFrostDecay.uPrevFrost, 0);
+    gl.uniform1f(uFrostDecay.uDt, dt);
+    gl.uniform1f(uFrostDecay.uLiqNormY, LIQ_NORM_Y);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(progFrostWipe);
+    gl.bindVertexArray(dropVao);
+    gl.drawArrays(gl.POINTS, 0, MAX_DROPS);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboDrop);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.MAX);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progDropSplat);
+    gl.bindVertexArray(dropVao);
+    gl.drawArrays(gl.POINTS, 0, MAX_DROPS);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.disable(gl.BLEND);
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboFrostA);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboFrostB);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  for (let i = 0; i < 190; i++) {
+    renderCondensationPasses(0.22);
+  }
+
+  // =========================================================================
+  // ADAPTIVE RESOLUTION & RENDER LOOP
+  // =========================================================================
+  let qualityScale = 1.0;
+  let avgFrameMs = 16.0;
+  let lastPerf = performance.now();
+  let startPerf = lastPerf;
+
+  function updateCanvasSize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const maxDim = 1540 * qualityScale;
+    let w = Math.round(cssW * dpr * qualityScale);
+    let h = Math.round(cssH * dpr * qualityScale);
+    const scale = Math.min(1.0, maxDim / Math.max(w, h, 1));
+    w = Math.max(320, Math.round(w * scale));
+    h = Math.max(240, Math.round(h * scale));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    resizeFBOs(w, h);
+  }
+
+  window.addEventListener('resize', updateCanvasSize);
+  updateCanvasSize();
+
+  function frame(nowMs) {
+    const dt = Math.min((nowMs - lastPerf) * 0.001, 0.06);
+    const frameMs = nowMs - lastPerf;
+    lastPerf = nowMs;
+    const t = (nowMs - startPerf) * 0.001;
+    const nowSec = nowMs * 0.001;
+
+    if (t > 1.5 && frameMs < 200) {
+      avgFrameMs = avgFrameMs * 0.94 + frameMs * 0.06;
+      if (avgFrameMs > 38.0 && qualityScale > 0.68) {
+        qualityScale = Math.max(0.68, qualityScale - 0.03);
+        updateCanvasSize();
+      } else if (avgFrameMs < 18.0 && qualityScale < 1.0) {
+        qualityScale = Math.min(1.0, qualityScale + 0.02);
+        updateCanvasSize();
+      }
+    }
+
+    // 1. Update camera inertia, damping & smooth automatic orbit resumption
+    const idleTime = nowSec - cam.lastInputTime;
+    if (!cam.isInteracting) {
+      if (idleTime > AUTO_RESUME_DELAY) {
+        cam.orbitBlend = Math.min(1.0, cam.orbitBlend + dt * 0.42);
+      }
+      cam.targetYaw += cam.velYaw;
+      cam.targetPitch = Math.max(0.048, Math.min(1.36, cam.targetPitch + cam.velPitch));
+      const damp = Math.exp(-dt * 6.5);
+      cam.velYaw *= damp;
+      cam.velPitch *= damp;
+
+      const easeBlend = cam.orbitBlend * cam.orbitBlend * (3.0 - 2.0 * cam.orbitBlend);
+      cam.targetYaw += AUTO_ORBIT_SPEED * easeBlend * dt;
+      const breathPitch = 0.185 + Math.sin(t * 0.24) * 0.030;
+      cam.targetPitch += (breathPitch - cam.targetPitch) * (0.14 * easeBlend * dt);
+    }
+
+    const follow = 1.0 - Math.exp(-dt * 11.0);
+    cam.yaw   += (cam.targetYaw - cam.yaw) * follow;
+    cam.pitch += (cam.targetPitch - cam.pitch) * follow;
+    cam.dist  += (cam.targetDist - cam.dist) * follow;
+
+    const targetY = 1.08 - Math.max(0, 0.16 - cam.pitch) * 0.32;
+    const target = [0.0, targetY, 0.0];
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const cy = Math.cos(cam.yaw),   sy = Math.sin(cam.yaw);
+    const camPos = [
+      target[0] + cam.dist * cp * sy,
+      Math.max(0.14, target[1] + cam.dist * sp),
+      target[2] + cam.dist * cp * cy
+    ];
+
+    let fx = target[0] - camPos[0], fy = target[1] - camPos[1], fz = target[2] - camPos[2];
+    const fl = Math.hypot(fx, fy, fz);
+    fx /= fl; fy /= fl; fz /= fl;
+    let rx = -fz, ry = 0.0, rz = fx;
+    const rl = Math.hypot(rx, ry, rz) || 1.0;
+    rx /= rl; rz /= rl;
+    const ux = ry * fz - rz * fy;
+    const uy = rz * fx - rx * fz;
+    const uz = rx * fy - ry * fx;
+
+    // 2. Step ice & condensation simulations
+    updateIceSimulation(t, dt);
+    renderCondensationPasses(dt);
+    const curFrostTex = frostPing === 0 ? texFrostA : texFrostB;
+
+    // 3. Pass 1: GPU-Traced Lockstep 3-Wavelength Caustic Photon Map + Smooth 2-Pass Filter
+    gl.viewport(0, 0, CAUSTIC_RES, CAUSTIC_RES);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboCaustic);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progCaustic);
+    uploadSharedUniforms(uCaustic, t);
+    gl.uniform1f(uCaustic.uCausticExtent, CAUSTIC_EXTENT);
+    gl.uniform1i(uCaustic.uGridSize, CAUSTIC_GRID);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.POINTS, 0, CAUSTIC_GRID * CAUSTIC_GRID * 3);
+    gl.disable(gl.BLEND);
+
+    // Tight 2-pass Gaussian filter preserves sharp golden caustic arcs while keeping outer spill silky!
+    gl.useProgram(progBlur);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboCausticTmp);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texCaustic);
+    gl.uniform1i(uBlur.uTex, 0);
+    gl.uniform2f(uBlur.uDir, 0.85 / CAUSTIC_RES, 0.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboCaustic);
+    gl.bindTexture(gl.TEXTURE_2D, texCausticTmp);
+    gl.uniform2f(uBlur.uDir, 0.0, 0.85 / CAUSTIC_RES);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 4. Pass 2: Main Multi-Bounce Ray-Traced Scene
+    gl.viewport(0, 0, renderW, renderH);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene);
+    gl.useProgram(progMain);
+    uploadSharedUniforms(uMain, t);
+    gl.uniform2f(uMain.uResolution, renderW, renderH);
+    gl.uniform3fv(uMain.uCamPos, camPos);
+    gl.uniform3f(uMain.uCamRight, rx, ry, rz);
+    gl.uniform3f(uMain.uCamUp, ux, uy, uz);
+    gl.uniform3f(uMain.uCamFwd, fx, fy, fz);
+    gl.uniform1f(uMain.uTanHalfFov, Math.tan(17.5 * Math.PI / 180));
+    gl.uniform1f(uMain.uCausticExtent, CAUSTIC_EXTENT);
+
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texCaustic);
+    gl.uniform1i(uMain.uCausticTex, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texDrop);
+    gl.uniform1i(uMain.uDropTex, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, curFrostTex);
+    gl.uniform1i(uMain.uFrostTex, 2);
+
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 5. Pass 3: Bloom Extract + Dual Separable Gaussian Blur
+    gl.viewport(0, 0, bloomW, bloomH);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBloomA);
+    gl.useProgram(progBloomExt);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texScene);
+    gl.uniform1i(uBloomExt.uSceneTex, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.useProgram(progBlur);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBloomB);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texBloomA);
+    gl.uniform1i(uBlur.uTex, 0);
+    gl.uniform2f(uBlur.uDir, 1.4 / bloomW, 0.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBloomA);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texBloomB);
+    gl.uniform2f(uBlur.uDir, 0.0, 1.4 / bloomH);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 6. Pass 4: Final Cinematic Composite (FXAA + DOF + Halation + ACES + Vignette + Grain)
+    gl.viewport(0, 0, renderW, renderH);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(progComposite);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texScene);
+    gl.uniform1i(uComposite.uSceneTex, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texBloomA);
+    gl.uniform1i(uComposite.uBloomTex, 1);
+    gl.uniform2f(uComposite.uResolution, renderW, renderH);
+    gl.uniform1f(uComposite.uFocusDist, Math.max(1.2, cam.dist - 0.52));
+    gl.uniform1f(uComposite.uTime, t);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,3090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Ridge Wildfire — Night Valley</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #040406;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas.dragging { cursor: grabbing; }
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: rgba(12, 9, 8, 0.45);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 165, 95, 0.16);
+    color: rgba(255, 224, 195, 0.78);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 1.4s ease;
+    white-space: nowrap;
+    z-index: 10;
+  }
+  #hint.hidden { opacity: 0; }
+  #err {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #0a0706;
+    color: #ffb88c;
+    padding: 32px;
+    font-family: monospace;
+    white-space: pre-wrap;
+    overflow: auto;
+    z-index: 100;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="hint">Drag to look 360° &middot; Scroll or pinch to zoom</div>
+<div id="err"></div>
+
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('glcanvas');
+const hintEl = document.getElementById('hint');
+const errEl = document.getElementById('err');
+
+function showError(msg) {
+  console.error(msg);
+  errEl.style.display = 'block';
+  errEl.textContent = msg;
+}
+
+const params = new URLSearchParams(window.location.search);
+const PARAM_FREEZE = params.get('freeze') === '1';
+const PARAM_T = params.has('t') ? parseFloat(params.get('t')) : null;
+const PARAM_YAW = params.has('yaw') ? parseFloat(params.get('yaw')) : null;
+const PARAM_PITCH = params.has('pitch') ? parseFloat(params.get('pitch')) : null;
+const PARAM_FOV = params.has('fov') ? parseFloat(params.get('fov')) : null;
+const PARAM_HUD = params.get('hud');
+if (PARAM_HUD === '0' || PARAM_FREEZE) {
+  hintEl.style.display = 'none';
+}
+
+const gl = canvas.getContext('webgl2', {
+  antialias: false,
+  alpha: false,
+  depth: false,
+  stencil: false,
+  powerPreference: 'high-performance',
+  preserveDrawingBuffer: PARAM_FREEZE
+});
+if (!gl) {
+  showError('WebGL2 is required to view this scene.');
+  return;
+}
+
+const extFloat = gl.getExtension('EXT_color_buffer_float');
+const extHalfFloat = gl.getExtension('EXT_color_buffer_half_float');
+const extFloatLinear = gl.getExtension('OES_texture_float_linear');
+gl.getExtension('OES_texture_half_float_linear');
+
+const HDR_INTERNAL = extFloat ? gl.RGBA16F : (extHalfFloat ? gl.RGBA16F : gl.RGBA8);
+const HDR_TYPE = (extFloat || extHalfFloat) ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+
+// ============================================================================
+// DETERMINISTIC RNG & PROCEDURAL NOISE (CPU — shared terrain/tree/fire setup)
+// ============================================================================
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hash2(ix, iz) {
+  let n = Math.imul(ix, 374761393) + Math.imul(iz, 668265263);
+  n = (n ^ (n >>> 13)) >>> 0;
+  n = Math.imul(n, 1274126177) >>> 0;
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+
+function valueNoise2D(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = x - ix, fz = z - iz;
+  const ux = fx * fx * (3.0 - 2.0 * fx);
+  const uz = fz * fz * (3.0 - 2.0 * fz);
+  const a = hash2(ix, iz);
+  const b = hash2(ix + 1, iz);
+  const c = hash2(ix, iz + 1);
+  const d = hash2(ix + 1, iz + 1);
+  return a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz;
+}
+
+function fbm2D(x, z, octaves = 5) {
+  let v = 0, amp = 0.5, freq = 1.0, norm = 0;
+  for (let i = 0; i < octaves; i++) {
+    v += amp * valueNoise2D(x * freq, z * freq);
+    norm += amp;
+    // Slight rotation per octave to eliminate grid alignment
+    const nx = x * 0.8 - z * 0.6;
+    const nz = x * 0.6 + z * 0.8;
+    x = nx + 17.3; z = nz - 11.7;
+    freq *= 2.03;
+    amp *= 0.5;
+  }
+  return v / norm;
+}
+
+function ridged2D(x, z, octaves = 5) {
+  let v = 0, amp = 0.52, freq = 1.0, weight = 1.0, norm = 0;
+  for (let i = 0; i < octaves; i++) {
+    let n = 1.0 - Math.abs(valueNoise2D(x * freq, z * freq) * 2.0 - 1.0);
+    n = n * n * weight;
+    weight = Math.min(1.0, Math.max(0.15, n * 1.6));
+    v += n * amp;
+    norm += amp;
+    const nx = x * 0.8 - z * 0.6;
+    const nz = x * 0.6 + z * 0.8;
+    x = nx + 31.1; z = nz + 19.4;
+    freq *= 2.07;
+    amp *= 0.5;
+  }
+  return v / norm;
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function smoothstep(e0, e1, x) {
+  const t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ============================================================================
+// WORLD GEOMETRY: MOUNTAIN VALLEY & BURNING RIDGE
+// ============================================================================
+const WORLD_HALF = 1250.0;
+const WORLD_SIZE = WORLD_HALF * 2.0;
+
+// Sweeping arc of the main burning mountain ridge to the North (-Z)
+function ridgeCurveZ(x) {
+  return -235.0
+    + 0.00038 * x * x
+    + 42.0 * Math.sin(x * 0.0046 + 0.55)
+    + 22.0 * Math.cos(x * 0.0092 - 0.4);
+}
+
+// Camera valley floor corridor (gentle winding East-West valley centered near z=315)
+function valleyPathPos(phase) {
+  // Smooth continuous figure-8 / lazy sweeping curve along valley floor
+  const x = Math.sin(phase) * 105.0 + Math.sin(phase * 2.0 + 0.7) * 22.0;
+  const z = 318.0 + Math.cos(phase * 0.85) * 34.0 + Math.sin(phase * 1.7) * 14.0;
+  return { x, z };
+}
+
+function distToCameraCorridor(x, z) {
+  // Approximate clearance around the drifting valley path
+  const nx = x / 135.0;
+  const nz = (z - 318.0) / 56.0;
+  const dEll = Math.sqrt(nx * nx + nz * nz);
+  return Math.max(0.0, (dEll - 1.0) * 65.0);
+}
+
+// Analytical mountain valley heightfield (in meters)
+function computeHeight(x, z) {
+  // 1. Main burning mountain massif along ridgeCurveZ(x)
+  const rz = ridgeCurveZ(x);
+  const dzR = z - rz;
+  // Slightly steeper valley-facing front slope, broader back slope
+  const slopeWidth = dzR > 0 ? 225.0 : 320.0;
+  const ridgeEnv = Math.exp(-(dzR * dzR) / (2.0 * slopeWidth * slopeWidth));
+
+  // Dramatic asymmetric peaks and saddle profile along the ridge
+  const peakLeft   = 1.05 * Math.exp(-Math.pow((x + 275.0) / 185.0, 2.0));
+  const peakCenter = 1.18 * Math.exp(-Math.pow((x - 105.0) / 175.0, 2.0));
+  const peakRight  = 0.92 * Math.exp(-Math.pow((x - 425.0) / 210.0, 2.0));
+  const peakFarL   = 0.85 * Math.exp(-Math.pow((x + 580.0) / 240.0, 2.0));
+  const baseCrest  = 0.68 + 0.36 * peakLeft + 0.42 * peakCenter + 0.28 * peakRight + 0.25 * peakFarL;
+
+  const crag = ridged2D(x * 0.0029 + 3.1, z * 0.0029 - 1.7, 5);
+  const detail = fbm2D(x * 0.011 - 4.2, z * 0.011 + 2.8, 4);
+  // Steep down-slope erosion couloirs/ribs radiating off the front face
+  const ribNoise = ridged2D(x * 0.0145 + 1.4, z * 0.0042 + 7.1, 3);
+  const frontFaceMask = smoothstep(0.0, 90.0, dzR) * smoothstep(310.0, 120.0, dzR);
+
+  let h = ridgeEnv * (175.0 * baseCrest + 98.0 * crag - 22.0 * frontFaceMask * (1.0 - ribNoise));
+
+  // 2. Interlocking midground dark foothill spurs (creates iconic depth layering!)
+  // Left spur jutting in from West-Northwest
+  const lsDx = (x + 295.0) / 220.0;
+  const lsDz = (z - 72.0 - 0.18 * (x + 295.0)) / 108.0;
+  const leftSpur = Math.exp(-(lsDx * lsDx + lsDz * lsDz)) * (92.0 + 34.0 * crag);
+  h = Math.max(h, leftSpur) + 0.28 * Math.min(h, leftSpur);
+
+  // Right spur jutting in from East-Northeast
+  const rsDx = (x - 315.0) / 230.0;
+  const rsDz = (z - 48.0 + 0.16 * (x - 315.0)) / 112.0;
+  const rightSpur = Math.exp(-(rsDx * rsDx + rsDz * rsDz)) * (98.0 + 36.0 * crag);
+  h = Math.max(h, rightSpur) + 0.26 * Math.min(h, rightSpur);
+
+  // Secondary lower dark knolls framing the valley edges
+  const lk = Math.exp(-(Math.pow((x + 225.0) / 115.0, 2.0) + Math.pow((z - 220.0) / 78.0, 2.0))) * 34.0;
+  const rk = Math.exp(-(Math.pow((x - 240.0) / 120.0, 2.0) + Math.pow((z - 235.0) / 82.0, 2.0))) * 38.0;
+  h += lk + rk;
+
+  // 3. Full 360-degree surrounding valley walls (East, West, and South behind camera)
+  const vx = (x) / 690.0;
+  const vz = (z - 305.0) / 520.0;
+  const basinR = Math.sqrt(vx * vx + vz * vz);
+  const outerRim = smoothstep(0.68, 1.38, basinR);
+  // Modulate South/East/West heights so opposite ridges feel natural and undulating
+  const rimProfile = 115.0 + 68.0 * ridged2D(x * 0.0024 + 9.2, z * 0.0024 + 5.3, 4);
+  // Reduce rim contribution in North where main massif already dominates
+  const nonNorth = smoothstep(-0.35, 0.45, (z - 120.0) / 400.0);
+  const sideWall = outerRim * rimProfile * (0.55 + 0.45 * nonNorth);
+  h = Math.max(h, sideWall) + 0.18 * Math.min(h, sideWall);
+
+  // 4. Valley floor gentle undulations & dry creek bed
+  const valleyFlat = smoothstep(260.0, 120.0, Math.abs(z - 318.0)) * smoothstep(320.0, 140.0, Math.abs(x));
+  const floorUndul = (detail - 0.5) * 10.0 + (fbm2D(x * 0.004, z * 0.004, 3) - 0.5) * 14.0;
+  h += (1.0 - valleyFlat * 0.55) * (detail - 0.45) * 18.0 + valleyFlat * floorUndul * 0.55;
+
+  // Carve a soft valley floor basin around the camera corridor so the camera sits cleanly on the floor
+  const camBasin = Math.exp(-(Math.pow(x / 175.0, 2.0) + Math.pow((z - 320.0) / 88.0, 2.0)));
+  h = lerp(h, 4.5 + floorUndul * 0.45, camBasin * 0.85);
+
+  return Math.max(0.0, h);
+}
+
+// Compute active fire intensity along the main ridge & creeping ravine fingers (0..1)
+function computeFireIntensity(x, z) {
+  const rz = ridgeCurveZ(x);
+  const dz = z - rz;
+  // Active span along ridge (burns across ~1050m of the sweeping mountain crest!)
+  const span = smoothstep(-620.0, -420.0, x) * smoothstep(640.0, 440.0, x);
+  if (span <= 0.001) return 0.0;
+
+  // Natural patchy variation: blazing sectors + quieter smoldering dips
+  const n1 = fbm2D(x * 0.0085 + 2.3, z * 0.0085 - 1.1, 3);
+  const n2 = valueNoise2D(x * 0.022 - 5.1, z * 0.022 + 3.4);
+
+  // Main crest band: intense right on crest and slightly down the valley-facing slope (dz in -18..+55)
+  const crestBand = Math.exp(-Math.pow((dz - 8.0) / 28.0, 2.0));
+
+  // Creeping fire fingers running down 4 steep front-slope gullies toward the valley!
+  let fingers = 0.0;
+  const fingerSpecs = [
+    { cx: -245.0, w: 34.0, len: 105.0 },
+    { cx: -65.0,  w: 42.0, len: 125.0 },
+    { cx: 130.0,  w: 38.0, len: 118.0 },
+    { cx: 330.0,  w: 32.0, len: 92.0  }
+  ];
+  for (let i = 0; i < fingerSpecs.length; i++) {
+    const f = fingerSpecs[i];
+    const warp = (valueNoise2D(x * 0.02 + i * 7.0, z * 0.02) - 0.5) * 28.0;
+    const fx = Math.exp(-Math.pow((x - f.cx + warp) / f.w, 2.0));
+    const fz = smoothstep(-10.0, 15.0, dz) * smoothstep(f.len, 22.0, dz);
+    fingers = Math.max(fingers, fx * fz * (0.65 + 0.35 * n2));
+  }
+
+  let fire = Math.max(crestBand * (0.45 + 0.85 * n1), fingers * 0.88) * span;
+  // Carve small natural burned-out gaps so it looks organic, not a painted stripe
+  const gap = smoothstep(0.24, 0.42, n1 * 0.7 + n2 * 0.3);
+  fire *= (0.22 + 0.78 * gap);
+  return clamp(fire, 0.0, 1.0);
+}
+
+// ============================================================================
+// PRECOMPUTE WORLD MAPS (Heightfield, Fire Map, Ridge Firelights, Occluded Irradiance)
+// ============================================================================
+const MAP_RES = 512;
+const heightGrid = new Float32Array(MAP_RES * MAP_RES);
+const fireGrid = new Float32Array(MAP_RES * MAP_RES);
+
+function worldToGrid(wx, wz) {
+  const u = (wx + WORLD_HALF) / WORLD_SIZE;
+  const v = (wz + WORLD_HALF) / WORLD_SIZE;
+  return [u * (MAP_RES - 1), v * (MAP_RES - 1)];
+}
+
+for (let iz = 0; iz < MAP_RES; iz++) {
+  const wz = (iz / (MAP_RES - 1)) * WORLD_SIZE - WORLD_HALF;
+  for (let ix = 0; ix < MAP_RES; ix++) {
+    const wx = (ix / (MAP_RES - 1)) * WORLD_SIZE - WORLD_HALF;
+    const idx = iz * MAP_RES + ix;
+    heightGrid[idx] = computeHeight(wx, wz);
+    fireGrid[idx] = computeFireIntensity(wx, wz);
+  }
+}
+
+function sampleHeightBilinear(wx, wz) {
+  const gx = clamp(((wx + WORLD_HALF) / WORLD_SIZE) * (MAP_RES - 1), 0, MAP_RES - 1.001);
+  const gz = clamp(((wz + WORLD_HALF) / WORLD_SIZE) * (MAP_RES - 1), 0, MAP_RES - 1.001);
+  const x0 = gx | 0, z0 = gz | 0;
+  const fx = gx - x0, fz = gz - z0;
+  const i00 = z0 * MAP_RES + x0;
+  const h00 = heightGrid[i00], h10 = heightGrid[i00 + 1];
+  const h01 = heightGrid[i00 + MAP_RES], h11 = heightGrid[i00 + MAP_RES + 1];
+  return (h00 * (1 - fx) + h10 * fx) * (1 - fz) + (h01 * (1 - fx) + h11 * fx) * fz;
+}
+
+function sampleFireBilinear(wx, wz) {
+  const gx = clamp(((wx + WORLD_HALF) / WORLD_SIZE) * (MAP_RES - 1), 0, MAP_RES - 1.001);
+  const gz = clamp(((wz + WORLD_HALF) / WORLD_SIZE) * (MAP_RES - 1), 0, MAP_RES - 1.001);
+  const x0 = gx | 0, z0 = gz | 0;
+  const fx = gx - x0, fz = gz - z0;
+  const i00 = z0 * MAP_RES + x0;
+  const h00 = fireGrid[i00], h10 = fireGrid[i00 + 1];
+  const h01 = fireGrid[i00 + MAP_RES], h11 = fireGrid[i00 + MAP_RES + 1];
+  return (h00 * (1 - fx) + h10 * fx) * (1 - fz) + (h01 * (1 - fx) + h11 * fx) * fz;
+}
+
+// 14 Active Firelight & Smoke Plume Cluster Nodes along the burning ridge
+const NUM_FIRE_LIGHTS = 14;
+const fireNodes = [];
+const fireNodeXs = [-470, -370, -285, -210, -135, -62, 12, 86, 152, 225, 305, 385, 465, 540];
+for (let i = 0; i < NUM_FIRE_LIGHTS; i++) {
+  const fx = fireNodeXs[i];
+  // Slight offset toward valley-facing ridge front so light spills nicely down slopes
+  const fz = ridgeCurveZ(fx) + (i % 3 === 1 ? 26.0 : 6.0);
+  const fy = sampleHeightBilinear(fx, fz) + 18.0;
+  const intensity = clamp(sampleFireBilinear(fx, fz) * 1.25 + 0.35, 0.35, 1.35);
+  fireNodes.push({
+    x: fx, y: fy, z: fz,
+    basePower: intensity,
+    phase: i * 1.93 + 0.4,
+    speed: 1.0 + (i % 5) * 0.19
+  });
+}
+
+// Precompute Terrain-Occluded Fire Irradiance & Cavity AO Map (256x256 RGBA8)
+// R = occluded fire irradiance, G/B = avg firelight XZ direction, A = sky AO
+const LMAP_RES = 256;
+const lightMapData = new Uint8Array(LMAP_RES * LMAP_RES * 4);
+
+for (let iz = 0; iz < LMAP_RES; iz++) {
+  const wz = (iz / (LMAP_RES - 1)) * WORLD_SIZE - WORLD_HALF;
+  for (let ix = 0; ix < LMAP_RES; ix++) {
+    const wx = (ix / (LMAP_RES - 1)) * WORLD_SIZE - WORLD_HALF;
+    const wy = sampleHeightBilinear(wx, wz);
+
+    // Terrain normal for irradiance angle + cavity AO
+    const eps = 9.0;
+    const hL = sampleHeightBilinear(wx - eps, wz);
+    const hR = sampleHeightBilinear(wx + eps, wz);
+    const hD = sampleHeightBilinear(wx, wz - eps);
+    const hU = sampleHeightBilinear(wx, wz + eps);
+    let nx = hL - hR, ny = 2.0 * eps, nz = hD - hU;
+    const nLen = Math.hypot(nx, ny, nz) || 1.0;
+    nx /= nLen; ny /= nLen; nz /= nLen;
+
+    // Horizon cavity AO
+    const avgSurround = 0.25 * (
+      sampleHeightBilinear(wx - 36, wz) + sampleHeightBilinear(wx + 36, wz) +
+      sampleHeightBilinear(wx, wz - 36) + sampleHeightBilinear(wx, wz + 36)
+    );
+    const ao = clamp(1.0 - Math.max(0.0, (avgSurround - wy) / 65.0), 0.22, 1.0);
+
+    let totalIrr = 0.0;
+    let dirX = 0.0, dirZ = 0.0;
+
+    for (let li = 0; li < NUM_FIRE_LIGHTS; li++) {
+      const L = fireNodes[li];
+      const dx = L.x - wx, dy = (L.y + 22.0) - (wy + 3.0), dz = L.z - wz;
+      const dist2 = dx * dx + dy * dy + dz * dz;
+      const dist = Math.sqrt(dist2) + 0.001;
+      // Check terrain occlusion along 7 heightfield samples
+      let vis = 1.0;
+      const steps = 7;
+      for (let s = 1; s < steps; s++) {
+        const t = s / steps;
+        const sx = wx + dx * t;
+        const sz = wz + dz * t;
+        const sy = (wy + 4.5) + dy * t;
+        const th = sampleHeightBilinear(sx, sz);
+        if (th > sy) {
+          const pen = (th - sy) / 28.0;
+          vis *= Math.max(0.0, 1.0 - pen);
+          if (vis < 0.03) { vis = 0.0; break; }
+        }
+      }
+      if (vis <= 0.0) continue;
+
+      const ndotl = Math.max(0.0, (nx * dx + ny * dy + nz * dz) / dist);
+      // Soft atmospheric wrap + inverse distance attenuation tuned for 500-1100m mountain valley scale
+      const atten = L.basePower / (1.0 + dist2 / (220.0 * 220.0));
+      const contrib = atten * vis * (0.28 + 0.72 * ndotl);
+      totalIrr += contrib;
+      dirX += (dx / dist) * contrib;
+      dirZ += (dz / dist) * contrib;
+    }
+
+    const dLen = Math.hypot(dirX, dirZ) || 1.0;
+    dirX /= dLen; dirZ /= dLen;
+
+    const idx = (iz * LMAP_RES + ix) * 4;
+    // Compress HDR irradiance smoothly into [0..1] via sqrt curve so distant bounce light preserves precision
+    const encIrr = clamp(Math.sqrt(totalIrr * 0.28), 0.0, 1.0);
+    lightMapData[idx + 0] = Math.round(encIrr * 255);
+    lightMapData[idx + 1] = Math.round((dirX * 0.5 + 0.5) * 255);
+    lightMapData[idx + 2] = Math.round((dirZ * 0.5 + 0.5) * 255);
+    lightMapData[idx + 3] = Math.round(ao * 255);
+  }
+}
+
+const lightMapTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, lightMapTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, LMAP_RES, LMAP_RES, 0, gl.RGBA, gl.UNSIGNED_BYTE, lightMapData);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ============================================================================
+// PRECOMPUTE 3D VOLUMETRIC BILLOWING NOISE TEXTURE (64x64x64 RGBA8)
+// R = seamless 3D fBm, G = seamless 3D inverted Worley billows, B = medium detail, A = fine wisps
+// ============================================================================
+function create3DNoiseTexture() {
+  const N = 64;
+  const data = new Uint8Array(N * N * N * 4);
+
+  function hash3(ix, iy, iz, period) {
+    ix = ((ix % period) + period) % period;
+    iy = ((iy % period) + period) % period;
+    iz = ((iz % period) + period) % period;
+    let n = Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(iz, 2147483647);
+    n = (n ^ (n >>> 13)) >>> 0;
+    n = Math.imul(n, 1274126177) >>> 0;
+    return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+  }
+
+  function tileValue3D(x, y, z, period) {
+    const px = x * period, py = y * period, pz = z * period;
+    const ix = Math.floor(px), iy = Math.floor(py), iz = Math.floor(pz);
+    const fx = px - ix, fy = py - iy, fz = pz - iz;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    const uz = fz * fz * (3 - 2 * fz);
+    const c000 = hash3(ix, iy, iz, period);
+    const c100 = hash3(ix + 1, iy, iz, period);
+    const c010 = hash3(ix, iy + 1, iz, period);
+    const c110 = hash3(ix + 1, iy + 1, iz, period);
+    const c001 = hash3(ix, iy, iz + 1, period);
+    const c101 = hash3(ix + 1, iy, iz + 1, period);
+    const c011 = hash3(ix, iy + 1, iz + 1, period);
+    const c111 = hash3(ix + 1, iy + 1, iz + 1, period);
+    const x00 = c000 + (c100 - c000) * ux;
+    const x10 = c010 + (c110 - c010) * ux;
+    const x01 = c001 + (c101 - c001) * ux;
+    const x11 = c011 + (c111 - c011) * ux;
+    const y0 = x00 + (x10 - x00) * uy;
+    const y1 = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+  }
+
+  function tileWorley3D(x, y, z, cells) {
+    const px = x * cells, py = y * cells, pz = z * cells;
+    const ix = Math.floor(px), iy = Math.floor(py), iz = Math.floor(pz);
+    let minD = 9.0;
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const cx = ix + dx, cy = iy + dy, cz = iz + dz;
+          const jx = hash3(cx, cy, cz, cells);
+          const jy = hash3(cx + 17, cy + 31, cz + 47, cells);
+          const jz = hash3(cx + 59, cy + 13, cz + 71, cells);
+          const rx = (cx + jx) - px;
+          const ry = (cy + jy) - py;
+          const rz = (cz + jz) - pz;
+          const d = rx * rx + ry * ry + rz * rz;
+          if (d < minD) minD = d;
+        }
+      }
+    }
+    return clamp(1.0 - Math.sqrt(minD), 0.0, 1.0);
+  }
+
+  let ptr = 0;
+  for (let z = 0; z < N; z++) {
+    const fz = z / N;
+    for (let y = 0; y < N; y++) {
+      const fy = y / N;
+      for (let x = 0; x < N; x++) {
+        const fx = x / N;
+        const fbm = 0.55 * tileValue3D(fx, fy, fz, 4)
+                  + 0.30 * tileValue3D(fx, fy, fz, 8)
+                  + 0.15 * tileValue3D(fx, fy, fz, 16);
+        const w1 = tileWorley3D(fx, fy, fz, 4);
+        const w2 = tileWorley3D(fx, fy, fz, 8);
+        const billow = 0.62 * w1 + 0.38 * w2;
+        const med = 0.6 * tileValue3D(fx, fy, fz, 8) + 0.4 * w2;
+        const fine = 0.55 * tileValue3D(fx, fy, fz, 16) + 0.45 * tileWorley3D(fx, fy, fz, 12);
+        data[ptr++] = Math.round(clamp(fbm, 0, 1) * 255);
+        data[ptr++] = Math.round(clamp(billow, 0, 1) * 255);
+        data[ptr++] = Math.round(clamp(med, 0, 1) * 255);
+        data[ptr++] = Math.round(clamp(fine, 0, 1) * 255);
+      }
+    }
+  }
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, tex);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, N, N, N, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.REPEAT);
+  return tex;
+}
+
+const noise3DTex = create3DNoiseTexture();
+
+// ============================================================================
+// PROCEDURAL PHOTOREALISTIC CONIFER SILHOUETTE ATLAS (4 Archetypes, 2048x1024)
+// R = needle edge/rim factor, G = normalized height, B = branch shade variation, A = crisp foliage mask
+// ============================================================================
+function createConiferAtlas() {
+  const cellW = 512, cellH = 1024, count = 4;
+  const c = document.createElement('canvas');
+  c.width = cellW * count;
+  c.height = cellH;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  for (let type = 0; type < count; type++) {
+    const rng = mulberry32(4109 + type * 997);
+    const ox = type * cellW;
+    const cx = ox + cellW * 0.5;
+    const baseY = cellH - 12;
+    const topY = type === 3 ? 90 : (type === 1 ? 65 : 42);
+    const treeH = baseY - topY;
+    const isSnag = (type === 3);
+
+    // Slight organic trunk lean/bow
+    const lean = (rng() - 0.5) * 18.0;
+    const trunkX = (t) => cx + Math.sin(t * Math.PI) * lean * 0.5 + t * lean * 0.4;
+
+    // 1. Draw slightly gnarled tapered trunk
+    for (let s = 0; s < 32; s++) {
+      const t0 = s / 32, t1 = (s + 1) / 32;
+      const y0 = baseY - t0 * treeH;
+      const y1 = baseY - t1 * treeH;
+      const w0 = lerp(type === 1 ? 15.0 : 11.5, 1.5, Math.pow(t0, 0.85));
+      const gVal = Math.round(t0 * 255);
+      ctx.strokeStyle = `rgb(25, ${gVal}, 80)`;
+      ctx.lineWidth = w0;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(trunkX(t0), y0);
+      ctx.lineTo(trunkX(t1), y1);
+      ctx.stroke();
+    }
+
+    // 2. Draw organic tiered drooping boughs + fine needle sprigs
+    const numTiers = isSnag ? 18 : (type === 1 ? 42 : 48);
+    const startT = type === 1 ? 0.14 : (type === 2 ? 0.22 : 0.12);
+
+    for (let i = 0; i < numTiers; i++) {
+      const t = startT + (i / numTiers) * (0.985 - startT) + (rng() - 0.5) * 0.015;
+      if (t >= 0.995) continue;
+      // Occasional missing limb gap for authentic ragged wildfire forest silhouettes!
+      if (rng() < (isSnag ? 0.34 : (type === 2 ? 0.18 : 0.09))) continue;
+
+      const y = baseY - t * treeH;
+      const tx = trunkX(t);
+      // Conifer width envelope: wider near lower third, narrowing unevenly to ragged spire
+      let env = Math.pow(1.0 - t, type === 1 ? 0.78 : 0.92) * smoothstep(startT - 0.05, startT + 0.12, t);
+      if (type === 1) env *= 1.18;
+      if (type === 2) env *= 0.82;
+      if (isSnag) env *= 0.68;
+
+      const maxReach = (cellW * 0.42) * env * (0.68 + 0.52 * rng());
+
+      // Draw left & right branches (+ central depth-fill bough)
+      const sides = isSnag ? [-1, 1] : [-1, 1, (rng() < 0.5 ? -0.45 : 0.45)];
+      for (let si = 0; si < sides.length; si++) {
+        const side = sides[si];
+        const asym = 0.72 + 0.55 * rng();
+        // Wind-flagged slight asymmetry on type 2
+        const windBias = (type === 2) ? (side > 0 ? 1.22 : 0.72) : 1.0;
+        const reach = maxReach * Math.abs(side) * asym * windBias;
+        const dir = side >= 0 ? 1 : -1;
+
+        // Lower branches droop downwards; upper crown limbs angle gently up
+        const droop = lerp(32.0, -24.0, Math.pow(t, 0.85)) * (0.65 + 0.6 * rng());
+        const endX = tx + dir * reach;
+        const endY = y + droop;
+        const midX = tx + dir * reach * 0.55;
+        const midY = y + droop * 0.65 + (t < 0.65 ? 9.0 : -3.0);
+
+        const gVal = Math.round(clamp(t, 0, 1) * 255);
+        // Woody bough limb
+        ctx.strokeStyle = `rgb(55, ${gVal}, 95)`;
+        ctx.lineWidth = Math.max(1.2, lerp(4.8, 1.0, t) * (isSnag ? 0.85 : 1.0));
+        ctx.beginPath();
+        ctx.moveTo(tx, y);
+        ctx.quadraticCurveTo(midX, midY, endX, endY);
+        ctx.stroke();
+
+        // Twigs & needle clusters along the limb
+        const numSprigs = isSnag ? Math.floor(3 + reach * 0.06) : Math.floor(9 + reach * 0.24);
+        for (let k = 0; k < numSprigs; k++) {
+          const u = 0.12 + (k / Math.max(1, numSprigs - 1)) * 0.88 + (rng() - 0.5) * 0.07;
+          const uc = clamp(u, 0.05, 1.04);
+          // Point on quadratic curve
+          const inv = 1.0 - uc;
+          const bx = inv * inv * tx + 2 * inv * uc * midX + uc * uc * endX;
+          const by = inv * inv * y + 2 * inv * uc * midY + uc * uc * endY;
+
+          // Edge factor R: high near tips & outer edges -> catches fiery backlit needle glow!
+          const rimR = Math.round(clamp(0.25 + 0.75 * uc + (rng() - 0.5) * 0.15, 0, 1) * 255);
+          const shadeB = Math.round(clamp(0.35 + 0.55 * rng(), 0, 1) * 255);
+
+          if (isSnag) {
+            // Bare broken charred twigs + occasional tiny scorched needle tuft
+            const twLen = (7 + 16 * rng()) * (1.1 - uc * 0.5);
+            const ang = (dir > 0 ? 0 : Math.PI) + (rng() - 0.5) * 1.4;
+            ctx.strokeStyle = `rgb(${rimR}, ${gVal}, ${shadeB})`;
+            ctx.lineWidth = 1.1 + rng() * 1.1;
+            ctx.beginPath();
+            ctx.moveTo(bx, by);
+            ctx.lineTo(bx + Math.cos(ang) * twLen, by + Math.sin(ang) * twLen);
+            ctx.stroke();
+          } else {
+            // Dense radiating fine pine-needle fan / sprig cluster
+            const fanCount = 5 + Math.floor(rng() * 5);
+            const baseLen = (6.5 + 14.0 * (1.0 - t * 0.45)) * (0.55 + 0.65 * Math.sin(uc * Math.PI * 0.85 + 0.2));
+            ctx.strokeStyle = `rgb(${rimR}, ${gVal}, ${shadeB})`;
+            for (let f = 0; f < fanCount; f++) {
+              const fang = (dir > 0 ? 0.15 : Math.PI - 0.15)
+                         + (f / (fanCount - 1) - 0.5) * 2.15
+                         + (rng() - 0.5) * 0.35;
+              const flen = baseLen * (0.55 + 0.65 * rng());
+              ctx.lineWidth = 1.25 + rng() * 1.35;
+              ctx.beginPath();
+              ctx.moveTo(bx + (rng() - 0.5) * 3.0, by + (rng() - 0.5) * 3.0);
+              ctx.lineTo(bx + Math.cos(fang) * flen, by + Math.sin(fang) * flen + 2.0);
+              ctx.stroke();
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Delicate jagged leader spire at top
+    if (!isSnag) {
+      const tipX = trunkX(1.0);
+      for (let k = 0; k < 14; k++) {
+        const u = k / 14;
+        const yy = topY + u * 52;
+        const sp = 3.0 + u * 16.0;
+        ctx.strokeStyle = `rgb(235, 250, 180)`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(tipX, yy);
+        ctx.lineTo(tipX + (k % 2 === 0 ? 1 : -1) * sp * (0.6 + 0.6 * rng()), yy - 6.0 - rng() * 6.0);
+        ctx.stroke();
+      }
+    }
+  }
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+const coniferAtlasTex = createConiferAtlas();
+
+// ============================================================================
+// SHADER COMPILATION UTILITIES
+// ============================================================================
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split('\n').map((l, i) => `${i + 1}: ${l}`).join('\n');
+    throw new Error(`Shader compile error:\n${log}\n---\n${numbered}`);
+  }
+  return s;
+}
+
+function createProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(`Program link error:\n${gl.getProgramInfoLog(p)}`);
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  const uniforms = {};
+  const nU = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < nU; i++) {
+    const info = gl.getActiveUniform(p, i);
+    const name = info.name.replace(/\[0\]$/, '');
+    uniforms[name] = gl.getUniformLocation(p, name);
+  }
+  return { prog: p, u: uniforms };
+}
+
+// Common GLSL snippet: hashing, value noise, fBm, blackbody, firelight flicker
+const GLSL_COMMON = /* glsl */`
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise2(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x),
+    mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x),
+    u.y
+  );
+}
+float fbm2(vec2 p) {
+  float v = 0.0, a = 0.5;
+  mat2 rot = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 4; i++) {
+    v += a * vnoise2(p);
+    p = rot * p * 2.04 + vec2(13.7, 9.2);
+    a *= 0.5;
+  }
+  return v;
+}
+// Blackbody-inspired HDR wildfire color ramp (t in 0..1.3+)
+vec3 fireBlackbody(float t) {
+  t = max(t, 0.0);
+  // Deep crimson soot edge -> fierce flame orange -> glowing amber -> blinding white-yellow core
+  vec3 c1 = vec3(0.65, 0.035, 0.004);
+  vec3 c2 = vec3(2.40, 0.36, 0.025);
+  vec3 c3 = vec3(4.80, 1.65, 0.18);
+  vec3 c4 = vec3(8.50, 6.20, 3.10);
+  vec3 col = mix(vec3(0.0), c1, smoothstep(0.0, 0.24, t));
+  col = mix(col, c2, smoothstep(0.20, 0.52, t));
+  col = mix(col, c3, smoothstep(0.48, 0.80, t));
+  col = mix(col, c4, smoothstep(0.76, 1.15, t));
+  return col;
+}
+float ridgeCurveZ_gl(float x) {
+  return -235.0
+    + 0.00038 * x * x
+    + 42.0 * sin(x * 0.0046 + 0.55)
+    + 22.0 * cos(x * 0.0092 - 0.4);
+}
+`;
+
+// ============================================================================
+// 1. SKY DOME, STARS & HORIZON ORANGE WILDFIRE GLOW SHADER
+// ============================================================================
+const FS_QUAD_VS = `#version 300 es
+precision highp float;
+out vec2 vUv;
+void main() {
+  vec2 p = vec2((gl_VertexID & 1) << 1, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.99999, 1.0);
+}`;
+
+const SKY_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform mat4 uInvViewProj;
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uGlobalFlicker;
+uniform vec4 uFireLights[${NUM_FIRE_LIGHTS}]; // xyz = pos, w = live intensity
+
+${GLSL_COMMON}
+
+void main() {
+  vec4 ndcFar = vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+  vec4 worldP = uInvViewProj * ndcFar;
+  vec3 dir = normalize(worldP.xyz / worldP.w - uCamPos);
+
+  float elev = clamp(dir.y, -0.25, 1.0);
+  float elevPos = max(elev, 0.0);
+
+  // Base cold night sky: deep slate-navy zenith fading into smoky indigo horizon
+  vec3 zenithCol = vec3(0.0045, 0.0075, 0.017);
+  vec3 horizonNight = vec3(0.016, 0.015, 0.022);
+  vec3 sky = mix(horizonNight, zenithCol, pow(elevPos, 0.55));
+
+  // Integrate realistic warm amber-crimson atmospheric scatter from the entire burning ridge arc!
+  vec3 fireGlow = vec3(0.0);
+  float totalGlowFactor = 0.0;
+  for (int i = 0; i < ${NUM_FIRE_LIGHTS}; i++) {
+    vec3 toL = normalize(uFireLights[i].xyz - uCamPos);
+    float align = max(0.0, dot(dir, toL));
+    float azAlign = max(0.0, dot(normalize(vec2(dir.x, dir.z)), normalize(vec2(toL.x, toL.z))));
+    // Broad horizon dome scattering + tighter forward glow above active burning ridge
+    float horizBand = exp(-elevPos * 4.2) * pow(azAlign, 1.8);
+    float domeScatter = pow(align, 3.2) * 0.72 + pow(align, 12.0) * 0.85;
+    float pwr = uFireLights[i].w;
+    fireGlow += vec3(1.0, 0.27, 0.045) * (horizBand * 0.145 + domeScatter * 0.075) * pwr;
+    totalGlowFactor += (horizBand * 0.45 + domeScatter * 0.55) * pwr;
+  }
+
+  // Broad warm-rust ambient smoky sky glow spreading even across higher/opposite sky
+  float northBias = smoothstep(-0.7, 0.9, -dir.z);
+  float wideHaze = exp(-elevPos * 2.35) * (0.28 + 0.72 * northBias) * (0.88 + 0.16 * uGlobalFlicker);
+  sky += vec3(0.24, 0.062, 0.014) * wideHaze;
+  // Subtle fiery-amber zenith haze scatter
+  sky += fireGlow * 0.55;
+
+  // High-altitude thin drifting night smoke / cirrus veil catching dim fiery underglow
+  if (elev > 0.015) {
+    vec2 cloudUv = dir.xz / (elev + 0.22) * 0.65 - vec2(uTime * 0.011, uTime * 0.003);
+    float veil = fbm2(cloudUv * 2.2 + vec2(fbm2(cloudUv * 1.4) * 1.2));
+    veil = smoothstep(0.38, 0.78, veil) * smoothstep(0.015, 0.22, elev) * smoothstep(0.95, 0.18, elev);
+    vec3 veilGlow = mix(vec3(0.03, 0.016, 0.014), vec3(0.45, 0.11, 0.025), clamp(totalGlowFactor * 0.18, 0.0, 1.0));
+    sky = mix(sky, sky * 0.65 + veilGlow * 0.55, veil * 0.52);
+  }
+
+  // Crisp subtle stars visible high up where night sky clears from horizon smoke & fire glare
+  if (elev > 0.08) {
+    // Project onto stable sky sphere grid
+    vec2 skySph = vec2(atan(dir.x, dir.z), asin(clamp(dir.y, -1.0, 1.0)));
+    float starMask = smoothstep(0.10, 0.48, elev) * exp(-totalGlowFactor * 0.14);
+    for (int layer = 0; layer < 2; layer++) {
+      float scale = layer == 0 ? 155.0 : 285.0;
+      vec2 grid = skySph * scale;
+      vec2 cell = floor(grid);
+      vec2 local = fract(grid) - 0.5;
+      float rnd = hash12(cell + float(layer) * 43.1);
+      if (rnd > 0.986) {
+        vec2 off = vec2(hash12(cell + 11.7), hash12(cell + 29.3)) - 0.5;
+        float d = length(local - off * 0.62);
+        float bright = pow(clamp((rnd - 0.986) / 0.014, 0.0, 1.0), 1.7);
+        float twinkle = 0.72 + 0.28 * sin(uTime * (2.2 + rnd * 4.0) + rnd * 91.0);
+        float spot = exp(-d * d * (layer == 0 ? 185.0 : 260.0));
+        // Subtle realistic star color temperature
+        vec3 sCol = mix(vec3(0.75, 0.86, 1.0), vec3(1.0, 0.88, 0.72), hash12(cell + 7.4));
+        sky += sCol * spot * bright * twinkle * starMask * (layer == 0 ? 0.85 : 0.45);
+      }
+    }
+  }
+
+  fragColor = vec4(sky, 1.0);
+}`;
+
+// ============================================================================
+// 2. TERRAIN MESH BUILDER & SHADER (360° Mountain Valley + Ground Fire Veins)
+// ============================================================================
+function createTerrainGeometry() {
+  const N = 260;
+  const verts = new Float32Array((N + 1) * (N + 1) * 8); // pos(3), norm(3), uv(2)
+  const indices = new Uint32Array(N * N * 6);
+
+  // Non-linear coordinate warp: concentrates resolution across valley & main burning ridge
+  function mapCoord(u) {
+    // u in [-1, 1] -> dense in center, gently expanded toward outer 360 rim
+    const s = Math.sign(u);
+    const a = Math.abs(u);
+    return s * (0.62 * a + 0.38 * a * a * a) * WORLD_HALF;
+  }
+
+  let vp = 0;
+  for (let iz = 0; iz <= N; iz++) {
+    const vz = (iz / N) * 2.0 - 1.0;
+    const wz = mapCoord(vz);
+    for (let ix = 0; ix <= N; ix++) {
+      const vx = (ix / N) * 2.0 - 1.0;
+      const wx = mapCoord(vx);
+      const wy = sampleHeightBilinear(wx, wz);
+
+      const eps = 5.5;
+      const hL = sampleHeightBilinear(wx - eps, wz);
+      const hR = sampleHeightBilinear(wx + eps, wz);
+      const hD = sampleHeightBilinear(wx, wz - eps);
+      const hU = sampleHeightBilinear(wx, wz + eps);
+      let nx = hL - hR, ny = 2.0 * eps, nz = hD - hU;
+      const nl = Math.hypot(nx, ny, nz) || 1.0;
+
+      verts[vp++] = wx;
+      verts[vp++] = wy;
+      verts[vp++] = wz;
+      verts[vp++] = nx / nl;
+      verts[vp++] = ny / nl;
+      verts[vp++] = nz / nl;
+      verts[vp++] = (wx + WORLD_HALF) / WORLD_SIZE;
+      verts[vp++] = (wz + WORLD_HALF) / WORLD_SIZE;
+    }
+  }
+
+  let ip = 0;
+  for (let iz = 0; iz < N; iz++) {
+    for (let ix = 0; ix < N; ix++) {
+      const i0 = iz * (N + 1) + ix;
+      const i1 = i0 + 1;
+      const i2 = i0 + (N + 1);
+      const i3 = i2 + 1;
+      indices[ip++] = i0; indices[ip++] = i2; indices[ip++] = i1;
+      indices[ip++] = i1; indices[ip++] = i2; indices[ip++] = i3;
+    }
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const stride = 8 * 4;
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 2, gl.FLOAT, false, stride, 24);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+
+  return { vao, count: indices.length };
+}
+
+// Also upload fireIntensity map (512x512 R8) for crisp ground fire veins on GPU
+const fireMapBytes = new Uint8Array(MAP_RES * MAP_RES);
+for (let i = 0; i < MAP_RES * MAP_RES; i++) {
+  fireMapBytes[i] = Math.round(clamp(fireGrid[i], 0, 1) * 255);
+}
+const fireMapTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, fireMapTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, MAP_RES, MAP_RES, 0, gl.RED, gl.UNSIGNED_BYTE, fireMapBytes);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+const TERRAIN_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNorm;
+layout(location=2) in vec2 aUv;
+
+uniform mat4 uViewProj;
+out vec3 vWorldPos;
+out vec3 vNorm;
+out vec2 vUv;
+
+void main() {
+  vWorldPos = aPos;
+  vNorm = aNorm;
+  vUv = aUv;
+  gl_Position = uViewProj * vec4(aPos, 1.0);
+}`;
+
+const TERRAIN_FS = `#version 300 es
+precision highp float;
+in vec3 vWorldPos;
+in vec3 vNorm;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uGlobalFlicker;
+uniform sampler2D uLightMap;
+uniform sampler2D uFireMap;
+uniform vec4 uFireLights[${NUM_FIRE_LIGHTS}];
+
+${GLSL_COMMON}
+
+void main() {
+  vec3 P = vWorldPos;
+  vec3 N = normalize(vNorm);
+  vec3 V = normalize(uCamPos - P);
+  float dist = length(uCamPos - P);
+
+  // Micro-surface rock & scree normal perturbation for crisp terrain texture
+  float micro1 = fbm2(P.xz * 0.045);
+  float micro2 = fbm2(P.xz * 0.19 + vec2(micro1 * 1.4));
+  float e = 1.6;
+  float hX = fbm2((P.xz + vec2(e, 0.0)) * 0.065) - fbm2((P.xz - vec2(e, 0.0)) * 0.065);
+  float hZ = fbm2((P.xz + vec2(0.0, e)) * 0.065) - fbm2((P.xz - vec2(0.0, e)) * 0.065);
+  N = normalize(N + vec3(-hX, 0.0, -hZ) * 0.42);
+
+  // Albedo: dark nocturnal pine-needle forest floor, rocky scree on steep slopes, scorched soot near fire
+  float slope = 1.0 - clamp(N.y, 0.0, 1.0);
+  vec3 forestCol = mix(vec3(0.022, 0.026, 0.020), vec3(0.038, 0.034, 0.026), micro1);
+  vec3 rockCol = mix(vec3(0.045, 0.042, 0.040), vec3(0.082, 0.074, 0.068), micro2);
+  vec3 albedo = mix(forestCol, rockCol, smoothstep(0.16, 0.48, slope));
+
+  float fireAmt = texture(uFireMap, vUv).r;
+  // Scorch dark charcoal around burning zones
+  albedo = mix(albedo, vec3(0.012, 0.010, 0.010), smoothstep(0.06, 0.35, fireAmt));
+
+  // Precomputed terrain-occluded firelight irradiance + sky cavity AO
+  vec4 lm = texture(uLightMap, vUv);
+  float occludedIrr = lm.r * lm.r * 3.6;
+  vec2 fireDirXZ = normalize(lm.gb * 2.0 - 1.0 + vec2(0.0001));
+  float ao = lm.a;
+
+  // Dynamic spatially-varying firelight flicker from nearby active ridge nodes
+  vec3 fireBounce = vec3(0.0);
+  float localFlicker = 0.0;
+  float weightSum = 0.001;
+  for (int i = 0; i < ${NUM_FIRE_LIGHTS}; i++) {
+    vec3 toL = uFireLights[i].xyz - P;
+    float d2 = dot(toL, toL);
+    float d = sqrt(d2) + 0.001;
+    float w = 1.0 / (1.0 + d2 / (240.0 * 240.0));
+    localFlicker += uFireLights[i].w * w;
+    weightSum += w;
+    // Direct close-range illumination on ridge slopes & nearby foothills
+    if (d < 420.0) {
+      float ndl = max(0.0, dot(N, toL / d));
+      float att = uFireLights[i].w / (1.0 + d2 / (115.0 * 115.0));
+      fireBounce += vec3(1.0, 0.31, 0.045) * att * (0.22 + 0.78 * ndl) * 0.42;
+    }
+  }
+  localFlicker /= weightSum;
+
+  // Far-field terrain-occluded warm firelight bouncing across the whole 360° valley!
+  vec3 avgL = normalize(vec3(fireDirXZ.x, 0.34, fireDirXZ.y));
+  float ndlAvg = max(0.0, dot(N, avgL));
+  vec3 farFireLight = vec3(1.0, 0.29, 0.042) * occludedIrr * localFlicker * (0.30 + 0.70 * ndlAvg) * 1.18;
+
+  // Grazing specular glint on dry rock & grass catching the wildfire glow
+  vec3 H = normalize(avgL + V);
+  float spec = pow(max(0.0, dot(N, H)), 14.0) * occludedIrr * localFlicker * (0.04 + 0.14 * slope);
+
+  // Cool nocturnal skylight ambient (rich blue-slate shadow contrast against warm firelight!)
+  vec3 nightSkyAmb = mix(vec3(0.004, 0.006, 0.012), vec3(0.014, 0.020, 0.036), N.y * 0.5 + 0.5) * ao;
+  // Subtle warm sky-dome bounce even in shadowed creases
+  vec3 skyBounceWarm = vec3(0.032, 0.009, 0.002) * ao * (0.7 + 0.3 * uGlobalFlicker) * (0.4 + 0.6 * N.y);
+
+  vec3 col = albedo * (nightSkyAmb + skyBounceWarm + farFireLight + fireBounce * (0.25 + 0.75 * occludedIrr))
+           + vec3(1.0, 0.38, 0.09) * spec;
+
+  // CREEPING GROUND FIRE, GLOWING EMBER BEDS & MOLTEN VEINS ON THE BURNING RIDGE!
+  if (fireAmt > 0.04) {
+    vec2 gUv = P.xz * 0.042;
+    float warp = fbm2(gUv * 0.75 - vec2(uTime * 0.08, uTime * 0.05));
+    float emberNoise = fbm2(gUv * 2.4 + vec2(warp * 1.8, -uTime * 0.12));
+    float crackle = vnoise2(P.xz * 0.28 + vec2(uTime * 0.4, -uTime * 0.3));
+
+    // Glowing molten coal bed & active creeping fire ribbons along ridge & ravines
+    float coalMask = smoothstep(0.12, 0.75, fireAmt) * smoothstep(0.28, 0.78, emberNoise);
+    float pulse = 0.72 + 0.28 * sin(uTime * 3.1 + P.x * 0.05 + emberNoise * 9.0) * (0.75 + 0.25 * crackle);
+    float heat = coalMask * (0.45 + 0.75 * fireAmt) * pulse;
+
+    // Bright hot front edges where creeping ground flames consume fresh brush
+    float hotVein = smoothstep(0.56, 0.84, emberNoise * fireAmt * 1.45) * (0.65 + 0.55 * crackle);
+    col += fireBlackbody(heat * 0.82 + hotVein * 0.58) * (0.85 + 0.65 * fireAmt);
+  }
+
+  // DEPTH-LAYERED SMOKY AERIAL PERSPECTIVE (crucial for mountain scale!)
+  // Height-modulated valley haze that glows warm amber near the burning ridge & deep dusky rust away from it
+  float fogDens = 0.00118 * exp(-max(P.y - 10.0, 0.0) * 0.0046);
+  float fogAmt = 1.0 - exp(-dist * fogDens);
+  // Extra misty smoke veil trapped in the valley saddle between midground spurs & main ridge
+  float saddleBand = exp(-pow((P.z + 40.0) / 210.0, 2.0)) * exp(-max(P.y, 0.0) * 0.008);
+  fogAmt = clamp(fogAmt + saddleBand * smoothstep(140.0, 460.0, dist) * 0.38, 0.0, 0.90);
+
+  vec3 viewDir = normalize(P - uCamPos);
+  float northLook = smoothstep(-0.6, 0.85, -viewDir.z);
+  vec3 coolMist = vec3(0.012, 0.014, 0.022);
+  vec3 warmSmokeFog = vec3(0.22, 0.062, 0.014) * (0.82 + 0.22 * uGlobalFlicker);
+  // Brighter fiery orange aerial glow directly in front of the burning massif
+  float ridgeProx = exp(-pow((P.z - ridgeCurveZ_gl(P.x)) / 240.0, 2.0));
+  vec3 fogCol = mix(coolMist, warmSmokeFog, 0.28 + 0.72 * northLook)
+              + vec3(0.28, 0.075, 0.015) * ridgeProx * localFlicker * 0.55;
+
+  col = mix(col, fogCol, fogAmt);
+  fragColor = vec4(col, 1.0);
+}`;
+
+// ============================================================================
+// 3. INSTANCED 3D SILHOUETTED CONIFER TREES (~8,200 Trees across full 360°)
+// ============================================================================
+function createConiferSystem() {
+  // Base 3D tree geometry: 3 radial vertical crossed cards (0°, 60°, 120°)
+  // -> lush 3D feathery silhouette from every 360° angle, only 12 verts / 18 indices per tree!
+  const bPos = [];
+  const bUv = [];
+  const bIdx = [];
+  const angles = [0, Math.PI / 3, (2 * Math.PI) / 3];
+  for (let p = 0; p < 3; p++) {
+    const a = angles[p];
+    const ca = Math.cos(a) * 0.5;
+    const sa = Math.sin(a) * 0.5;
+    const base = p * 4;
+    // Bottom-left, bottom-right, top-right, top-left
+    bPos.push(-ca, 0.0, -sa,  ca, 0.0, sa,  ca, 1.0, sa,  -ca, 1.0, -sa);
+    bUv.push(0, 0,  1, 0,  1, 1,  0, 1);
+    bIdx.push(base, base + 1, base + 2,  base, base + 2, base + 3);
+  }
+
+  // Generate ~8,200 tree instances across 4 carefully designed cinematic zones!
+  const rng = mulberry32(88317);
+  const instList = []; // [x, y, z, scaleH, scaleW, rotY, typeIdx, fireBias]
+
+  function tryAddTree(x, z, minH, maxH, snagChance, allowInCorridor) {
+    if (Math.abs(x) > WORLD_HALF - 40 || Math.abs(z) > WORLD_HALF - 40) return false;
+    // Keep camera drift corridor cleanly clear so no pine ever clips the camera lens!
+    if (!allowInCorridor) {
+      // Check against sampled path points for guaranteed clearance
+      for (let s = 0; s < 32; s++) {
+        const p = valleyPathPos((s / 32) * Math.PI * 2.0);
+        const dx = x - p.x, dz = z - p.z;
+        if (dx * dx + dz * dz < 19.0 * 19.0) return false;
+      }
+      // Also keep central immediate foreground sightline open so view of ridge isn't blocked by a wall of trees right in front
+      if (z > 240 && z < 355 && Math.abs(x) < 62) {
+        if (rng() < 0.88) return false;
+      }
+    }
+
+    const y = sampleHeightBilinear(x, z);
+    const fireAmt = sampleFireBilinear(x, z);
+
+    const h = lerp(minH, maxH, rng());
+    const w = h * lerp(0.42, 0.58, rng());
+    const rot = rng() * Math.PI * 2.0;
+    let typeIdx = Math.floor(rng() * 3);
+    if (rng() < snagChance + fireAmt * 0.42) typeIdx = 3; // charred snag near/on fire!
+
+    instList.push(x, y - 1.4, z, h, w, rot, typeIdx, fireAmt);
+    return true;
+  }
+
+  // Zone 1: Hero Foreground Valley Floor & Meadow Fringe Pines (great parallax!)
+  let added = 0;
+  for (let tries = 0; tries < 2400 && added < 560; tries++) {
+    const x = (rng() - 0.5) * 620.0;
+    const z = 175.0 + rng() * 310.0;
+    // Cluster nicely in natural forest groves flanking left, right, and behind camera
+    const grove = fbm2D(x * 0.015 + 3.1, z * 0.015 - 2.4, 3);
+    if (grove < 0.36 && Math.abs(x) < 150 && z < 370) continue;
+    if (tryAddTree(x, z, 15.0, 29.0, 0.03, false)) added++;
+  }
+
+  // Zone 2: Midground Interlocking Foothill Spurs & Valley Slopes (serrated dark ridges!)
+  added = 0;
+  for (let tries = 0; tries < 9500 && added < 3600; tries++) {
+    const x = (rng() - 0.5) * 1450.0;
+    const z = -140.0 + rng() * 380.0;
+    const h = sampleHeightBilinear(x, z);
+    if (h < 14.0 && Math.abs(x) < 120) continue;
+    const grove = fbm2D(x * 0.011 + 8.1, z * 0.011 + 1.2, 3);
+    if (grove < 0.28) continue;
+    if (tryAddTree(x, z, 15.0, 27.0, 0.04, false)) added++;
+  }
+
+  // Zone 3: Burning Mountain Ridge Crest & Upper Slopes (iconic razor-sharp silhouettes against flames!)
+  added = 0;
+  for (let tries = 0; tries < 7500 && added < 2450; tries++) {
+    const x = (rng() - 0.5) * 1500.0;
+    const rz = ridgeCurveZ(x);
+    // Concentrate strongly along the ridge crest and upper valley-facing slope!
+    const spread = (rng() < 0.55) ? (rng() - 0.42) * 58.0 : (rng() - 0.25) * 210.0;
+    const z = rz + spread;
+    if (tryAddTree(x, z, 15.0, 26.0, 0.14, true)) added++;
+  }
+
+  // Zone 4: Surrounding 360° East, West, and South Valley Walls (full wrap-around immersion!)
+  added = 0;
+  for (let tries = 0; tries < 5500 && added < 2000; tries++) {
+    const ang = rng() * Math.PI * 2.0;
+    const rad = 360.0 + rng() * 580.0;
+    const x = Math.cos(ang) * rad * 1.15;
+    const z = 310.0 + Math.sin(ang) * rad * 0.88;
+    // Focus on East, West, South walls
+    if (z < 120.0 && Math.abs(x) < 420.0) continue;
+    if (tryAddTree(x, z, 17.0, 31.0, 0.04, false)) added++;
+  }
+
+  const instCount = instList.length / 8;
+  const instData = new Float32Array(instList);
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  const vboPos = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboPos);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(bPos), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+  const vboUv = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboUv);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(bUv), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(bIdx), gl.STATIC_DRAW);
+
+  const vboInst = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboInst);
+  gl.bufferData(gl.ARRAY_BUFFER, instData, gl.STATIC_DRAW);
+  const iStride = 8 * 4;
+  // loc 2: xyz + scaleH
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, iStride, 0);
+  gl.vertexAttribDivisor(2, 1);
+  // loc 3: scaleW, rotY, typeIdx, fireBias
+  gl.enableVertexAttribArray(3);
+  gl.vertexAttribPointer(3, 4, gl.FLOAT, false, iStride, 16);
+  gl.vertexAttribDivisor(3, 1);
+
+  gl.bindVertexArray(null);
+  return { vao, indexCount: bIdx.length, instCount };
+}
+
+const TREE_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aLocalPos;
+layout(location=1) in vec2 aLocalUv;
+layout(location=2) in vec4 aInstPosH;   // xyz, scaleH
+layout(location=3) in vec4 aInstMeta;   // scaleW, rotY, typeIdx, fireBias
+
+uniform mat4 uViewProj;
+uniform float uTime;
+
+out vec2 vAtlasUv;
+out vec3 vWorldPos;
+out vec2 vMapUv;
+out float vHeightFrac;
+out float vFireBias;
+out float vSeed;
+
+void main() {
+  float scaleH = aInstPosH.w;
+  float scaleW = aInstMeta.x;
+  float rotY = aInstMeta.y;
+  float typeIdx = aInstMeta.z;
+
+  float c = cos(rotY), s = sin(rotY);
+  vec3 lp = vec3(
+    (aLocalPos.x * c - aLocalPos.z * s) * scaleW,
+    aLocalPos.y * scaleH,
+    (aLocalPos.x * s + aLocalPos.z * c) * scaleW
+  );
+
+  // Subtle organic mountain wind sway (stiff trunk base, swaying crown tip!)
+  float swayPhase = uTime * 1.15 + aInstPosH.x * 0.037 + aInstPosH.z * 0.029;
+  float gust = sin(swayPhase) * 0.65 + sin(swayPhase * 2.3 + 1.1) * 0.35;
+  float swayAmt = aLocalPos.y * aLocalPos.y * (0.55 + aInstMeta.w * 0.85);
+  lp.x += gust * swayAmt * 0.72;
+  lp.z += gust * swayAmt * 0.24;
+
+  vec3 wp = aInstPosH.xyz + lp;
+  vWorldPos = wp;
+  vMapUv = (wp.xz + ${WORLD_HALF.toFixed(1)}) / ${WORLD_SIZE.toFixed(1)};
+  vAtlasUv = vec2((aLocalUv.x + typeIdx) * 0.25, aLocalUv.y);
+  vHeightFrac = aLocalPos.y;
+  vFireBias = aInstMeta.w;
+  vSeed = fract(sin(dot(aInstPosH.xz, vec2(12.9898, 78.233))) * 43758.5453);
+
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}`;
+
+const TREE_FS = `#version 300 es
+precision highp float;
+in vec2 vAtlasUv;
+in vec3 vWorldPos;
+in vec2 vMapUv;
+in float vHeightFrac;
+in float vFireBias;
+in float vSeed;
+out vec4 fragColor;
+
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uGlobalFlicker;
+uniform sampler2D uConiferAtlas;
+uniform sampler2D uLightMap;
+
+${GLSL_COMMON}
+
+void main() {
+  vec4 tex = texture(uConiferAtlas, vAtlasUv);
+  if (tex.a < 0.34) discard;
+
+  float edgeRim = tex.r;   // higher at outer needle tips
+  float shadeVar = tex.b;
+
+  float dist = length(uCamPos - vWorldPos);
+  vec3 viewDir = normalize(vWorldPos - uCamPos);
+
+  vec4 lm = texture(uLightMap, vMapUv);
+  float irr = lm.r * lm.r * 3.4;
+  float flick = 0.80 + 0.28 * uGlobalFlicker
+              + 0.14 * sin(uTime * 5.3 + vWorldPos.x * 0.04 + vSeed * 19.0);
+
+  // Core silhouette: deep dark pine charcoal (never cartoon green at night!)
+  vec3 col = vec3(0.005, 0.007, 0.008) * (0.65 + 0.55 * shadeVar);
+
+  // Warm orange-amber rim lighting on fire-facing pine needles & crowns
+  float rimFactor = smoothstep(0.32, 0.95, edgeRim) * (0.35 + 0.65 * vHeightFrac);
+  float fireLit = irr * flick;
+  col += vec3(0.11, 0.032, 0.006) * fireLit * (0.30 + 0.70 * shadeVar);
+  col += vec3(0.58, 0.155, 0.022) * rimFactor * fireLit * 0.52;
+
+  // Dramatic incandescent fiery edge-backlight bleed on trees perched RIGHT along the burning ridge!
+  if (vFireBias > 0.08) {
+    float localFlare = 0.7 + 0.45 * sin(uTime * 6.8 + vWorldPos.x * 0.06 + vSeed * 31.0);
+    // Thin burning amber rim around outer needle silhouettes backlit by the blaze behind them
+    float silhouetteFringe = smoothstep(0.68, 0.34, tex.a) + smoothstep(0.55, 0.98, edgeRim) * 0.65;
+    float baseEngulf = exp(-vHeightFrac * 3.2) * smoothstep(0.28, 0.82, vFireBias);
+    col += vec3(1.85, 0.48, 0.06) * silhouetteFringe * vFireBias * localFlare * 0.45;
+    col += fireBlackbody(0.55 * vFireBias * localFlare) * baseEngulf * 0.55;
+  }
+
+  // Match terrain smoky aerial perspective so distant treed hills blend seamlessly into valley haze!
+  float fogDens = 0.00118 * exp(-max(vWorldPos.y - 10.0, 0.0) * 0.0046);
+  float fogAmt = 1.0 - exp(-dist * fogDens);
+  float saddleBand = exp(-pow((vWorldPos.z + 40.0) / 210.0, 2.0)) * exp(-max(vWorldPos.y, 0.0) * 0.008);
+  fogAmt = clamp(fogAmt + saddleBand * smoothstep(140.0, 460.0, dist) * 0.38, 0.0, 0.88);
+
+  float northLook = smoothstep(-0.6, 0.85, -viewDir.z);
+  vec3 coolMist = vec3(0.012, 0.014, 0.022);
+  vec3 warmSmokeFog = vec3(0.22, 0.062, 0.014) * (0.82 + 0.22 * uGlobalFlicker);
+  float ridgeProx = exp(-pow((vWorldPos.z - ridgeCurveZ_gl(vWorldPos.x)) / 240.0, 2.0));
+  vec3 fogCol = mix(coolMist, warmSmokeFog, 0.28 + 0.72 * northLook)
+              + vec3(0.28, 0.075, 0.015) * ridgeProx * flick * 0.52;
+
+  // Keep ridge-crest trees crisp silhouettes against the blaze (less front fog right on the crest glow)
+  fogAmt *= (1.0 - vFireBias * 0.38);
+
+  col = mix(col, fogCol, fogAmt);
+  fragColor = vec4(col, 1.0);
+}`;
+
+// ============================================================================
+// 4. VOLUMETRIC MULTI-LAYER 3D RIDGE FLAMES & TORCHING CROWN FLARE-UPS
+// ============================================================================
+function createFlameGeometry() {
+  const verts = []; // pos(3), uv(2), meta(4): [intensity, seed, isTorch, worldX]
+  const indices = [];
+  let vBase = 0;
+
+  function addRibbon(pts, heightScale, seedOffset, isTorch) {
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const u = i / (pts.length - 1);
+      const h = p.h * heightScale;
+      // Bottom vertex anchored slightly below terrain surface
+      verts.push(p.x, p.y - 4.0, p.z, u * p.uScale, 0.0, p.intensity, seedOffset, isTorch, p.x);
+      // Top vertex soaring into the night sky
+      verts.push(p.x, p.y - 4.0 + h, p.z, u * p.uScale, 1.0, p.intensity, seedOffset, isTorch, p.x);
+      if (i < pts.length - 1) {
+        const a = vBase + i * 2;
+        indices.push(a, a + 2, a + 1,  a + 1, a + 2, a + 3);
+      }
+    }
+    vBase += pts.length * 2;
+  }
+
+  // A. Three depth-staggered continuous sinuous flame walls along the entire burning mountain crest!
+  const rowOffsets = [
+    { dz: -12.0, hMul: 1.05, seed: 1.3 },
+    { dz:   4.0, hMul: 1.18, seed: 4.7 },
+    { dz:  24.0, hMul: 0.85, seed: 8.9 }
+  ];
+  for (let r = 0; r < rowOffsets.length; r++) {
+    const ro = rowOffsets[r];
+    const pts = [];
+    const segs = 130;
+    for (let i = 0; i <= segs; i++) {
+      const x = lerp(-560.0, 580.0, i / segs);
+      const jitter = Math.sin(x * 0.025 + r * 2.1) * 11.0;
+      const z = ridgeCurveZ(x) + ro.dz + jitter;
+      const y = sampleHeightBilinear(x, z);
+      const fire = sampleFireBilinear(x, z);
+      pts.push({
+        x, y, z,
+        h: 26.0 + fire * 52.0,
+        intensity: fire,
+        uScale: 16.0
+      });
+    }
+    addRibbon(pts, ro.hMul, ro.seed, 0.0);
+  }
+
+  // B. Creeping flank-ravine fire ribbons descending the front slopes toward the valley!
+  const ravines = [-245, -65, 130, 330];
+  for (let ri = 0; ri < ravines.length; ri++) {
+    const cx = ravines[ri];
+    const rz = ridgeCurveZ(cx);
+    for (let side = -1; side <= 1; side += 2) {
+      const pts = [];
+      const segs = 22;
+      for (let i = 0; i <= segs; i++) {
+        const t = i / segs;
+        const x = cx + side * (12.0 + t * 18.0) + Math.sin(t * 5.0 + ri) * 14.0;
+        const z = rz + 10.0 + t * 105.0;
+        const y = sampleHeightBilinear(x, z);
+        const fire = sampleFireBilinear(x, z) * (1.0 - t * 0.55);
+        pts.push({
+          x, y, z,
+          h: 18.0 + fire * 36.0,
+          intensity: fire,
+          uScale: 3.5
+        });
+      }
+      addRibbon(pts, 0.92, 15.0 + ri * 3.7 + side, 0.0);
+    }
+  }
+
+  // C. ~55 Localized 3D Crossed Torching Crown Flare-Ups (episodic towering tree-crown explosions!)
+  const rng = mulberry32(55219);
+  for (let k = 0; k < 55; k++) {
+    const x = lerp(-480.0, 500.0, rng());
+    const z = ridgeCurveZ(x) + (rng() - 0.35) * 65.0;
+    const fire = sampleFireBilinear(x, z);
+    if (fire < 0.25) continue;
+    const y = sampleHeightBilinear(x, z);
+    const radius = lerp(11.0, 22.0, rng());
+    const h = lerp(38.0, 78.0, rng()) * (0.65 + 0.5 * fire);
+    const seed = 30.0 + k * 2.71;
+
+    // 3 crossed vertical planes per torching crown for full 360° 3D volume
+    for (let p = 0; p < 3; p++) {
+      const a = (p / 3) * Math.PI + rng() * 0.4;
+      const dx = Math.cos(a) * radius;
+      const dz = Math.sin(a) * radius;
+      const pts = [
+        { x: x - dx, y, z: z - dz, h, intensity: fire, uScale: 1.0 },
+        { x: x + dx, y, z: z + dz, h, intensity: fire, uScale: 1.0 }
+      ];
+      addRibbon(pts, 1.0, seed + p * 0.37, 1.0);
+    }
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+  const stride = 9 * 4;
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, stride, 12);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 20);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(indices), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: indices.length };
+}
+
+const FLAME_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec2 aUv;
+layout(location=2) in vec4 aMeta; // intensity, seed, isTorch, worldX
+
+uniform mat4 uViewProj;
+uniform float uTime;
+
+out vec2 vUv;
+out vec4 vMeta;
+out vec3 vWorldPos;
+
+void main() {
+  vec3 wp = aPos;
+  // Wind leans upper flame geometry gently downwind (+X, slightly +Z)
+  float h = aUv.y;
+  float windGust = 1.0 + 0.25 * sin(uTime * 1.4 + aMeta.w * 0.015);
+  wp.x += h * h * 15.5 * windGust;
+  wp.z += h * h * 3.8 * windGust;
+
+  vUv = aUv;
+  vMeta = aMeta;
+  vWorldPos = wp;
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}`;
+
+const FLAME_FS = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vUv;
+in vec4 vMeta;
+in vec3 vWorldPos;
+out vec4 fragColor;
+
+uniform float uTime;
+uniform vec3 uCamPos;
+uniform sampler3D uNoise3D;
+
+${GLSL_COMMON}
+
+void main() {
+  float baseInt = vMeta.x;
+  float seed = vMeta.y;
+  float isTorch = vMeta.z;
+  if (baseInt < 0.04) discard;
+
+  float u = vUv.x;
+  float v = vUv.y; // 0 = base on ridge, 1 = upper tip
+
+  // Soft edge mask for localized torching plumes vs continuous ridge curtains
+  float horizMask = 1.0;
+  if (isTorch > 0.5) {
+    float cx = abs(u - 0.5) * 2.0;
+    // Narrower flame column tapering cleanly as it rises
+    horizMask = smoothstep(1.0, 0.15, cx / mix(1.0, 0.42, v));
+    if (horizMask < 0.01) discard;
+  }
+
+  // Episodic flare-up & chaotic multi-frequency flicker!
+  float surge = 0.72
+    + 0.22 * sin(uTime * 1.65 + seed * 3.1 + vWorldPos.x * 0.018)
+    + 0.16 * sin(uTime * 4.70 + seed * 7.3 + vWorldPos.x * 0.045)
+    + 0.10 * sin(uTime * 11.4 + seed * 13.7 + vWorldPos.x * 0.09);
+
+  if (isTorch > 0.5) {
+    // Periodic dramatic conifer crown torching spikes!
+    float cycle = sin(uTime * 0.75 + seed * 2.3) * 0.5 + 0.5;
+    float spike = pow(cycle, 3.2);
+    surge *= (0.35 + 1.15 * spike);
+  }
+
+  // 3D world-space turbulent fluid advection (uses hardware 3D Perlin-Worley texture!)
+  // Rising upward rapidly + sheared diagonally by mountain wind (+X)
+  vec3 windShear = vec3(-v * 0.55, -uTime * 0.62, -v * 0.14);
+  vec3 p1 = vWorldPos * 0.0165 + windShear + vec3(seed * 0.17, 0.0, seed * 0.11);
+  vec4 nLarge = texture(uNoise3D, p1);
+
+  // Domain-warp coordinates for curling, licking turbulent flame tongues!
+  vec3 warp = (nLarge.rgb - 0.5) * vec3(0.45, 0.58, 0.45) * (0.35 + 0.85 * v);
+  vec3 p2 = vWorldPos * 0.038 + vec3(-v * 0.95, -uTime * 1.28, -v * 0.25) + warp + vec3(seed * 0.31);
+  vec4 nMid = texture(uNoise3D, p2);
+
+  // Fine crackling high-frequency tongue edges
+  vec3 p3 = vWorldPos * 0.095 + vec3(-v * 1.4, -uTime * 2.35, 0.0) + warp * 1.5;
+  vec4 nFine = texture(uNoise3D, p3);
+
+  // Combine multi-scale turbulent flame density
+  float turb = nLarge.r * 0.42 + nMid.g * 0.36 + nFine.a * 0.22;
+  // Carve sharp licking flame tongues vertically
+  float tongues = nMid.r * 0.55 + nFine.r * 0.45;
+
+  // Dynamic flame reach along height
+  float maxReach = clamp((0.36 + 0.56 * baseInt) * surge * (0.65 + 0.70 * nLarge.g), 0.14, 0.96);
+  float heightFalloff = smoothstep(maxReach, 0.0, v + (turb - 0.5) * 0.42);
+  // Extra detached licking flame wisps near tips
+  float wisp = smoothstep(0.58, 0.88, tongues) * smoothstep(maxReach + 0.16, maxReach * 0.35, v) * 0.45;
+
+  float shape = (heightFalloff + wisp) * horizMask;
+  // Soft anchor at very bottom so it melts organically out of glowing terrain coals
+  shape *= smoothstep(0.0, 0.09, v);
+  // Crisp flame boundary (sharp edges like real fire, not mushy fog!)
+  float alpha = smoothstep(0.16, 0.54, shape * (0.55 + 0.85 * tongues));
+  if (alpha < 0.01) discard;
+
+  // Temperature: hottest near oxygen-fed base & dense cores, cooling rapidly to deep crimson at ragged tips
+  float temp = shape * (0.72 + 0.65 * tongues) * (1.18 - 0.72 * pow(v, 0.85)) * (0.75 + 0.45 * baseInt);
+  // Bright flickering incandescent pockets inside the roaring core
+  temp += smoothstep(0.62, 0.92, nFine.g) * (1.0 - v) * 0.35 * baseInt;
+
+  vec3 col = fireBlackbody(temp);
+
+  // Fade slightly with extreme distance so far flank fires settle into the smoky horizon
+  float dist = length(uCamPos - vWorldPos);
+  float distFade = exp(-max(dist - 520.0, 0.0) * 0.00085);
+  col *= distFade;
+
+  // Premultiplied additive-friendly glow output
+  fragColor = vec4(col * alpha, alpha);
+}`;
+
+// ============================================================================
+// 5. TRUE 3D VOLUMETRIC RAYMARCHED SMOKE COLUMNS LIT FROM BELOW + VALLEY MIST
+// ============================================================================
+const SMOKE_FS = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform mat4 uInvViewProj;
+uniform mat4 uViewProj;
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uGlobalFlicker;
+uniform vec2 uNearFar;
+uniform sampler2D uDepthTex;
+uniform sampler3D uNoise3D;
+uniform vec4 uFireLights[${NUM_FIRE_LIGHTS}];
+
+${GLSL_COMMON}
+
+float linearizeDepth(float d) {
+  float z = d * 2.0 - 1.0;
+  float n = uNearFar.x, f = uNearFar.y;
+  return (2.0 * n * f) / (f + n - z * (f - n));
+}
+
+// Interleaved Gradient Noise for banding-free raymarch jitter
+float ign(vec2 p) {
+  return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// Evaluate 3D volumetric smoke density at world position p
+// Returns vec2(density, heightAboveRidge)
+vec2 sampleSmokeVolume(vec3 p) {
+  float rz = ridgeCurveZ_gl(p.x);
+  // Base ridge height approximation along main fire line (fast analytical match)
+  float baseY = 175.0
+    + 68.0 * exp(-pow((p.x + 275.0) / 195.0, 2.0))
+    + 76.0 * exp(-pow((p.x - 105.0) / 185.0, 2.0))
+    + 45.0 * exp(-pow((p.x - 425.0) / 220.0, 2.0));
+
+  float hAbove = p.y - (baseY - 20.0);
+  float dens = 0.0;
+
+  // A. TOWERING CONVECTIVE PYROCUMULUS SMOKE COLUMNS rising from the burning ridge!
+  // Prevailing mountain wind shears columns downwind (+X and gently +Z toward East-Southeast)
+  if (hAbove > -25.0 && hAbove < 780.0) {
+    float hPos = max(hAbove, 0.0);
+    // Curved wind-sheared coordinate system
+    float windBendX = pow(hPos * 0.01, 1.32) * 34.0;
+    float windBendZ = pow(hPos * 0.01, 1.24) * 14.0;
+
+    // Un-bend p back to column source coordinates
+    float srcX = p.x - windBendX;
+    float srcZ = p.z - windBendZ;
+    float srcRz = ridgeCurveZ_gl(srcX);
+    float dz = srcZ - srcRz;
+
+    // Main continuous ridge smoke curtain + 6 distinct towering pyrocumulus plume cores!
+    float span = smoothstep(-580.0, -340.0, srcX) * smoothstep(610.0, 360.0, srcX);
+    float colRadius = 56.0 + hPos * 0.36;
+    float zEnv = exp(-(dz * dz) / (2.0 * colRadius * colRadius));
+
+    // Distinct billowing column peaks along the ridge (so sky has dramatic individual smoke towers + gaps!)
+    float plumes = 0.42
+      + 0.72 * exp(-pow((srcX + 340.0) / 115.0, 2.0))
+      + 0.95 * exp(-pow((srcX + 125.0) / 130.0, 2.0))
+      + 1.05 * exp(-pow((srcX - 95.0) / 138.0, 2.0))
+      + 0.82 * exp(-pow((srcX - 315.0) / 125.0, 2.0))
+      + 0.58 * exp(-pow((srcX - 495.0) / 115.0, 2.0));
+
+    float vEnv = smoothstep(-15.0, 38.0, hAbove) * smoothstep(740.0, 220.0, hPos);
+    float baseShape = span * zEnv * plumes * vEnv;
+
+    if (baseShape > 0.03) {
+      // Advect 3D billowing Perlin-Worley cauliflower noise UPWARD & DOWNWIND!
+      vec3 flow = vec3(-uTime * 0.036, -uTime * 0.052, -uTime * 0.012);
+      vec3 q1 = p * 0.0029 + flow;
+      vec4 n1 = texture(uNoise3D, q1);
+      // Domain warp for rolling turbulent smoke curls
+      vec3 q2 = p * 0.0068 + flow * 1.65 + (n1.rgb - 0.5) * 0.28;
+      vec4 n2 = texture(uNoise3D, q2);
+
+      // Cauliflower billowing cloud carving: Worley lobes (g) + fBm (r) + fine wisps (a)
+      float cloud = n1.g * 0.48 + n1.r * 0.22 + n2.g * 0.20 + n2.a * 0.10;
+      float erode = mix(0.28, 0.46, smoothstep(40.0, 520.0, hPos));
+      float d = smoothstep(erode, erode + 0.42, baseShape * (0.45 + 0.95 * cloud));
+      dens += d * 0.0135;
+    }
+  }
+
+  // B. LOW-LYING DRIFTING VALLEY SMOKE & HAZE RIBBONS (between spurs & foreground!)
+  if (p.y > 5.0 && p.y < 185.0 && p.z > -180.0 && p.z < 520.0) {
+    float vH = smoothstep(5.0, 40.0, p.y) * smoothstep(180.0, 65.0, p.y);
+    vec3 mq = p * vec3(0.0032, 0.0075, 0.0032) + vec3(-uTime * 0.018, -uTime * 0.004, -uTime * 0.007);
+    vec4 mn = texture(uNoise3D, mq);
+    float mist = smoothstep(0.46, 0.84, mn.r * 0.65 + mn.g * 0.35) * vH;
+    // Concentrate subtly in valley trough & foothill saddles
+    float valleyZone = smoothstep(520.0, 220.0, abs(p.x));
+    dens += mist * valleyZone * 0.00145;
+  }
+
+  return vec2(dens, max(hAbove, 0.0));
+}
+
+void main() {
+  vec4 ndcFar = vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+  vec4 worldFar = uInvViewProj * ndcFar;
+  vec3 rayDir = normalize(worldFar.xyz / worldFar.w - uCamPos);
+
+  float rawDepth = texture(uDepthTex, vUv).r;
+  // Distance along ray to opaque geometry (or far sky limit)
+  float maxT = 1650.0;
+  if (rawDepth < 0.99995) {
+    vec4 ndcD = vec4(vUv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
+    vec4 worldD = uInvViewProj * ndcD;
+    vec3 hitP = worldD.xyz / worldD.w;
+    maxT = min(maxT, length(hitP - uCamPos));
+  }
+
+  // Skip rays pointing straight down into close ground
+  if (rayDir.y < -0.45 && maxT < 120.0) {
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  // Adaptive non-uniform march: finer steps near valley & ridge, broader steps far aloft
+  const int STEPS = 44;
+  float jitter = ign(gl_FragCoord.xy + fract(uTime * 0.0)); // static IGN keeps temporal stability clean!
+  float tMin = 28.0;
+  float tEnd = min(maxT, 1480.0);
+  if (tEnd <= tMin) {
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  vec3 accumLight = vec3(0.0);
+  float trans = 1.0;
+  float prevT = tMin;
+
+  for (int i = 0; i < STEPS; i++) {
+    float f0 = (float(i) + jitter) / float(STEPS);
+    float f1 = (float(i + 1) + jitter) / float(STEPS);
+    // Mild quadratic distribution packs more steps across the 200..850m ridge/plume sweet spot
+    float t0 = mix(tMin, tEnd, f0 * (0.62 + 0.38 * f0));
+    float t1 = mix(tMin, tEnd, min(1.0, f1 * (0.62 + 0.38 * f1)));
+    float dt = t1 - t0;
+    float tMid = 0.5 * (t0 + t1);
+    vec3 p = uCamPos + rayDir * tMid;
+
+    vec2 sd = sampleSmokeVolume(p);
+    float dens = sd.x;
+    float hAbove = sd.y;
+
+    if (dens > 0.00008) {
+      // BOTTOM-UP VOLUMETRIC FIRE ILLUMINATION!
+      // 1. Measure optical depth downward toward the burning ridge below p (2-tap self-shadowing!)
+      float dDown1 = sampleSmokeVolume(p - vec3(14.0, 48.0, 5.0)).x;
+      float dDown2 = sampleSmokeVolume(p - vec3(32.0, 118.0, 12.0)).x;
+      float tauBelow = (dDown1 * 55.0 + dDown2 * 95.0);
+
+      // Dual-lobe multiple-scattering approximation (bright illuminated underside + glowing deep core!)
+      float scatterAtt = 0.68 * exp(-tauBelow * 1.35) + 0.32 * exp(-tauBelow * 0.30);
+
+      // 2. Sum live flickering firelight from the burning ridge fire clusters directly underneath!
+      vec3 fireRad = vec3(0.0);
+      for (int li = 0; li < ${NUM_FIRE_LIGHTS}; li++) {
+        vec3 toL = uFireLights[li].xyz - p;
+        float dist2 = dot(toL, toL);
+        // Stronger vertical reach straight above flames; warm inverse-square falloff
+        float horizD2 = toL.x * toL.x + toL.z * toL.z;
+        float vertD = max(0.0, -toL.y);
+        float effD2 = horizD2 * 0.92 + vertD * vertD * 0.52 + 2400.0;
+        float att = (uFireLights[li].w * 52000.0) / effD2;
+        // Upward directional bias: surfaces facing downward toward the blaze glow fiercely!
+        float underGlow = smoothstep(-0.35, 0.85, -toL.y / (sqrt(dist2) + 1.0));
+        fireRad += vec3(1.0, 0.34, 0.055) * att * (0.28 + 0.72 * underGlow);
+      }
+
+      // Spectral smoke absorption: blazing orange-gold right over flames -> deep burnt crimson higher up!
+      float altShift = clamp(hAbove / 320.0 + tauBelow * 0.45, 0.0, 1.0);
+      vec3 smokeTint = mix(vec3(1.05, 0.72, 0.34), vec3(0.88, 0.22, 0.075), altShift);
+      vec3 litUnder = fireRad * smokeTint * scatterAtt * 0.36;
+
+      // Subtle cool/dark charcoal ambient on upper smoke billows so they silhouette dramatically against sky glow!
+      vec3 darkSootAmb = vec3(0.011, 0.011, 0.016) * (0.55 + 0.45 * smoothstep(80.0, 480.0, hAbove));
+      // Faint backlit rim glow where thin edges meet the bright horizon
+      float edgePowder = 1.0 - exp(-dens * dt * 2.8);
+      vec3 sampleCol = darkSootAmb + litUnder * (0.65 + 0.55 * edgePowder);
+
+      float stepTrans = exp(-dens * dt);
+      // Energy-conserving analytical integration across step
+      accumLight += trans * sampleCol * (1.0 - stepTrans);
+      trans *= stepTrans;
+
+      if (trans < 0.015) {
+        trans = 0.0;
+        break;
+      }
+    }
+    prevT = t1;
+  }
+
+  fragColor = vec4(accumLight, trans);
+}`;
+
+// ============================================================================
+// 6. COMPOSITE SMOKE (WITH DEPTH-AWARE SOFT SMOOTHING) ONTO SCENE
+// ============================================================================
+const COMPOSITE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uSceneTex;
+uniform sampler2D uSmokeTex;
+uniform sampler2D uDepthTex;
+uniform vec2 uSmokeTexel;
+uniform vec2 uNearFar;
+
+float linD(float d) {
+  float z = d * 2.0 - 1.0;
+  return (2.0 * uNearFar.x * uNearFar.y) / (uNearFar.y + uNearFar.x - z * (uNearFar.y - uNearFar.x));
+}
+
+void main() {
+  vec3 scene = texture(uSceneTex, vUv).rgb;
+  float centerD = linD(texture(uDepthTex, vUv).r);
+
+  // 5-tap depth-aware bilateral upsample of volumetric smoke (zero haloing around silhouetted pines!)
+  vec4 acc = vec4(0.0);
+  float wSum = 0.0;
+  vec2 offs[5] = vec2[5](
+    vec2(0.0, 0.0),
+    vec2(-1.0, 0.0), vec2(1.0, 0.0),
+    vec2(0.0, -1.0), vec2(0.0, 1.0)
+  );
+  float kW[5] = float[5](0.40, 0.15, 0.15, 0.15, 0.15);
+  for (int i = 0; i < 5; i++) {
+    vec2 suv = vUv + offs[i] * uSmokeTexel;
+    float sd = linD(texture(uDepthTex, suv).r);
+    float dw = exp(-abs(sd - centerD) / max(35.0, centerD * 0.18));
+    float w = kW[i] * dw;
+    acc += texture(uSmokeTex, suv) * w;
+    wSum += w;
+  }
+  vec4 smoke = acc / max(wSum, 0.0001);
+
+  vec3 outCol = scene * smoke.a + smoke.rgb;
+  fragColor = vec4(outCol, 1.0);
+}`;
+
+// ============================================================================
+// 7. GPU 3D RISING EMBERS & SPARK STREAKS (~4,200 Particles)
+// ============================================================================
+function createEmberSystem() {
+  const COUNT = 4200;
+  const rng = mulberry32(99103);
+  // Each ember: origin(3), phaseLifeSizeClass(4)
+  // Using instanced quad (4 verts, 6 indices) so we can orient velocity-aligned motion streaks in VS!
+  const qVerts = new Float32Array([-1, -1,  1, -1,  1, 1,  -1, 1]);
+  const qIdx = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+  const data = new Float32Array(COUNT * 8);
+  let p = 0;
+  for (let i = 0; i < COUNT; i++) {
+    const rClass = rng();
+    let ox, oy, oz, life, size, kind;
+    if (rClass < 0.62) {
+      // Kind 0: Dense ridge eruption sparks shooting up from active ridge hotspots!
+      const node = fireNodes[Math.floor(rng() * NUM_FIRE_LIGHTS)];
+      ox = node.x + (rng() - 0.5) * 95.0;
+      oz = ridgeCurveZ(ox) + (rng() - 0.35) * 55.0;
+      oy = sampleHeightBilinear(ox, oz) + 3.0 + rng() * 14.0;
+      life = lerp(6.5, 16.0, rng());
+      size = lerp(0.55, 1.45, rng());
+      kind = 0.0;
+    } else if (rClass < 0.90) {
+      // Kind 1: High/mid-air wind-carried glowing firebrands drifting across valley sky!
+      const node = fireNodes[Math.floor(rng() * NUM_FIRE_LIGHTS)];
+      ox = node.x + (rng() - 0.5) * 140.0;
+      oz = ridgeCurveZ(ox) + (rng() - 0.3) * 80.0;
+      oy = sampleHeightBilinear(ox, oz) + 8.0 + rng() * 25.0;
+      life = lerp(14.0, 28.0, rng());
+      size = lerp(0.75, 1.85, rng());
+      kind = 1.0;
+    } else {
+      // Kind 2: Near-camera hero valley embers (toroidal volume wrapped around camera!)
+      ox = (rng() - 0.5) * 180.0;
+      oy = rng() * 58.0;
+      oz = (rng() - 0.5) * 180.0;
+      life = lerp(9.0, 18.0, rng());
+      size = lerp(0.11, 0.26, rng());
+      kind = 2.0;
+    }
+    const phase = rng();
+    const seed = rng();
+    data[p++] = ox; data[p++] = oy; data[p++] = oz; data[p++] = life;
+    data[p++] = phase; data[p++] = size; data[p++] = kind; data[p++] = seed;
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vboQ = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboQ);
+  gl.bufferData(gl.ARRAY_BUFFER, qVerts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, qIdx, gl.STATIC_DRAW);
+
+  const vboI = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboI);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
+  gl.vertexAttribDivisor(1, 1);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
+  gl.vertexAttribDivisor(2, 1);
+  gl.bindVertexArray(null);
+
+  return { vao, count: COUNT };
+}
+
+const EMBER_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aQuad;
+layout(location=1) in vec4 aOriginLife; // ox, oy, oz, life
+layout(location=2) in vec4 aMeta;       // phase, size, kind, seed
+
+uniform mat4 uViewProj;
+uniform vec3 uCamPos;
+uniform vec2 uViewport;
+uniform float uTime;
+
+out vec2 vUv;
+out float vHeat;
+out float vFlicker;
+out float vKind;
+out float vBokeh;
+
+vec3 emberPos(vec3 orig, float age, float kind, float seed) {
+  float a1 = seed * 6.28318;
+  float a2 = fract(seed * 17.31) * 6.28318;
+  if (kind > 1.5) {
+    // Near-camera valley firebrands drifting lazily across the valley air in 3D wrap volume
+    vec3 vel = vec3(5.2 + 2.8 * sin(a1), 0.75 + 0.65 * cos(a2), 1.8 + 1.4 * sin(a1 + a2));
+    vec3 p = orig + vel * uTime;
+    p.x += sin(uTime * 0.85 + a1 + p.y * 0.08) * 3.8;
+    p.y += sin(uTime * 1.15 + a2 + p.x * 0.06) * 2.2;
+    p.z += cos(uTime * 0.75 + a1 * 1.7) * 2.8;
+    // Toroidal wrap around drifting camera
+    vec3 rel = mod(p - uCamPos + vec3(90.0, 12.0, 90.0), vec3(180.0, 62.0, 180.0)) - vec3(90.0, 12.0, 90.0);
+    return uCamPos + rel;
+  } else {
+    // Rising thermal column + wind shear + turbulent swirl!
+    float updraft = (kind < 0.5 ? 20.5 : 15.0) * (0.72 + 0.56 * fract(seed * 7.13));
+    float rise = updraft * age * exp(-age * 0.042);
+    // Prevailing mountain wind carries embers diagonally (+X, gently +Z toward valley!)
+    float windX = (kind < 0.5 ? 11.5 : 22.0) * pow(age, 1.16) * (0.75 + 0.5 * fract(seed * 11.7));
+    float windZ = (kind < 0.5 ? 4.8 : 13.5) * pow(age, 1.12) * (0.65 + 0.7 * fract(seed * 5.3));
+    // Swirling convective curl eddies
+    float swirlR = (4.5 + age * 1.85) * (0.5 + 0.8 * fract(seed * 3.7));
+    float swirlX = sin(age * 1.35 + a1) * swirlR + cos(age * 2.6 + a2) * swirlR * 0.35;
+    float swirlY = cos(age * 1.75 + a2) * (2.2 + age * 0.45);
+    float swirlZ = cos(age * 1.25 + a1) * swirlR * 0.85;
+    return orig + vec3(windX + swirlX, rise + swirlY, windZ + swirlZ);
+  }
+}
+
+void main() {
+  float life = aOriginLife.w;
+  float phase = aMeta.x;
+  float size = aMeta.y;
+  float kind = aMeta.z;
+  float seed = aMeta.w;
+
+  float age = mod(uTime + phase * life, life);
+  float ageFrac = age / life;
+
+  vec3 pos = emberPos(aOriginLife.xyz, age, kind, seed);
+  vec3 posNext = emberPos(aOriginLife.xyz, age + 0.045, kind, seed);
+
+  vec4 clip0 = uViewProj * vec4(pos, 1.0);
+  vec4 clip1 = uViewProj * vec4(posNext, 1.0);
+
+  // Reject behind camera
+  if (clip0.w <= 0.4) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
+  vec2 ndc0 = clip0.xy / clip0.w;
+  vec2 ndc1 = clip1.xy / max(clip1.w, 0.1);
+  vec2 velPx = (ndc1 - ndc0) * uViewport * 0.5;
+  float speedPx = length(velPx);
+
+  // Subtle velocity-aligned cinema shutter motion streak!
+  vec2 dirPx = speedPx > 0.15 ? (velPx / speedPx) : vec2(0.0, 1.0);
+  vec2 perpPx = vec2(-dirPx.y, dirPx.x);
+
+  float dist = length(pos - uCamPos);
+  // Perspective pixel radius with minimum visibility floor for distant ridge sparks
+  float basePx = clamp((size / max(dist, 2.0)) * uViewport.y * 0.92, 1.15, 22.0);
+  // Near-camera hero embers get gentle photographic out-of-focus bokeh!
+  float bokeh = kind > 1.5 ? smoothstep(26.0, 4.5, dist) : 0.0;
+  basePx *= (1.0 + bokeh * 2.2);
+
+  float stretchPx = min(speedPx * 0.65, basePx * 4.2);
+  vec2 offsetPx = dirPx * (aQuad.y * (basePx + stretchPx)) + perpPx * (aQuad.x * basePx);
+
+  gl_Position = clip0;
+  gl_Position.xy += (offsetPx / (uViewport * 0.5)) * clip0.w;
+
+  vUv = aQuad;
+  vKind = kind;
+  vBokeh = bokeh;
+
+  // Temperature cools as ember rises & ages (incandescent yellow-white -> orange -> deep red)
+  if (kind > 1.5) {
+    float edgeFade = smoothstep(88.0, 62.0, max(abs(pos.x - uCamPos.x), abs(pos.z - uCamPos.z)));
+    vHeat = (0.55 + 0.45 * sin(uTime * 1.8 + seed * 41.0)) * edgeFade;
+  } else {
+    float fadeIn = smoothstep(0.0, 0.06, ageFrac);
+    float fadeOut = smoothstep(1.0, 0.68, ageFrac);
+    vHeat = (1.12 - ageFrac * 0.72) * fadeIn * fadeOut;
+  }
+
+  // Rapid chaotic tumble-glint flicker!
+  float fl = 0.52 + 0.48 * sin(uTime * (9.0 + seed * 14.0) + seed * 67.0);
+  vFlicker = 0.45 + 0.85 * fl * fl;
+}`;
+
+const EMBER_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in float vHeat;
+in float vFlicker;
+in float vKind;
+in float vBokeh;
+out vec4 fragColor;
+
+${GLSL_COMMON}
+
+void main() {
+  float r2 = dot(vUv, vUv);
+  if (r2 > 1.0) discard;
+
+  // Soft glowing core; soft optical bokeh disk for near-camera hero embers!
+  float core = mix(exp(-r2 * 5.2), smoothstep(1.0, 0.25, r2) * 0.65 + exp(-r2 * 3.5) * 0.35, vBokeh);
+  float inten = core * vHeat * vFlicker;
+  if (inten < 0.01) discard;
+
+  vec3 col = fireBlackbody(clamp(vHeat * 0.95 + 0.15, 0.0, 1.18)) * (vKind > 1.5 ? 1.45 : 1.75);
+  fragColor = vec4(col * inten, inten);
+}`;
+
+// ============================================================================
+// 8. GPU 3D FALLING ASH FLAKES (~2,600 Particles, Toroidal Valley Volume)
+// ============================================================================
+function createAshSystem() {
+  const COUNT = 2600;
+  const rng = mulberry32(314159);
+  const qVerts = new Float32Array([-1, -1,  1, -1,  1, 1,  -1, 1]);
+  const qIdx = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+  const data = new Float32Array(COUNT * 8);
+  let p = 0;
+  for (let i = 0; i < COUNT; i++) {
+    data[p++] = (rng() - 0.5) * 140.0; // ox
+    data[p++] = rng() * 54.0;          // oy
+    data[p++] = (rng() - 0.5) * 140.0; // oz
+    data[p++] = lerp(0.055, 0.155, rng()); // flake physical radius in meters
+    data[p++] = rng();                 // seedA
+    data[p++] = rng();                 // seedB
+    data[p++] = lerp(0.65, 1.55, rng()); // fallSpeed
+    data[p++] = rng() * 6.28318;       // initAngle
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vboQ = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboQ);
+  gl.bufferData(gl.ARRAY_BUFFER, qVerts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, qIdx, gl.STATIC_DRAW);
+
+  const vboI = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboI);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
+  gl.vertexAttribDivisor(1, 1);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
+  gl.vertexAttribDivisor(2, 1);
+  gl.bindVertexArray(null);
+
+  return { vao, count: COUNT };
+}
+
+const ASH_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aQuad;
+layout(location=1) in vec4 aOriginSize; // ox, oy, oz, size
+layout(location=2) in vec4 aMeta;       // seedA, seedB, fallSpeed, initAng
+
+uniform mat4 uViewProj;
+uniform vec3 uCamPos;
+uniform vec2 uViewport;
+uniform float uTime;
+
+out vec2 vUv;
+out float vSeed;
+out float vTumble;
+out float vAlpha;
+
+void main() {
+  float seedA = aMeta.x;
+  float seedB = aMeta.y;
+  float fallSpd = aMeta.z;
+  float ang = aMeta.w + uTime * (1.2 + seedA * 2.4) * (seedB > 0.5 ? 1.0 : -1.0);
+
+  // Slow downward rain of weightless ash + lateral valley breeze + fluttering side-slip!
+  vec3 pos = aOriginSize.xyz;
+  pos.x += uTime * (2.6 + seedA * 1.4) + sin(uTime * (0.9 + seedB * 0.8) + seedA * 25.0) * 2.1;
+  pos.y -= uTime * fallSpd;
+  pos.z += uTime * (1.1 + seedB * 0.9) + cos(uTime * (0.8 + seedA * 0.7) + seedB * 19.0) * 1.6;
+
+  // Seamless 3D toroidal wrap around camera (visible in full 360°!)
+  vec3 box = vec3(135.0, 52.0, 135.0);
+  vec3 rel = mod(pos - uCamPos + vec3(box.x * 0.5, 10.0, box.z * 0.5), box) - vec3(box.x * 0.5, 10.0, box.z * 0.5);
+  vec3 wp = uCamPos + rel;
+
+  vec4 clip = uViewProj * vec4(wp, 1.0);
+  if (clip.w <= 1.2) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
+  float dist = length(rel);
+  float pxR = clamp((aOriginSize.w / max(dist, 1.8)) * uViewport.y * 0.85, 0.95, 11.0);
+
+  // 3D tumbling foreshortening (flat charred flake flipping end-over-end!)
+  float tumble = 0.28 + 0.72 * abs(sin(uTime * (1.8 + seedB * 2.5) + seedA * 31.0));
+  float ca = cos(ang), sa = sin(ang);
+  vec2 qRot = vec2(
+    aQuad.x * ca - aQuad.y * tumble * sa,
+    aQuad.x * sa + aQuad.y * tumble * ca
+  );
+
+  gl_Position = clip;
+  gl_Position.xy += (qRot * pxR / (uViewport * 0.5)) * clip.w;
+
+  // Soft distance fade (avoid harsh pop near lens or box edge)
+  float nearFade = smoothstep(1.8, 5.5, dist);
+  float farFade = smoothstep(64.0, 24.0, dist);
+  vUv = aQuad;
+  vSeed = seedA;
+  vTumble = tumble;
+  vAlpha = nearFade * farFade * (0.45 + 0.45 * seedB);
+}`;
+
+const ASH_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in float vSeed;
+in float vTumble;
+in float vAlpha;
+out vec4 fragColor;
+
+uniform float uGlobalFlicker;
+
+void main() {
+  // Irregular angular charred flake silhouette (distinct from circular sparks!)
+  float a = atan(vUv.y, vUv.x);
+  float r = length(vUv);
+  float edge = 0.68 + 0.24 * sin(a * 3.0 + vSeed * 19.0) + 0.14 * cos(a * 5.0 - vSeed * 31.0);
+  float mask = smoothstep(edge, edge - 0.22, r);
+  if (mask < 0.02) discard;
+
+  // Pale charred ash gray catching gentle warm amber glint from the distant wildfire!
+  vec3 coolAsh = vec3(0.18, 0.17, 0.18);
+  vec3 fireGlint = vec3(0.56, 0.24, 0.09) * (0.8 + 0.28 * uGlobalFlicker);
+  vec3 col = mix(coolAsh, fireGlint, 0.35 + 0.55 * vTumble);
+
+  float al = mask * vAlpha * 0.78;
+  fragColor = vec4(col, al);
+}`;
+
+// ============================================================================
+// 9. HDR MULTI-SCALE OPTICAL BLOOM & ACES FILMIC POST-PROCESSING
+// ============================================================================
+const BLOOM_EXTRACT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uTex;
+
+void main() {
+  vec3 col = texture(uTex, vUv).rgb;
+  // Soft-knee threshold targeting blazing flames, hot ridge embers, and incandescent sparks
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  float thresh = 0.55;
+  float knee = 0.45;
+  float soft = clamp(lum - thresh + knee, 0.0, 2.0 * knee);
+  soft = (soft * soft) / (4.0 * knee + 0.0001);
+  float contrib = max(soft, lum - thresh) / max(lum, 0.0001);
+  fragColor = vec4(col * max(contrib, 0.0), 1.0);
+}`;
+
+const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uTex;
+uniform vec2 uDir; // texelStep * axis
+
+void main() {
+  // 9-tap Gaussian filter
+  vec3 sum = texture(uTex, vUv).rgb * 0.227027;
+  sum += texture(uTex, vUv + uDir * 1.384615).rgb * 0.316216;
+  sum += texture(uTex, vUv - uDir * 1.384615).rgb * 0.316216;
+  sum += texture(uTex, vUv + uDir * 3.230769).rgb * 0.070270;
+  sum += texture(uTex, vUv - uDir * 3.230769).rgb * 0.070270;
+  fragColor = vec4(sum, 1.0);
+}`;
+
+const POST_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uSceneTex;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform sampler2D uBloom3;
+uniform sampler2D uBloom4;
+uniform float uTime;
+uniform vec2 uResolution;
+
+${GLSL_COMMON}
+
+// Refined ACES Filmic tone mapping (smooth incandescent highlight roll-off, rich cinema shadows)
+vec3 acesFilmic(vec3 x) {
+  const mat3 m1 = mat3(
+    0.59719, 0.07600, 0.02840,
+    0.35458, 0.90834, 0.13383,
+    0.04823, 0.01566, 0.83777
+  );
+  const mat3 m2 = mat3(
+    1.60475, -0.10208, -0.00327,
+    -0.53108,  1.10813, -0.07276,
+    -0.07367, -0.00605,  1.07602
+  );
+  vec3 v = m1 * x;
+  vec3 a = v * (v + 0.0245786) - 0.000090537;
+  vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+  return clamp(m2 * (a / b), 0.0, 1.0);
+}
+
+void main() {
+  vec3 col = texture(uSceneTex, vUv).rgb;
+
+  // Multi-scale cinema bloom: tight glowing flame edge + wide atmospheric amber lens halation!
+  vec3 b1 = texture(uBloom1, vUv).rgb;
+  vec3 b2 = texture(uBloom2, vUv).rgb;
+  vec3 b3 = texture(uBloom3, vUv).rgb;
+  vec3 b4 = texture(uBloom4, vUv).rgb;
+  vec3 bloom = b1 * 0.22 + b2 * 0.24 + b3 * 0.20 + b4 * 0.16;
+  // Subtle warm film halation tint on widest bloom halo
+  col += bloom * vec3(1.06, 0.88, 0.72) * 0.58;
+
+  // Exposure tuned for moody high-ISO nocturnal cinema look
+  col *= 1.18;
+
+  // Subtle natural optical lens vignette
+  vec2 centered = (vUv - 0.5) * vec2(uResolution.x / max(uResolution.y, 1.0), 1.0);
+  float vig = 1.0 - smoothstep(0.45, 1.38, length(centered)) * 0.34;
+  col *= vig;
+
+  // ACES Filmic tone map
+  col = acesFilmic(col);
+
+  // Subtle shadow-grade lift so deep valley shadows stay rich dark charcoal-indigo instead of flat black
+  col = mix(vec3(0.005, 0.007, 0.011), col, 0.985);
+
+  // Gamma 2.2 encoding
+  col = pow(max(col, 0.0), vec3(1.0 / 2.2));
+
+  // Fine organic 35mm cinema film grain (eliminates any 8-bit gradient banding in dark sky/smoke!)
+  float grain = (hash12(gl_FragCoord.xy + fract(uTime * 19.37) * 137.0) - 0.5) * 0.022;
+  col = clamp(col + grain, 0.0, 1.0);
+
+  fragColor = vec4(col, 1.0);
+}`;
+
+// ============================================================================
+// COMPILE ALL PROGRAMS & BUILD GEOMETRY
+// ============================================================================
+let progSky, progTerrain, progTree, progFlame, progSmoke, progComp, progEmber, progAsh, progBloomExt, progBlur, progPost;
+try {
+  progSky      = createProgram(FS_QUAD_VS, SKY_FS);
+  progTerrain  = createProgram(TERRAIN_VS, TERRAIN_FS);
+  progTree     = createProgram(TREE_VS, TREE_FS);
+  progFlame    = createProgram(FLAME_VS, FLAME_FS);
+  progSmoke    = createProgram(FS_QUAD_VS, SMOKE_FS);
+  progComp     = createProgram(FS_QUAD_VS, COMPOSITE_FS);
+  progEmber    = createProgram(EMBER_VS, EMBER_FS);
+  progAsh      = createProgram(ASH_VS, ASH_FS);
+  progBloomExt = createProgram(FS_QUAD_VS, BLOOM_EXTRACT_FS);
+  progBlur     = createProgram(FS_QUAD_VS, BLUR_FS);
+  progPost     = createProgram(FS_QUAD_VS, POST_FS);
+} catch (e) {
+  showError(e.message);
+  return;
+}
+
+const emptyVao = gl.createVertexArray();
+const terrainGeom = createTerrainGeometry();
+const coniferGeom = createConiferSystem();
+const flameGeom = createFlameGeometry();
+const emberGeom = createEmberSystem();
+const ashGeom = createAshSystem();
+
+// ============================================================================
+// FRAMEBUFFERS (HDR Scene + Depth, Smoke Volume, Composited HDR, 4-Level Bloom Pyramid)
+// ============================================================================
+function createTex2D(w, h, internalFmt, fmt, type, filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, fmt, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+function createFBO(w, h, withDepthTex, withDepthRB) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const filter = (HDR_TYPE === gl.HALF_FLOAT && !extFloatLinear) ? gl.LINEAR : gl.LINEAR;
+  const colTex = createTex2D(w, h, HDR_INTERNAL, gl.RGBA, HDR_TYPE, filter);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colTex, 0);
+  let depthTex = null, depthRB = null;
+  if (withDepthTex) {
+    depthTex = createTex2D(w, h, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+  } else if (withDepthRB) {
+    depthRB = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRB);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, colTex, depthTex, depthRB, w, h };
+}
+
+function destroyFBO(f) {
+  if (!f) return;
+  gl.deleteFramebuffer(f.fbo);
+  gl.deleteTexture(f.colTex);
+  if (f.depthTex) gl.deleteTexture(f.depthTex);
+  if (f.depthRB) gl.deleteRenderbuffer(f.depthRB);
+}
+
+let fboScene = null, fboSmoke = null, fboComp = null;
+let bloomA = [], bloomB = [];
+let viewW = 0, viewH = 0;
+
+function resizeBuffers() {
+  const dpr = Math.min(window.devicePixelRatio || 1, PARAM_FREEZE ? 1.0 : 1.75);
+  const w = Math.max(2, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(2, Math.floor(window.innerHeight * dpr));
+  if (w === viewW && h === viewH) return;
+  viewW = w; viewH = h;
+  canvas.width = w;
+  canvas.height = h;
+
+  destroyFBO(fboScene);
+  destroyFBO(fboSmoke);
+  destroyFBO(fboComp);
+  bloomA.forEach(destroyFBO);
+  bloomB.forEach(destroyFBO);
+  bloomA = []; bloomB = [];
+
+  fboScene = createFBO(w, h, true, false);
+  const sw = Math.max(2, Math.floor(w * 0.58));
+  const sh = Math.max(2, Math.floor(h * 0.58));
+  fboSmoke = createFBO(sw, sh, false, false);
+  fboComp = createFBO(w, h, false, true);
+
+  let bw = Math.max(2, w >> 1), bh = Math.max(2, h >> 1);
+  for (let i = 0; i < 4; i++) {
+    bloomA.push(createFBO(bw, bh, false, false));
+    bloomB.push(createFBO(bw, bh, false, false));
+    bw = Math.max(2, bw >> 1);
+    bh = Math.max(2, bh >> 1);
+  }
+}
+
+resizeBuffers();
+window.addEventListener('resize', () => {
+  resizeBuffers();
+  if (PARAM_FREEZE) renderFrame(simTime, 0.016);
+});
+
+// ============================================================================
+// MATRIX MATH UTILITIES
+// ============================================================================
+function mat4Perspective(fovRad, aspect, near, far) {
+  const f = 1.0 / Math.tan(fovRad * 0.5);
+  const nf = 1.0 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, (2 * far * near) * nf, 0
+  ]);
+}
+
+function mat4LookDir(eye, yaw, pitch, roll) {
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const sy = Math.sin(yaw), cy = Math.cos(yaw);
+  // yaw=0 looks due North (-Z) straight toward the burning mountain ridge!
+  const fx = sy * cp;
+  const fy = sp;
+  const fz = -cy * cp;
+
+  // World up with optional tiny cinema gimbal roll
+  const ux0 = Math.sin(roll), uy0 = Math.cos(roll), uz0 = 0;
+  // right = normalize(cross(f, up))
+  let rx = fy * uz0 - fz * uy0;
+  let ry = fz * ux0 - fx * uz0;
+  let rz = fx * uy0 - fy * ux0;
+  const rl = Math.hypot(rx, ry, rz) || 1.0;
+  rx /= rl; ry /= rl; rz /= rl;
+  // true up = cross(r, f)
+  const ux = ry * fz - rz * fy;
+  const uy = rz * fx - rx * fz;
+  const uz = rx * fy - ry * fx;
+
+  return new Float32Array([
+    rx, ux, -fx, 0,
+    ry, uy, -fy, 0,
+    rz, uz, -fz, 0,
+    -(rx * eye[0] + ry * eye[1] + rz * eye[2]),
+    -(ux * eye[0] + uy * eye[1] + uz * eye[2]),
+     (fx * eye[0] + fy * eye[1] + fz * eye[2]),
+    1
+  ]);
+}
+
+function mat4Mul(a, b) {
+  const out = new Float32Array(16);
+  for (let col = 0; col < 4; col++) {
+    const b0 = b[col * 4], b1 = b[col * 4 + 1], b2 = b[col * 4 + 2], b3 = b[col * 4 + 3];
+    out[col * 4 + 0] = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3;
+    out[col * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3;
+    out[col * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    out[col * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+  return out;
+}
+
+function mat4Invert(m) {
+  const out = new Float32Array(16);
+  const a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3];
+  const a10 = m[4], a11 = m[5], a12 = m[6], a13 = m[7];
+  const a20 = m[8], a21 = m[9], a22 = m[10], a23 = m[11];
+  const a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
+
+  const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10;
+  const b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11;
+  const b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12;
+  const b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30;
+  const b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31;
+  const b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+
+  let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+  if (!det) return out;
+  det = 1.0 / det;
+
+  out[0]  = (a11 * b11 - a12 * b10 + a13 * b09) * det;
+  out[1]  = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+  out[2]  = (a31 * b05 - a32 * b04 + a33 * b03) * det;
+  out[3]  = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+  out[4]  = (a12 * b08 - a10 * b11 - a13 * b07) * det;
+  out[5]  = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+  out[6]  = (a32 * b02 - a30 * b05 - a33 * b01) * det;
+  out[7]  = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+  out[8]  = (a10 * b10 - a11 * b08 + a13 * b06) * det;
+  out[9]  = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+  out[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det;
+  out[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+  out[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det;
+  out[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+  out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det;
+  out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+  return out;
+}
+
+// ============================================================================
+// INTERACTIVE 360° CAMERA + VALLEY FLOOR DRIFT + AUTO-RESUME
+// ============================================================================
+const DEFAULT_FOV = 48.0;
+const MIN_FOV = 16.0;
+const MAX_FOV = 78.0;
+const MIN_PITCH = -0.48; // ~ -27.5° (valley floor)
+const MAX_PITCH = 1.40;  // ~ +80° (overhead smoke & stars)
+const RESUME_DELAY = 3.8; // seconds of inactivity before automatic drift resumes
+
+const cam = {
+  driftPhase: 0.25,        // position along valley drift curve
+  driftBlend: 1.0,         // 1 = full auto drift, 0 = paused for manual inspection
+  yaw: 0.0,
+  pitch: 0.22,             // looking slightly up from valley floor toward the burning ridge
+  fov: DEFAULT_FOV,
+  targetYaw: 0.0,
+  targetPitch: 0.22,
+  targetFov: DEFAULT_FOV,
+  velYaw: 0.0,
+  velPitch: 0.0,
+  lastInputTime: -100.0,
+  isInteracting: false,
+  autoMode: true
+};
+
+function shortestAngleDiff(from, to) {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+function computeAutoLook(phase, simT) {
+  const pos = valleyPathPos(phase);
+  const eyeY = sampleHeightBilinear(pos.x, pos.z) + 7.2 + Math.sin(simT * 0.42) * 0.45;
+  // Gently gaze toward the dramatic heart of the burning mountain ridge with subtle organic scanning
+  const aimX = Math.sin(phase * 0.65 + 0.3) * 145.0 + Math.sin(simT * 0.14) * 42.0;
+  const aimZ = ridgeCurveZ(aimX);
+  const aimY = sampleHeightBilinear(aimX, aimZ) + 26.0 + Math.sin(simT * 0.21) * 9.0;
+  const dx = aimX - pos.x, dy = aimY - eyeY, dz = aimZ - pos.z;
+  const horiz = Math.hypot(dx, dz);
+  const yaw = Math.atan2(dx, -dz);
+  const pitch = Math.atan2(dy, horiz);
+  return { pos: [pos.x, eyeY, pos.z], yaw, pitch };
+}
+
+// Initialize camera to exact auto orientation
+{
+  const initT = PARAM_T !== null ? PARAM_T : 8.0;
+  cam.driftPhase = 0.25 + initT * 0.0175;
+  const initLook = computeAutoLook(cam.driftPhase, initT);
+  cam.yaw = cam.targetYaw = (PARAM_YAW !== null ? PARAM_YAW : initLook.yaw);
+  cam.pitch = cam.targetPitch = (PARAM_PITCH !== null ? PARAM_PITCH : initLook.pitch);
+  cam.fov = cam.targetFov = (PARAM_FOV !== null ? clamp(PARAM_FOV, MIN_FOV, MAX_FOV) : DEFAULT_FOV);
+}
+
+// Fade out subtle hint after 5.5s or first interaction
+let hintHidden = false;
+function hideHint() {
+  if (!hintHidden) {
+    hintHidden = true;
+    hintEl.classList.add('hidden');
+  }
+}
+if (!PARAM_FREEZE) setTimeout(hideHint, 5500);
+
+let nowSec = 0.0;
+function markUserInput() {
+  cam.lastInputTime = nowSec;
+  cam.autoMode = false;
+  hideHint();
+}
+
+// Mouse Drag & Scroll Zoom
+let mouseDown = false, lastMouseX = 0, lastMouseY = 0;
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  mouseDown = true;
+  cam.isInteracting = true;
+  lastMouseX = e.clientX;
+  lastMouseY = e.clientY;
+  cam.velYaw = 0; cam.velPitch = 0;
+  canvas.classList.add('dragging');
+  markUserInput();
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!mouseDown) return;
+  const dx = e.clientX - lastMouseX;
+  const dy = e.clientY - lastMouseY;
+  lastMouseX = e.clientX;
+  lastMouseY = e.clientY;
+
+  const sens = 0.0036 * (cam.fov / DEFAULT_FOV);
+  cam.targetYaw -= dx * sens;
+  cam.targetPitch = clamp(cam.targetPitch + dy * sens, MIN_PITCH, MAX_PITCH);
+  cam.velYaw = -dx * sens * 0.35;
+  cam.velPitch = dy * sens * 0.35;
+  markUserInput();
+});
+
+window.addEventListener('mouseup', () => {
+  if (!mouseDown) return;
+  mouseDown = false;
+  cam.isInteracting = false;
+  canvas.classList.remove('dragging');
+  markUserInput();
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 16.0;
+  else if (e.deltaMode === 2) dy *= 100.0;
+  dy = clamp(dy, -120, 120);
+  cam.targetFov = clamp(cam.targetFov * (1.0 + dy * 0.0014), MIN_FOV, MAX_FOV);
+  markUserInput();
+}, { passive: false });
+
+// Double-click smoothly returns to ridge gaze
+canvas.addEventListener('dblclick', () => {
+  cam.lastInputTime = nowSec - RESUME_DELAY - 0.1;
+  cam.autoMode = true;
+});
+
+// Touch Controls: 1-finger drag to look 360°, 2-finger pinch to zoom!
+const activeTouches = new Map();
+let lastPinchDist = null;
+let lastTouchMid = null;
+
+function touchMetrics() {
+  const pts = Array.from(activeTouches.values());
+  if (pts.length === 1) return { count: 1, x: pts[0].x, y: pts[0].y, dist: 0 };
+  if (pts.length >= 2) {
+    const mx = 0.5 * (pts[0].x + pts[1].x);
+    const my = 0.5 * (pts[0].y + pts[1].y);
+    const d = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+    return { count: 2, x: mx, y: my, dist: d };
+  }
+  return { count: 0, x: 0, y: 0, dist: 0 };
+}
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    activeTouches.set(t.identifier, { x: t.clientX, y: t.clientY });
+  }
+  cam.isInteracting = true;
+  cam.velYaw = 0; cam.velPitch = 0;
+  const m = touchMetrics();
+  lastTouchMid = { x: m.x, y: m.y };
+  lastPinchDist = m.count >= 2 ? m.dist : null;
+  markUserInput();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    if (activeTouches.has(t.identifier)) {
+      activeTouches.set(t.identifier, { x: t.clientX, y: t.clientY });
+    }
+  }
+  const m = touchMetrics();
+  if (m.count === 1 && lastTouchMid) {
+    const dx = m.x - lastTouchMid.x;
+    const dy = m.y - lastTouchMid.y;
+    const sens = 0.0044 * (cam.fov / DEFAULT_FOV);
+    cam.targetYaw -= dx * sens;
+    cam.targetPitch = clamp(cam.targetPitch + dy * sens, MIN_PITCH, MAX_PITCH);
+    cam.velYaw = -dx * sens * 0.35;
+    cam.velPitch = dy * sens * 0.35;
+  } else if (m.count >= 2) {
+    if (lastPinchDist && m.dist > 8) {
+      const ratio = lastPinchDist / m.dist;
+      cam.targetFov = clamp(cam.targetFov * ratio, MIN_FOV, MAX_FOV);
+    }
+    if (lastTouchMid) {
+      const dx = m.x - lastTouchMid.x;
+      const dy = m.y - lastTouchMid.y;
+      const sens = 0.0028 * (cam.fov / DEFAULT_FOV);
+      cam.targetYaw -= dx * sens;
+      cam.targetPitch = clamp(cam.targetPitch + dy * sens, MIN_PITCH, MAX_PITCH);
+    }
+    lastPinchDist = m.dist;
+  }
+  lastTouchMid = { x: m.x, y: m.y };
+  markUserInput();
+}, { passive: false });
+
+function handleTouchEnd(e) {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    activeTouches.delete(e.changedTouches[i].identifier);
+  }
+  const m = touchMetrics();
+  if (m.count === 0) {
+    cam.isInteracting = false;
+    lastTouchMid = null;
+    lastPinchDist = null;
+  } else {
+    lastTouchMid = { x: m.x, y: m.y };
+    lastPinchDist = m.count >= 2 ? m.dist : null;
+  }
+  markUserInput();
+}
+canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
+canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
+
+// ============================================================================
+// MAIN RENDER LOOP
+// ============================================================================
+const fireLightsBuf = new Float32Array(NUM_FIRE_LIGHTS * 4);
+
+function updateFireLights(simT) {
+  let sum = 0;
+  for (let i = 0; i < NUM_FIRE_LIGHTS; i++) {
+    const n = fireNodes[i];
+    // Multi-frequency chaotic wildfire intensity flicker per ridge cluster
+    const f1 = Math.sin(simT * 1.45 * n.speed + n.phase);
+    const f2 = Math.sin(simT * 4.35 * n.speed + n.phase * 2.1);
+    const f3 = Math.sin(simT * 10.8 * n.speed + n.phase * 3.7);
+    const flare = Math.pow(0.5 + 0.5 * Math.sin(simT * 0.52 + n.phase * 1.3), 3.0);
+    const flick = clamp(0.76 + 0.16 * f1 + 0.11 * f2 + 0.06 * f3 + 0.34 * flare, 0.42, 1.55);
+    const pwr = n.basePower * flick;
+    fireLightsBuf[i * 4 + 0] = n.x;
+    fireLightsBuf[i * 4 + 1] = n.y;
+    fireLightsBuf[i * 4 + 2] = n.z;
+    fireLightsBuf[i * 4 + 3] = pwr;
+    sum += pwr;
+  }
+  return sum / NUM_FIRE_LIGHTS;
+}
+
+function renderFrame(simT, dt) {
+  // Update camera state (unless frozen via query parameter)
+  if (!PARAM_FREEZE) {
+    const idleTime = nowSec - cam.lastInputTime;
+    const shouldResume = !cam.isInteracting && idleTime > RESUME_DELAY;
+    if (shouldResume) cam.autoMode = true;
+
+    // Smoothly ramp valley drift speed: glides slowly during auto mode, gently pauses/slows during manual inspection
+    const targetDriftBlend = cam.autoMode ? 1.0 : 0.18;
+    cam.driftBlend += (targetDriftBlend - cam.driftBlend) * (1.0 - Math.exp(-dt * 1.4));
+    cam.driftPhase += dt * 0.0175 * cam.driftBlend;
+
+    const autoLook = computeAutoLook(cam.driftPhase, simT);
+
+    if (cam.autoMode) {
+      // Smoothly glide back toward automatic ridge-gazing view & default cinema framing
+      const k = 1.0 - Math.exp(-dt * 0.95);
+      cam.targetYaw += shortestAngleDiff(cam.targetYaw, autoLook.yaw) * k;
+      cam.targetPitch += (autoLook.pitch - cam.targetPitch) * k;
+      cam.targetFov += (DEFAULT_FOV - cam.targetFov) * (1.0 - Math.exp(-dt * 0.7));
+      cam.velYaw *= Math.exp(-dt * 5.0);
+      cam.velPitch *= Math.exp(-dt * 5.0);
+    } else if (!cam.isInteracting) {
+      // Gentle cinematic inertia coast after releasing mouse/finger
+      cam.targetYaw += cam.velYaw;
+      cam.targetPitch = clamp(cam.targetPitch + cam.velPitch, MIN_PITCH, MAX_PITCH);
+      const dragDamp = Math.exp(-dt * 6.2);
+      cam.velYaw *= dragDamp;
+      cam.velPitch *= dragDamp;
+    }
+
+    const smoothK = 1.0 - Math.exp(-dt * 10.5);
+    cam.yaw += shortestAngleDiff(cam.yaw, cam.targetYaw) * smoothK;
+    cam.pitch += (cam.targetPitch - cam.pitch) * smoothK;
+    cam.fov += (cam.targetFov - cam.fov) * (1.0 - Math.exp(-dt * 9.0));
+  }
+
+  const autoNow = computeAutoLook(cam.driftPhase, simT);
+  const eyePos = autoNow.pos;
+  // Subtle organic cinema dolly/breathing roll
+  const roll = Math.sin(simT * 0.31) * 0.0045 * cam.driftBlend;
+
+  const near = 0.8, far = 2600.0;
+  const aspect = viewW / Math.max(viewH, 1);
+  const proj = mat4Perspective((cam.fov * Math.PI) / 180.0, aspect, near, far);
+  const view = mat4LookDir(eyePos, cam.yaw, cam.pitch, roll);
+  const viewProj = mat4Mul(proj, view);
+  const invViewProj = mat4Invert(viewProj);
+
+  const globalFlicker = updateFireLights(simT);
+
+  // --------------------------------------------------------------------------
+  // PASS 1: SKY DOME + TERRAIN + 3D SILHOUETTED CONIFERS -> fboScene (+ Depth)
+  // --------------------------------------------------------------------------
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene.fbo);
+  gl.viewport(0, 0, fboScene.w, fboScene.h);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+
+  // 1A. Sky Dome
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.useProgram(progSky.prog);
+  gl.uniformMatrix4fv(progSky.u.uInvViewProj, false, invViewProj);
+  gl.uniform3fv(progSky.u.uCamPos, eyePos);
+  gl.uniform1f(progSky.u.uTime, simT);
+  gl.uniform1f(progSky.u.uGlobalFlicker, globalFlicker);
+  gl.uniform4fv(progSky.u.uFireLights, fireLightsBuf);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 1B. 360° Mountain Valley Terrain
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LESS);
+  gl.depthMask(true);
+  gl.enable(gl.CULL_FACE);
+  gl.cullFace(gl.BACK);
+
+  gl.useProgram(progTerrain.prog);
+  gl.uniformMatrix4fv(progTerrain.u.uViewProj, false, viewProj);
+  gl.uniform3fv(progTerrain.u.uCamPos, eyePos);
+  gl.uniform1f(progTerrain.u.uTime, simT);
+  gl.uniform1f(progTerrain.u.uGlobalFlicker, globalFlicker);
+  gl.uniform4fv(progTerrain.u.uFireLights, fireLightsBuf);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, lightMapTex);
+  gl.uniform1i(progTerrain.u.uLightMap, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, fireMapTex);
+  gl.uniform1i(progTerrain.u.uFireMap, 1);
+  gl.bindVertexArray(terrainGeom.vao);
+  gl.drawElements(gl.TRIANGLES, terrainGeom.count, gl.UNSIGNED_INT, 0);
+
+  // 1C. Instanced 3D Silhouetted Conifer Trees (double-sided crossed cards)
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progTree.prog);
+  gl.uniformMatrix4fv(progTree.u.uViewProj, false, viewProj);
+  gl.uniform3fv(progTree.u.uCamPos, eyePos);
+  gl.uniform1f(progTree.u.uTime, simT);
+  gl.uniform1f(progTree.u.uGlobalFlicker, globalFlicker);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, coniferAtlasTex);
+  gl.uniform1i(progTree.u.uConiferAtlas, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, lightMapTex);
+  gl.uniform1i(progTree.u.uLightMap, 1);
+  gl.bindVertexArray(coniferGeom.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, coniferGeom.indexCount, gl.UNSIGNED_SHORT, 0, coniferGeom.instCount);
+
+  // --------------------------------------------------------------------------
+  // PASS 2: 3D VOLUMETRIC RIDGE FLAMES & TORCHING CROWNS -> fboScene (Depth-Tested!)
+  // --------------------------------------------------------------------------
+  gl.depthMask(false);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // Luminous fire composited with rich core glow
+  gl.useProgram(progFlame.prog);
+  gl.uniformMatrix4fv(progFlame.u.uViewProj, false, viewProj);
+  gl.uniform1f(progFlame.u.uTime, simT);
+  gl.uniform3fv(progFlame.u.uCamPos, eyePos);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_3D, noise3DTex);
+  gl.uniform1i(progFlame.u.uNoise3D, 0);
+  gl.bindVertexArray(flameGeom.vao);
+  gl.drawElements(gl.TRIANGLES, flameGeom.count, gl.UNSIGNED_INT, 0);
+
+  // --------------------------------------------------------------------------
+  // PASS 3: VOLUMETRIC RAYMARCHED SMOKE COLUMNS LIT FROM BELOW -> fboSmoke
+  // --------------------------------------------------------------------------
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboSmoke.fbo);
+  gl.viewport(0, 0, fboSmoke.w, fboSmoke.h);
+  gl.disable(gl.BLEND);
+  gl.disable(gl.DEPTH_TEST);
+
+  gl.useProgram(progSmoke.prog);
+  gl.uniformMatrix4fv(progSmoke.u.uInvViewProj, false, invViewProj);
+  gl.uniformMatrix4fv(progSmoke.u.uViewProj, false, viewProj);
+  gl.uniform3fv(progSmoke.u.uCamPos, eyePos);
+  gl.uniform1f(progSmoke.u.uTime, simT);
+  gl.uniform1f(progSmoke.u.uGlobalFlicker, globalFlicker);
+  gl.uniform2f(progSmoke.u.uNearFar, near, far);
+  gl.uniform4fv(progSmoke.u.uFireLights, fireLightsBuf);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboScene.depthTex);
+  gl.uniform1i(progSmoke.u.uDepthTex, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_3D, noise3DTex);
+  gl.uniform1i(progSmoke.u.uNoise3D, 1);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // --------------------------------------------------------------------------
+  // PASS 4: BLIT DEPTH + COMPOSITE SMOKE + RISING EMBERS + FALLING ASH -> fboComp
+  // --------------------------------------------------------------------------
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboScene.fbo);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fboComp.fbo);
+  gl.blitFramebuffer(0, 0, fboScene.w, fboScene.h, 0, 0, fboComp.w, fboComp.h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboComp.fbo);
+  gl.viewport(0, 0, fboComp.w, fboComp.h);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+
+  gl.useProgram(progComp.prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboScene.colTex);
+  gl.uniform1i(progComp.u.uSceneTex, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, fboSmoke.colTex);
+  gl.uniform1i(progComp.u.uSmokeTex, 1);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, fboScene.depthTex);
+  gl.uniform1i(progComp.u.uDepthTex, 2);
+  gl.uniform2f(progComp.u.uSmokeTexel, 1.0 / fboSmoke.w, 1.0 / fboSmoke.h);
+  gl.uniform2f(progComp.u.uNearFar, near, far);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 4A. Rising Glowing Embers & Sparks (depth-tested against terrain & trees, additive glow!)
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(progEmber.prog);
+  gl.uniformMatrix4fv(progEmber.u.uViewProj, false, viewProj);
+  gl.uniform3fv(progEmber.u.uCamPos, eyePos);
+  gl.uniform2f(progEmber.u.uViewport, fboComp.w, fboComp.h);
+  gl.uniform1f(progEmber.u.uTime, simT);
+  gl.bindVertexArray(emberGeom.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, emberGeom.count);
+
+  // 4B. Falling Ash Flakes (soft alpha-blended pale charred flakes drifting through valley air!)
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progAsh.prog);
+  gl.uniformMatrix4fv(progAsh.u.uViewProj, false, viewProj);
+  gl.uniform3fv(progAsh.u.uCamPos, eyePos);
+  gl.uniform2f(progAsh.u.uViewport, fboComp.w, fboComp.h);
+  gl.uniform1f(progAsh.u.uTime, simT);
+  gl.uniform1f(progAsh.u.uGlobalFlicker, globalFlicker);
+  gl.bindVertexArray(ashGeom.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, ashGeom.count);
+
+  // --------------------------------------------------------------------------
+  // PASS 5: MULTI-SCALE HDR OPTICAL BLOOM PYRAMID (4 Levels)
+  // --------------------------------------------------------------------------
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.bindVertexArray(emptyVao);
+
+  // Extract highlights -> bloomA[0]
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA[0].fbo);
+  gl.viewport(0, 0, bloomA[0].w, bloomA[0].h);
+  gl.useProgram(progBloomExt.prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboComp.colTex);
+  gl.uniform1i(progBloomExt.u.uTex, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.useProgram(progBlur.prog);
+  gl.uniform1i(progBlur.u.uTex, 0);
+  for (let i = 0; i < 4; i++) {
+    const srcTex = (i === 0) ? bloomA[0].colTex : bloomA[i - 1].colTex;
+    // Horizontal blur -> bloomB[i]
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomB[i].fbo);
+    gl.viewport(0, 0, bloomB[i].w, bloomB[i].h);
+    gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.uniform2f(progBlur.u.uDir, 1.35 / bloomB[i].w, 0.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // Vertical blur -> bloomA[i]
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA[i].fbo);
+    gl.viewport(0, 0, bloomA[i].w, bloomA[i].h);
+    gl.bindTexture(gl.TEXTURE_2D, bloomB[i].colTex);
+    gl.uniform2f(progBlur.u.uDir, 0.0, 1.35 / bloomA[i].h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // --------------------------------------------------------------------------
+  // PASS 6: FINAL ACES FILMIC GRADE, HALATION, VIGNETTE & 35mm FILM GRAIN
+  // --------------------------------------------------------------------------
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, viewW, viewH);
+  gl.useProgram(progPost.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboComp.colTex);   gl.uniform1i(progPost.u.uSceneTex, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomA[0].colTex); gl.uniform1i(progPost.u.uBloom1, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, bloomA[1].colTex); gl.uniform1i(progPost.u.uBloom2, 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, bloomA[2].colTex); gl.uniform1i(progPost.u.uBloom3, 3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, bloomA[3].colTex); gl.uniform1i(progPost.u.uBloom4, 4);
+  gl.uniform1f(progPost.u.uTime, simT);
+  gl.uniform2f(progPost.u.uResolution, viewW, viewH);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Expose minimal read-only state for automated verification tests
+window.__wildfire = {
+  getState: () => ({
+    yaw: cam.yaw, pitch: cam.pitch, fov: cam.fov,
+    autoMode: cam.autoMode, driftPhase: cam.driftPhase,
+    trees: coniferGeom.instCount, embers: emberGeom.count, ash: ashGeom.count
+  }),
+  advance: (sec) => {
+    nowSec += sec;
+    simTime += sec;
+    renderFrame(simTime, sec);
+  }
+};
+
+let simTime = PARAM_T !== null ? PARAM_T : 8.0;
+let lastWall = performance.now();
+
+if (PARAM_FREEZE) {
+  const drawFrozen = () => {
+    resizeBuffers();
+    renderFrame(simTime, 0.016);
+    gl.finish();
+    document.title = 'READY';
+  };
+  drawFrozen();
+  requestAnimationFrame(() => {
+    drawFrozen();
+    requestAnimationFrame(drawFrozen);
+  });
+} else {
+  function loop(now) {
+    const dt = clamp((now - lastWall) * 0.001, 0.001, 0.05);
+    lastWall = now;
+    nowSec += dt;
+    simTime += dt;
+    resizeBuffers();
+    renderFrame(simTime, dt);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+
+})();
+</script>
+</body>
+</html>

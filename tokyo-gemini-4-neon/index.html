@@ -1,0 +1,3186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Rainy Neon Tokyo Alley — Midnight Walk</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: #020306;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Segoe UI", sans-serif;
+    user-select: none;
+  }
+  canvas#gl {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: grab;
+  }
+  canvas#gl:active { cursor: grabbing; }
+  #hud {
+    position: fixed;
+    left: 22px; bottom: 18px;
+    color: rgba(235, 240, 250, 0.72);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 0.6s ease;
+    text-shadow: 0 1px 6px rgba(0,0,0,0.9);
+    line-height: 1.65;
+  }
+  #hud.hidden { opacity: 0; }
+  #hud .jp {
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    color: rgba(255, 198, 152, 0.85);
+    margin-bottom: 2px;
+  }
+  #err {
+    display: none;
+    position: fixed; inset: 0;
+    background: #090b10; color: #ff6b7a;
+    padding: 28px; font-family: monospace; font-size: 13px;
+    white-space: pre-wrap; overflow: auto; z-index: 99;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud" class="hidden">
+  <div class="jp">新宿・雨夜路地 — SHINJUKU RAIN WALK</div>
+  <div>Drag: Look &nbsp;·&nbsp; Space: Pause &nbsp;·&nbsp; M: Rain Audio &nbsp;·&nbsp; R: Reset View &nbsp;·&nbsp; H: HUD</div>
+</div>
+<pre id="err"></pre>
+
+<script>
+(() => {
+'use strict';
+
+// ============================================================================
+// 0. QUERY PARAMETERS & WEBGL2 BOOTSTRAP
+// ============================================================================
+const params = new URLSearchParams(location.search);
+const FIXED_TIME = params.has('t') ? parseFloat(params.get('t')) : null;
+const OVERRIDE_PITCH = params.has('pitch') ? parseFloat(params.get('pitch')) : null;
+const OVERRIDE_YAW = params.has('yaw') ? parseFloat(params.get('yaw')) : null;
+const OVERRIDE_X = params.has('x') ? parseFloat(params.get('x')) : null;
+const OVERRIDE_Y = params.has('y') ? parseFloat(params.get('y')) : null;
+const WALK_SPEED = params.has('speed') ? parseFloat(params.get('speed')) : 0.90;
+const SHOW_HUD_INIT = params.get('hud') === '1';
+
+const errEl = document.getElementById('err');
+function fatal(msg) {
+  errEl.style.display = 'block';
+  errEl.textContent += msg + '\n';
+  console.error(msg);
+  throw new Error(msg);
+}
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', {
+  antialias: false,
+  alpha: false,
+  depth: false,
+  stencil: false,
+  powerPreference: 'high-performance',
+  preserveDrawingBuffer: FIXED_TIME !== null
+});
+if (!gl) fatal('WebGL2 is required to view this scene.');
+
+const extColorFloat = gl.getExtension('EXT_color_buffer_float');
+const extColorHalf = gl.getExtension('EXT_color_buffer_half_float');
+const extAniso = gl.getExtension('EXT_texture_filter_anisotropic');
+const MAX_ANISO = extAniso ? Math.min(8, gl.getParameter(extAniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)) : 1;
+const USE_HDR = !!(extColorFloat || extColorHalf);
+
+// ============================================================================
+// 1. DETERMINISTIC PRNG & MATH UTILITIES
+// ============================================================================
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(20261120);
+const rand = (a = 0, b = 1) => a + (b - a) * rng();
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(rng() * arr.length)];
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return s - Math.floor(s);
+}
+function valueNoise2D(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return lerp(lerp(a, b, ux), lerp(c, d, ux), uy);
+}
+function fbm2D(x, y, oct = 4) {
+  let v = 0, amp = 0.5, freq = 1;
+  for (let i = 0; i < oct; i++) {
+    v += amp * valueNoise2D(x * freq, y * freq);
+    freq *= 2.02; amp *= 0.5;
+  }
+  return v;
+}
+
+function mat4Create() { return new Float32Array(16); }
+function mat4Perspective(out, fovy, aspect, near, far) {
+  const f = 1.0 / Math.tan(fovy * 0.5);
+  const nf = 1.0 / (near - far);
+  out.fill(0);
+  out[0] = f / aspect; out[5] = f;
+  out[10] = (far + near) * nf; out[11] = -1;
+  out[14] = 2 * far * near * nf;
+  return out;
+}
+function mat4LookAt(out, eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let zl = Math.hypot(zx, zy, zz) || 1;
+  zx /= zl; zy /= zl; zz /= zl;
+  let xx = up[1] * zz - up[2] * zy;
+  let xy = up[2] * zx - up[0] * zz;
+  let xz = up[0] * zy - up[1] * zx;
+  let xl = Math.hypot(xx, xy, xz) || 1;
+  xx /= xl; xy /= xl; xz /= xl;
+  const yx = zy * xz - zz * xy;
+  const yy = zz * xx - zx * xz;
+  const yz = zx * xy - zy * xx;
+  out[0] = xx; out[1] = yx; out[2] = zx; out[3] = 0;
+  out[4] = xy; out[5] = yy; out[6] = zy; out[7] = 0;
+  out[8] = xz; out[9] = yz; out[10] = zz; out[11] = 0;
+  out[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+  out[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+  out[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+  out[15] = 1;
+  return out;
+}
+function mat4Mul(out, a, b) {
+  for (let c = 0; c < 4; c++) {
+    const b0 = b[c * 4], b1 = b[c * 4 + 1], b2 = b[c * 4 + 2], b3 = b[c * 4 + 3];
+    out[c * 4 + 0] = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3;
+    out[c * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3;
+    out[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    out[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+  return out;
+}
+function mat4ScaleYNeg(out, m) {
+  out.set(m);
+  out[4] = -out[4]; out[5] = -out[5]; out[6] = -out[6]; out[7] = -out[7];
+  return out;
+}
+function invertMat4(out, m) {
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3],a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+  const a20=m[8],a21=m[9],a22=m[10],a23=m[11],a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11;
+  const b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30;
+  const b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06;
+  if (!det) return out;
+  det = 1.0 / det;
+  out[0]=(a11*b11-a12*b10+a13*b09)*det; out[1]=(a02*b10-a01*b11-a03*b09)*det;
+  out[2]=(a31*b05-a32*b04+a33*b03)*det; out[3]=(a22*b04-a21*b05-a23*b03)*det;
+  out[4]=(a12*b08-a10*b11-a13*b07)*det; out[5]=(a00*b11-a02*b08+a03*b07)*det;
+  out[6]=(a32*b02-a30*b05-a33*b01)*det; out[7]=(a20*b05-a22*b02+a23*b01)*det;
+  out[8]=(a10*b10-a11*b08+a13*b06)*det; out[9]=(a01*b08-a00*b10-a03*b06)*det;
+  out[10]=(a30*b04-a31*b02+a33*b00)*det; out[11]=(a21*b02-a20*b04-a23*b00)*det;
+  out[12]=(a11*b07-a10*b09-a12*b06)*det; out[13]=(a00*b09-a01*b07+a02*b06)*det;
+  out[14]=(a31*b01-a30*b03-a32*b00)*det; out[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return out;
+}
+
+// ============================================================================
+// 2. WEBGL2 SHADER & FBO UTILITIES
+// ============================================================================
+function compileShader(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const lines = src.split('\n').map((l, i) => `${i + 1}: ${l}`).join('\n');
+    fatal(`Shader compile error (${label}):\n${log}\n---\n${lines}`);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc, label) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc, label + ' VS'));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc, label + ' FS'));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fatal(`Program link error (${label}):\n${gl.getProgramInfoLog(p)}`);
+  }
+  const uniforms = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    const name = info.name.replace(/\[0\]$/, '');
+    uniforms[name] = gl.getUniformLocation(p, name);
+  }
+  return { prog: p, u: uniforms };
+}
+
+function createCanvasTexture(cnv, { srgb = false, wrap = gl.REPEAT, mipmap = true, aniso = true } = {}) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, srgb ? gl.SRGB8_ALPHA8 : gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cnv);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  if (mipmap) {
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  } else {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  if (aniso && extAniso) {
+    gl.texParameterf(gl.TEXTURE_2D, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, MAX_ANISO);
+  }
+  return tex;
+}
+
+function createFBO(w, h, { hdr = true, depthRB = false } = {}) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const color = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, color);
+  const intFmt = (hdr && USE_HDR) ? gl.RGBA16F : gl.RGBA8;
+  const type = (hdr && USE_HDR) ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+  gl.texImage2D(gl.TEXTURE_2D, 0, intFmt, w, h, 0, gl.RGBA, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+
+  let depth = null;
+  if (depthRB) {
+    depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+  }
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) fatal('FBO incomplete: 0x' + status.toString(16));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, color, depth, w, h };
+}
+function destroyFBO(f) {
+  if (!f) return;
+  gl.deleteFramebuffer(f.fbo);
+  gl.deleteTexture(f.color);
+  if (f.depth) gl.deleteRenderbuffer(f.depth);
+}
+
+// ============================================================================
+// 3. PROCEDURAL PBR & JAPANESE SIGNAGE TEXTURE ATLASES
+// ============================================================================
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
+}
+
+function heightToNormalCanvas(heights, w, h, strength = 3.2) {
+  const c = makeCanvas(w, h);
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(w, h);
+  const d = img.data;
+  for (let y = 0; y < h; y++) {
+    const ym = (y - 1 + h) % h, yp = (y + 1) % h;
+    for (let x = 0; x < w; x++) {
+      const xm = (x - 1 + w) % w, xp = (x + 1) % w;
+      let nx = (heights[y * w + xm] - heights[y * w + xp]) * strength;
+      let ny = (heights[ym * w + x] - heights[yp * w + x]) * strength;
+      let nz = 1.0;
+      const inv = 1.0 / Math.hypot(nx, ny, nz);
+      nx *= inv; ny *= inv; nz *= inv;
+      const i = (y * w + x) * 4;
+      d[i]     = Math.round((nx * 0.5 + 0.5) * 255);
+      d[i + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+      d[i + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+      d[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+// 3A. Architectural PBR Atlas (1024 x 768 = 4 cols x 3 rows of 256x256 tiles)
+function buildArchitectureAtlas() {
+  const W = 1024, H = 768, S = 256;
+  const alb = makeCanvas(W, H), actx = alb.getContext('2d');
+  const rma = makeCanvas(W, H), rctx = rma.getContext('2d');
+  const heights = new Float32Array(W * H);
+
+  actx.fillStyle = '#24272d'; actx.fillRect(0, 0, W, H);
+  rctx.fillStyle = 'rgb(130,30,235)'; rctx.fillRect(0, 0, W, H);
+
+  const albImg = actx.getImageData(0, 0, W, H);
+  const rmaImg = rctx.getImageData(0, 0, W, H);
+  const ad = albImg.data, rd = rmaImg.data;
+
+  function putPx(x, y, r, g, b, rough, metal, ao, hv) {
+    const i = (y * W + x) * 4;
+    ad[i] = clamp(r, 0, 255); ad[i+1] = clamp(g, 0, 255); ad[i+2] = clamp(b, 0, 255); ad[i+3] = 255;
+    rd[i] = clamp(rough * 255, 0, 255); rd[i+1] = clamp(metal * 255, 0, 255); rd[i+2] = clamp(ao * 255, 0, 255); rd[i+3] = 255;
+    heights[y * W + x] = hv;
+  }
+
+  // (0,0) Classic Tokyo Ceramic Mosaic Tile
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const tx = lx % 32, ty = ly % 16;
+      const cid = hash2(Math.floor(lx / 32) + 11, Math.floor(ly / 16) + 7);
+      const isGrout = tx < 2 || ty < 2;
+      const grime = fbm2D(lx * 0.032, ly * 0.018, 4);
+      const drip = Math.pow(fbm2D(lx * 0.14, ly * 0.015, 3), 2.0);
+      if (isGrout) {
+        putPx(lx, ly, 24, 26, 30, 0.80, 0.02, 0.45, 0.14);
+      } else {
+        const s = 86 + cid * 24 - grime * 30 - drip * 36;
+        putPx(lx, ly, s * 1.02, s * 0.99, s * 0.94, 0.22 + grime * 0.22 - drip * 0.08, 0.06, 0.95 - drip * 0.24, 0.78 + (cid - 0.5) * 0.08);
+      }
+    }
+  }
+
+  // (1,0) Weathered Showa Exposed Concrete
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const n1 = fbm2D(lx * 0.038 + 40, ly * 0.038, 5);
+      const streak = fbm2D(lx * 0.17 + 12, ly * 0.014, 3);
+      const seamX = (lx % 128) < 3, seamY = (ly % 128) < 3;
+      const px = (lx % 64) - 32, py = (ly % 64) - 32;
+      const hole = (px * px + py * py) < 11;
+      let base = 62 + n1 * 34 - streak * 24;
+      let rough = 0.48 + n1 * 0.24 - streak * 0.16, ao = 0.92 - streak * 0.22, hv = 0.55 + n1 * 0.25;
+      if (seamX || seamY) { base *= 0.42; ao *= 0.48; hv = 0.12; rough = 0.82; }
+      if (hole) { base *= 0.28; ao *= 0.3; hv = 0.04; }
+      putPx(S + lx, ly, base * 0.95, base * 0.98, base * 1.05, rough, 0.03, ao, hv);
+    }
+  }
+
+  // (2,0) Corrugated Galvanized Metal Siding
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const wave = Math.sin((lx / S) * Math.PI * 2 * 24) * 0.5 + 0.5;
+      const rust = Math.max(0, fbm2D(lx * 0.05 + 80, ly * 0.025, 4) - 0.55) * 2.4;
+      const grime = fbm2D(lx * 0.09, ly * 0.02, 3);
+      const seamY = (ly % 128) < 2;
+      const base = (seamY ? 18 : 38 + wave * 26) - grime * 14;
+      putPx(2 * S + lx, ly, base * 0.94 + rust * 72, base * 0.98 + rust * 26, base * 1.08 + rust * 6,
+            0.20 + rust * 0.46 + grime * 0.14, clamp(0.84 - rust * 0.65, 0.1, 0.92), 0.60 + wave * 0.40, seamY ? 0.1 : 0.22 + wave * 0.72);
+    }
+  }
+
+  // (3,0) Dark Charred Cedar Wood Slats
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const slat = Math.floor(lx / 16);
+      const gap = (lx % 16) < 2;
+      const grain = fbm2D(lx * 0.35 + slat * 7.3, ly * 0.03, 4);
+      const vs = hash2(slat, 19) * 16;
+      if (gap) {
+        putPx(3 * S + lx, ly, 10, 8, 6, 0.85, 0.02, 0.22, 0.08);
+      } else {
+        const s = 42 + vs + grain * 24;
+        putPx(3 * S + lx, ly, s * 1.16, s * 0.78, s * 0.48, 0.32 + grain * 0.22, 0.03, 0.88, 0.65 + grain * 0.2);
+      }
+    }
+  }
+
+  // (0,1) Roll-Down Ribbed Metal Shop Shutter
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const slatY = ly % 16;
+      const ridge = Math.sin((slatY / 16) * Math.PI);
+      const seam = slatY < 2;
+      const grime = fbm2D(lx * 0.045, ly * 0.045 + 22, 4);
+      const lowerDirt = Math.pow(ly / S, 2.2) * 30;
+      const base = (seam ? 18 : 58 + ridge * 26) - grime * 22 - lowerDirt;
+      putPx(lx, S + ly, base * 0.88, base * 0.96, base * 1.08, 0.24 + grime * 0.26 + (seam ? 0.4 : 0), 0.74, seam ? 0.32 : 0.70 + ridge * 0.26, seam ? 0.08 : 0.35 + ridge * 0.56);
+    }
+  }
+
+  // (1,1) Dark Slate-Charcoal Modern Tokyo Tile
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const row = Math.floor(ly / 16);
+      const ox = (row & 1) ? 16 : 0;
+      const tx = (lx + ox) % 32, ty = ly % 16;
+      const grout = tx < 2 || ty < 2;
+      const id = hash2(Math.floor((lx + ox) / 32) + 3, row + 5);
+      const n = fbm2D(lx * 0.06, ly * 0.02, 3);
+      if (grout) putPx(S + lx, S + ly, 14, 16, 20, 0.84, 0.02, 0.38, 0.12);
+      else {
+        const s = 38 + id * 18 - n * 12;
+        putPx(S + lx, S + ly, s * 0.92, s * 0.96, s * 1.07, 0.22 + n * 0.18, 0.10, 0.90, 0.76 + (id - 0.5) * 0.1);
+      }
+    }
+  }
+
+  // (2,1) AC Outdoor Unit Front Louver Grille & Fan Shroud
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const dx = lx - 102, dy = ly - 132;
+      const dist = Math.hypot(dx, dy);
+      const n = fbm2D(lx * 0.05 + 15, ly * 0.05, 3);
+      let base = 104 - n * 28, rough = 0.40 + n * 0.18, metal = 0.38, ao = 0.92, hv = 0.7;
+      if (dist < 76) {
+        const ring = (Math.floor(dist) % 9) < 2;
+        const spoke = Math.abs(Math.sin(Math.atan2(dy, dx) * 4)) < 0.06;
+        const blade = Math.sin(Math.atan2(dy, dx) * 3 + dist * 0.03) > 0.25;
+        if (ring || spoke) { base = 40; metal = 0.65; hv = 0.76; ao = 0.75; }
+        else { base = blade ? 20 : 10; rough = 0.52; metal = 0.2; hv = 0.08; ao = 0.22; }
+      } else if (lx > 192 && ly > 44 && ly < 216) {
+        const louver = (ly % 12) < 4;
+        base = louver ? 24 : 92 - n * 20;
+        hv = louver ? 0.22 : 0.72; ao = louver ? 0.40 : 0.88;
+      }
+      if (lx < 6 || lx > S - 7 || ly < 6 || ly > S - 7) { base *= 0.70; hv = 0.44; }
+      putPx(2 * S + lx, S + ly, base * 0.99, base * 0.97, base * 0.90, rough, metal, ao, hv);
+    }
+  }
+
+  // (3,1) Metal Drain Grate / Plastic Beer Crate Mesh
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const gx = lx % 16, gy = ly % 32;
+      const bar = gx < 4 || gy < 4;
+      const n = fbm2D(lx * 0.08, ly * 0.08 + 50, 3);
+      if (bar) {
+        const s = 62 + n * 22;
+        putPx(3 * S + lx, S + ly, s, s * 1.02, s * 1.06, 0.24 + n * 0.16, 0.82, 0.88, 0.82);
+      } else {
+        putPx(3 * S + lx, S + ly, 7, 8, 11, 0.72, 0.1, 0.16, 0.06);
+      }
+    }
+  }
+
+  // (0,2) Vending Machine / AC Painted Metal Side Panel (clean weathered sheet metal with vents & seam!)
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const n = fbm2D(lx * 0.05 + 3, ly * 0.04, 3);
+      const isBase = ly > 228;
+      const isTopAccent = ly < 24;
+      const isPanelSeam = Math.abs(lx - 20) < 2 || Math.abs(lx - 236) < 2 || Math.abs(ly - 24) < 2;
+      const inVent = (ly > 168 && ly < 216 && lx > 44 && lx < 212 && (ly % 7) < 3);
+      let r = 104 - n * 22, g = 110 - n * 22, b = 122 - n * 20;
+      let rough = 0.24 + n * 0.16, metal = 0.56, ao = 0.92, hv = 0.68;
+      if (isTopAccent) { r = 24; g = 60; b = 106; rough = 0.20; }
+      if (isBase) { r = 26; g = 28; b = 34; rough = 0.45; hv = 0.4; }
+      if (isPanelSeam) { r *= 0.42; g *= 0.42; b *= 0.42; hv = 0.22; ao = 0.45; }
+      if (inVent) { r = 14; g = 16; b = 20; hv = 0.14; ao = 0.28; rough = 0.7; }
+      putPx(lx, 2 * S + ly, r, g, b, rough, metal, ao, hv);
+    }
+  }
+
+  // (1,2) Japanese Drink Recycling Bin
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const n = fbm2D(lx * 0.07 + 7, ly * 0.07, 3);
+      let r = 46 - n * 10, g = 56 - n * 10, b = 74 - n * 10;
+      let rough = 0.34, metal = 0.30, ao = 0.9, hv = 0.65;
+      if (ly < 72) { r = 140 - n * 24; g = 144 - n * 24; b = 150 - n * 24; }
+      const d1 = Math.hypot(lx - 80, ly - 38), d2 = Math.hypot(lx - 176, ly - 38);
+      if (d1 < 22 || d2 < 22) { r = 8; g = 9; b = 12; hv = 0.05; ao = 0.2; rough = 0.8; }
+      else if (d1 < 27 || d2 < 27) { r = 26; g = 122; b = 195; hv = 0.78; }
+      putPx(S + lx, 2 * S + ly, r, g, b, rough, metal, ao, hv);
+    }
+  }
+
+  // (2,2) Electrical Utility Junction / Meter Box Front Face (authentic Japanese kWh box with glass readout & steel latch!)
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const n = fbm2D(lx * 0.06 + 31, ly * 0.06, 3);
+      let base = 74 - n * 24, rough = 0.34 + n * 0.2, metal = 0.58, ao = 0.9, hv = 0.68;
+      if (lx < 14 || lx > 242 || ly < 14 || ly > 242) { base *= 0.50; hv = 0.34; }
+      // Rectangular glass inspection window (more authentic than giant circle!)
+      const inWin = lx > 66 && lx < 190 && ly > 52 && ly < 126;
+      const inFrame = lx > 58 && lx < 198 && ly > 44 && ly < 134 && !inWin;
+      let r = base * 0.95, g = base * 0.98, b = base * 1.04;
+      if (inFrame) { r = 22; g = 24; b = 28; hv = 0.82; }
+      else if (inWin) {
+        const isCounter = ly > 72 && ly < 92 && lx > 84 && lx < 172;
+        const isWheel = Math.abs(ly - 108) < 3 && lx > 88 && lx < 168;
+        r = isCounter ? 20 : (isWheel ? 165 : 92);
+        g = isCounter ? 22 : (isWheel ? 162 : 98);
+        b = isCounter ? 24 : (isWheel ? 155 : 104);
+        rough = 0.08; metal = 0.15; hv = 0.48;
+      }
+      // Subtle small warning label
+      if (ly > 176 && ly < 204 && lx > 56 && lx < 200) {
+        const str = ((lx + ly) % 20) < 10;
+        r = str ? 155 : 22; g = str ? 118 : 20; b = str ? 20 : 20;
+      }
+      putPx(2 * S + lx, 2 * S + ly, r, g, b, rough, metal, ao, hv);
+    }
+  }
+
+  // (3,2) Concrete Utility Pole with Weathered Address Plate & Hazard Band
+  for (let ly = 0; ly < S; ly++) {
+    for (let lx = 0; lx < S; lx++) {
+      const n = fbm2D(lx * 0.08 + 5, ly * 0.03, 4);
+      let base = 54 + n * 24;
+      let r = base * 0.96, g = base * 0.98, b = base * 1.03;
+      let rough = 0.58 - n * 0.14, metal = 0.05, hv = 0.5 + n * 0.2;
+      if (ly > 180 && ly < 218) {
+        const str = ((lx + ly) % 28) < 14;
+        r = str ? 175 : 20; g = str ? 142 : 20; b = str ? 24 : 22; rough = 0.26;
+      }
+      putPx(3 * S + lx, 2 * S + ly, r, g, b, rough, metal, 0.88, hv);
+    }
+  }
+
+  actx.putImageData(albImg, 0, 0);
+  rctx.putImageData(rmaImg, 0, 0);
+
+  actx.save();
+  actx.fillStyle = 'rgba(195, 52, 42, 0.50)'; actx.fillRect(36, S + 112, 26, 18);
+  actx.fillStyle = 'rgba(225, 212, 168, 0.55)'; actx.fillRect(156, S + 90, 20, 28);
+  actx.fillStyle = 'rgba(42, 138, 188, 0.42)'; actx.fillRect(78, S + 152, 28, 14);
+  actx.fillStyle = '#183f78'; actx.fillRect(3 * S + 96, 2 * S + 76, 56, 86);
+  actx.strokeStyle = '#d4dce6'; actx.lineWidth = 3; actx.strokeRect(3 * S + 99, 2 * S + 79, 50, 80);
+  actx.fillStyle = '#e6ecf2'; actx.font = 'bold 18px sans-serif'; actx.textAlign = 'center';
+  actx.fillText('新宿', 3 * S + 124, 2 * S + 108);
+  actx.fillText('三丁目', 3 * S + 124, 2 * S + 138);
+  actx.restore();
+
+  const normCanvas = heightToNormalCanvas(heights, W, H, 3.3);
+  return {
+    albedo: createCanvasTexture(alb, { srgb: true }),
+    rma: createCanvasTexture(rma, { srgb: false }),
+    normal: createCanvasTexture(normCanvas, { srgb: false })
+  };
+}
+
+// 3B. Ultra-Crisp High-Frequency Wet Asphalt Detail & Puddle Basin Texture (512x512 seamless)
+function buildAsphaltTextures() {
+  const S = 512;
+  const hBuf = new Float32Array(S * S);
+  const dataCnv = makeCanvas(S, S);
+  const ctx = dataCnv.getContext('2d');
+  const img = ctx.createImageData(S, S);
+  const d = img.data;
+
+  function pNoise(x, y, period) {
+    const ix = Math.floor(x), iy = Math.floor(y);
+    const fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const x0 = ((ix % period) + period) % period, x1 = (x0 + 1) % period;
+    const y0 = ((iy % period) + period) % period, y1 = (y0 + 1) % period;
+    const a = hash2(x0 * 3.17, y0 * 5.23), b = hash2(x1 * 3.17, y0 * 5.23);
+    const c = hash2(x0 * 3.17, y1 * 5.23), e = hash2(x1 * 3.17, y1 * 5.23);
+    return lerp(lerp(a, b, ux), lerp(c, e, ux), uy);
+  }
+  function pFbm(u, v, baseFreq, oct) {
+    let sum = 0, amp = 0.5, f = baseFreq;
+    for (let i = 0; i < oct; i++) {
+      sum += amp * pNoise(u * f, v * f, f);
+      f *= 2; amp *= 0.5;
+    }
+    return sum;
+  }
+
+  for (let y = 0; y < S; y++) {
+    const v = y / S;
+    for (let x = 0; x < S; x++) {
+      const u = x / S;
+      const macro = pFbm(u, v, 4, 3);
+      const med = pFbm(u + 0.31, v + 0.17, 16, 3);
+      const grit1 = pNoise(u * 64, v * 64, 64);
+      const grit2 = pNoise(u * 128, v * 128, 128);
+      const grit3 = pNoise(u * 256, v * 256, 256);
+      const fine = grit1 * 0.25 + grit2 * 0.40 + grit3 * 0.35;
+      const cr = Math.abs(pFbm(u + 0.71, v + 0.23, 8, 3) - 0.5) * 2.0;
+      const crack = cr < 0.022 ? (1.0 - cr / 0.022) : 0.0;
+
+      const hVal = clamp(0.62 * fine + 0.25 * med + 0.13 * macro - crack * 0.42, 0, 1);
+      hBuf[y * S + x] = hVal;
+
+      const i = (y * S + x) * 4;
+      d[i]     = Math.round(clamp(0.12 + fine * 0.58 + med * 0.20 - crack * 0.18, 0, 1) * 255);
+      d[i + 1] = Math.round(clamp(macro * 0.72 + med * 0.28, 0, 1) * 255);
+      d[i + 2] = Math.round(clamp(0.24 + fine * 0.56 + med * 0.20, 0, 1) * 255);
+      d[i + 3] = Math.round(clamp(crack, 0, 1) * 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const normCnv = heightToNormalCanvas(hBuf, S, S, 4.4);
+  return {
+    data: createCanvasTexture(dataCnv, { srgb: false }),
+    normal: createCanvasTexture(normCnv, { srgb: false })
+  };
+}
+
+// 3C. Signage, Photographic Shopfronts, Arch Banners, Vending & Lantern Atlas (2048 x 2048)
+function buildSignageAtlas() {
+  const W = 2048, H = 2048;
+  const colCnv = makeCanvas(W, H), cctx = colCnv.getContext('2d');
+  const emiCnv = makeCanvas(W, H), ectx = emiCnv.getContext('2d');
+
+  cctx.fillStyle = '#0e1015'; cctx.fillRect(0, 0, W, H);
+  ectx.fillStyle = '#000000'; ectx.fillRect(0, 0, W, H);
+
+  const rects = {};
+  const FONT_GOTHIC = '"Hiragino Kaku Gothic ProN", "YuGothic", "Meiryo", sans-serif';
+  const FONT_MINCHO = '"Hiragino Mincho ProN", "YuMincho", serif';
+
+  function reg(id, x, y, w, h, meta = {}) {
+    rects[id] = {
+      u0: (x + 2) / W, v0: (y + 2) / H,
+      u1: (x + w - 2) / W, v1: (y + h - 2) / H,
+      w, h, ...meta
+    };
+  }
+
+  function drawVerticalText(ctx, chars, cx, yStart, stepY, font, fill, stroke, shadowCol, shadowBlur) {
+    ctx.save();
+    ctx.font = font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    if (shadowCol) { ctx.shadowColor = shadowCol; ctx.shadowBlur = shadowBlur || 16; }
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i], y = yStart + i * stepY;
+      if (ch === 'ー' || ch === '〜') {
+        ctx.save(); ctx.translate(cx, y); ctx.rotate(Math.PI / 2);
+        if (stroke) { ctx.strokeStyle = stroke; ctx.strokeText(ch, 0, 0); }
+        ctx.fillStyle = fill; ctx.fillText(ch, 0, 0);
+        ctx.restore();
+      } else {
+        if (stroke) { ctx.strokeStyle = stroke; ctx.strokeText(ch, cx, y); }
+        ctx.fillStyle = fill; ctx.fillText(ch, cx, y);
+      }
+    }
+    ctx.restore();
+  }
+
+  function fitText(ctx, text, maxW, maxH, weight, family) {
+    let sz = Math.round(maxH);
+    ctx.font = `${weight} ${sz}px ${family}`;
+    const mw = ctx.measureText(text).width;
+    if (mw > maxW) sz = Math.max(12, Math.floor(sz * (maxW / mw)));
+    return `${weight} ${sz}px ${family}`;
+  }
+
+  function drawBladeSign(id, x, y, w, h, cfg) {
+    reg(id, x, y, w, h, { lightColor: cfg.lightColor, intensity: cfg.intensity || 1.75 });
+    const drawTo = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+      ctx.fillStyle = isEmissive ? '#000' : '#16181e';
+      ctx.fillRect(x, y, w, h);
+
+      const pad = 8, ix = x + pad, iy = y + pad, iw = w - pad * 2, ih = h - pad * 2;
+      if (cfg.style === 'neon_tube') {
+        ctx.fillStyle = isEmissive ? '#030206' : '#0f1117';
+        ctx.fillRect(ix, iy, iw, ih);
+        if (!isEmissive) {
+          ctx.strokeStyle = '#222630'; ctx.lineWidth = 2.5;
+          for (let gy = iy + 28; gy < iy + ih; gy += 44) {
+            ctx.beginPath(); ctx.moveTo(ix, gy); ctx.lineTo(ix + iw, gy); ctx.stroke();
+          }
+        }
+        ctx.strokeStyle = cfg.borderCol || cfg.glowCol;
+        ctx.lineWidth = isEmissive ? 7 : 5;
+        ctx.shadowColor = cfg.glowCol; ctx.shadowBlur = isEmissive ? 18 : 8;
+        ctx.strokeRect(ix + 8, iy + 8, iw - 16, ih - 16);
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+        ctx.strokeRect(ix + 8, iy + 8, iw - 16, ih - 16);
+
+        const chars = Array.from(cfg.text);
+        const step = (ih - 48) / Math.max(chars.length, 1);
+        const fSize = Math.min(iw * 0.66, step * 0.84);
+        const font = `900 ${Math.round(fSize)}px ${cfg.mincho ? FONT_MINCHO : FONT_GOTHIC}`;
+        const y0 = iy + 24 + step * 0.5;
+        ctx.lineWidth = isEmissive ? 10 : 6;
+        drawVerticalText(ctx, chars, ix + iw / 2, y0, step, font, cfg.glowCol, cfg.glowCol, cfg.glowCol, isEmissive ? 22 : 10);
+        drawVerticalText(ctx, chars, ix + iw / 2, y0, step, font, '#fff5f2', null, cfg.glowCol, 6);
+      } else {
+        const grad = ctx.createRadialGradient(ix + iw * 0.5, iy + ih * 0.48, iw * 0.05, ix + iw * 0.5, iy + ih * 0.5, ih * 0.60);
+        grad.addColorStop(0, cfg.bgCenter); grad.addColorStop(0.70, cfg.bgMid || cfg.bgEdge); grad.addColorStop(1, cfg.bgEdge);
+        ctx.fillStyle = grad; ctx.fillRect(ix, iy, iw, ih);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.07)';
+        for (let ty = iy + 20; ty < iy + ih - 12; ty += 56) ctx.fillRect(ix + 3, ty, iw - 6, 14);
+
+        if (cfg.headerBg) {
+          ctx.fillStyle = cfg.headerBg; ctx.fillRect(ix, iy, iw, 44);
+          ctx.font = `800 20px ${FONT_GOTHIC}`; ctx.fillStyle = cfg.headerText || '#ffffff';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(cfg.sub || '2F', ix + iw / 2, iy + 23);
+        }
+        if (cfg.innerBorder) { ctx.strokeStyle = cfg.innerBorder; ctx.lineWidth = 3.5; ctx.strokeRect(ix + 5, iy + 5, iw - 10, ih - 10); }
+
+        const chars = Array.from(cfg.text);
+        const topPad = cfg.headerBg ? 54 : 20, botPad = cfg.footer ? 40 : 18;
+        const step = (ih - topPad - botPad) / Math.max(chars.length, 1);
+        const fSize = Math.min(iw * 0.72, step * 0.86);
+        const font = `900 ${Math.round(fSize)}px ${cfg.mincho ? FONT_MINCHO : FONT_GOTHIC}`;
+        ctx.lineWidth = cfg.textStroke ? 4.5 : 0;
+        drawVerticalText(ctx, chars, ix + iw / 2, iy + topPad + step * 0.5, step, font, cfg.textCol, cfg.textStroke || null, null, 0);
+
+        if (cfg.footer) {
+          ctx.font = fitText(ctx, cfg.footer, iw - 12, 18, '800', FONT_GOTHIC);
+          ctx.fillStyle = cfg.footerCol || cfg.textCol;
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(cfg.footer, ix + iw / 2, iy + ih - 20);
+        }
+
+        const vg = ctx.createLinearGradient(ix, iy, ix, iy + ih);
+        vg.addColorStop(0, 'rgba(0,0,0,0.48)'); vg.addColorStop(0.09, 'rgba(0,0,0,0)');
+        vg.addColorStop(0.91, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.52)');
+        ctx.fillStyle = vg; ctx.fillRect(ix, iy, iw, ih);
+        const hg = ctx.createLinearGradient(ix, iy, ix + iw, iy);
+        hg.addColorStop(0, 'rgba(0,0,0,0.38)'); hg.addColorStop(0.15, 'rgba(0,0,0,0)');
+        hg.addColorStop(0.85, 'rgba(0,0,0,0)'); hg.addColorStop(1, 'rgba(0,0,0,0.38)');
+        ctx.fillStyle = hg; ctx.fillRect(ix, iy, iw, ih);
+        if (isEmissive) { ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fillRect(ix, iy, iw, ih); }
+      }
+      for (let k = 0; k < 36; k++) {
+        const sx = ix + hash2(k + x, y) * iw, sy = iy + hash2(y, k + x * 3) * ih;
+        ctx.fillStyle = `rgba(8,6,10,${0.10 + hash2(sx, sy) * 0.18})`;
+        ctx.fillRect(sx, sy, 2 + hash2(sy, sx) * 4, 4 + hash2(k, sx) * 14);
+      }
+      ctx.restore();
+    };
+    drawTo(cctx, false);
+    drawTo(ectx, true);
+  }
+
+  // Row 0 (y=0..464): 16 Unique Blade Signs
+  const bladeConfigs = [
+    { id: 'blade_ramen',    text: 'ラーメン龍', sub: '1F',  footer: '年中無休', bgCenter: '#e62212', bgMid: '#a8100a', bgEdge: '#540606', textCol: '#ffefb8', textStroke: '#240202', headerBg: '#e8b62c', headerText: '#1a0605', innerBorder: '#f0be38', mincho: true, lightColor: [1.0, 0.18, 0.08], intensity: 1.90 },
+    { id: 'blade_izakaya',  text: '居酒屋呑兵衛', sub: '酒処', footer: '地下1F', bgCenter: '#f0d8a8', bgMid: '#cca058', bgEdge: '#7d5422', textCol: '#140c09', headerBg: '#a81914', headerText: '#fff2d6', innerBorder: '#1f1009', mincho: true, lightColor: [1.0, 0.66, 0.28], intensity: 1.68 },
+    { id: 'blade_karaoke',  text: 'カラオケ歌姫', style: 'neon_tube', glowCol: '#00dcff', borderCol: '#ff1f8e', lightColor: [0.06, 0.85, 1.0], intensity: 3.0 },
+    { id: 'blade_bar',      text: '深夜バー蛍',   style: 'neon_tube', glowCol: '#ff1f7a', borderCol: '#ff52a8', mincho: true, lightColor: [1.0, 0.14, 0.50], intensity: 2.9 },
+    { id: 'blade_yakitori', text: '焼鳥炭火焼', sub: '名物', footer: '生ビール', bgCenter: '#f27814', bgMid: '#bd3a08', bgEdge: '#5e1402', textCol: '#170602', textStroke: '#ffd68a', headerBg: '#180a06', headerText: '#ffa638', mincho: true, lightColor: [1.0, 0.40, 0.08], intensity: 1.85 },
+    { id: 'blade_mahjong',  text: '麻雀クラブ', sub: '3F',  footer: '24H', bgCenter: '#0dc45e', bgMid: '#057d3a', bgEdge: '#023b1b', textCol: '#fff3a0', textStroke: '#031f0e', headerBg: '#e8c426', headerText: '#08180c', lightColor: [0.10, 0.90, 0.42], intensity: 1.82 },
+    { id: 'blade_arcade',   text: 'ゲーム会館',   style: 'neon_tube', glowCol: '#2ca8ff', borderCol: '#00f5d4', lightColor: [0.14, 0.68, 1.0], intensity: 2.95 },
+    { id: 'blade_sake',     text: '地酒おでん', sub: '名代', footer: '二階席', bgCenter: '#ede0c6', bgMid: '#c4b08c', bgEdge: '#78684e', textCol: '#9e130e', headerBg: '#182846', headerText: '#f0e6d2', innerBorder: '#9e130e', mincho: true, lightColor: [1.0, 0.78, 0.50], intensity: 1.58 },
+    { id: 'blade_hotel',    text: '新宿ホテル',   style: 'neon_tube', glowCol: '#ff2e38', borderCol: '#ff9518', lightColor: [1.0, 0.18, 0.20], intensity: 2.90 },
+    { id: 'blade_snack',    text: 'スナック夢', sub: '2F',  footer: 'PM8-AM4', bgCenter: '#8220e8', bgMid: '#480d8f', bgEdge: '#200542', textCol: '#ffd8ff', textStroke: '#140229', headerBg: '#e01e78', headerText: '#fff', lightColor: [0.72, 0.22, 1.0], intensity: 2.15 },
+    { id: 'blade_gyoza',    text: '餃子専門店', sub: '元祖', footer: '持帰り', bgCenter: '#f0c622', bgMid: '#bd820a', bgEdge: '#664004', textCol: '#a60d08', textStroke: '#fff2c2', headerBg: '#b8110c', headerText: '#ffea94', lightColor: [1.0, 0.72, 0.14], intensity: 1.80 },
+    { id: 'blade_coffee',   text: '純喫茶星影', sub: '珈琲', footer: 'OPEN', bgCenter: '#12a8b2', bgMid: '#086470', bgEdge: '#032e36', textCol: '#fff3d4', headerBg: '#d9741a', headerText: '#140b05', mincho: true, lightColor: [0.10, 0.80, 0.88], intensity: 1.88 },
+    { id: 'blade_sushi',    text: '江戸前寿司', sub: '旬魚', footer: '深夜迄', bgCenter: '#18427d', bgMid: '#0d264d', bgEdge: '#061229', textCol: '#fff2d8', headerBg: '#c9231a', headerText: '#fff', innerBorder: '#d9b25e', mincho: true, lightColor: [0.24, 0.55, 1.0], intensity: 1.98 },
+    { id: 'blade_horumon',  text: 'ホルモン焼',   style: 'neon_tube', glowCol: '#ff7b1c', borderCol: '#ff2b2b', lightColor: [1.0, 0.42, 0.10], intensity: 2.90 },
+    { id: 'blade_jazz',     text: 'ジャズ喫茶',   style: 'neon_tube', glowCol: '#ffbf36', borderCol: '#38d2ff', mincho: true, lightColor: [1.0, 0.72, 0.20], intensity: 2.80 },
+    { id: 'blade_pub',      text: '大衆酒場翠', sub: '樽生', footer: '1F奥', bgCenter: '#158a6a', bgMid: '#0b5240', bgEdge: '#04261e', textCol: '#fff4d4', headerBg: '#f07824', headerText: '#170a04', mincho: true, lightColor: [0.14, 0.82, 0.62], intensity: 1.88 }
+  ];
+  bladeConfigs.forEach((cfg, i) => drawBladeSign(cfg.id, i * 128 + 2, 4, 124, 456, cfg));
+
+  // Row 1 (y=468..812): 8 Horizontal Facia Signboards + Overhead Alley Arch Sign!
+  function drawHorizSign(id, x, y, w, h, cfg) {
+    reg(id, x, y, w, h, { lightColor: cfg.lightColor, intensity: cfg.intensity || 1.78 });
+    const drawTo = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+      ctx.fillStyle = isEmissive ? '#000' : '#16181e'; ctx.fillRect(x, y, w, h);
+      const p = 8, ix = x + p, iy = y + p, iw = w - p * 2, ih = h - p * 2;
+      if (cfg.style === 'neon') {
+        ctx.fillStyle = isEmissive ? '#030307' : '#0f1016'; ctx.fillRect(ix, iy, iw, ih);
+        ctx.strokeStyle = cfg.glowCol; ctx.lineWidth = isEmissive ? 6 : 4;
+        ctx.shadowColor = cfg.glowCol; ctx.shadowBlur = isEmissive ? 18 : 8;
+        ctx.strokeRect(ix + 7, iy + 7, iw - 14, ih - 14);
+        ctx.font = fitText(ctx, cfg.text, iw - 36, ih * 0.48, '900', cfg.mincho ? FONT_MINCHO : FONT_GOTHIC);
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = cfg.glowCol; ctx.fillText(cfg.text, ix + iw / 2, iy + ih * 0.44);
+        ctx.fillStyle = '#fff8f5'; ctx.shadowBlur = 5; ctx.fillText(cfg.text, ix + iw / 2, iy + ih * 0.44);
+        if (cfg.sub) {
+          ctx.font = fitText(ctx, cfg.sub, iw - 32, ih * 0.18, '700', FONT_GOTHIC);
+          ctx.fillStyle = cfg.subCol || '#ffe4a0'; ctx.fillText(cfg.sub, ix + iw / 2, iy + ih * 0.80);
+        }
+      } else {
+        const g = ctx.createLinearGradient(ix, iy, ix, iy + ih);
+        g.addColorStop(0, cfg.bg1); g.addColorStop(0.5, cfg.bg2); g.addColorStop(1, cfg.bg1);
+        ctx.fillStyle = g; ctx.fillRect(ix, iy, iw, ih);
+        if (cfg.border) { ctx.strokeStyle = cfg.border; ctx.lineWidth = 4; ctx.strokeRect(ix + 6, iy + 6, iw - 12, ih - 12); }
+        ctx.font = fitText(ctx, cfg.text, iw - 34, ih * 0.48, '900', cfg.mincho ? FONT_MINCHO : FONT_GOTHIC);
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        if (cfg.stroke) { ctx.lineWidth = 5; ctx.strokeStyle = cfg.stroke; ctx.strokeText(cfg.text, ix + iw / 2, iy + ih * (cfg.sub ? 0.42 : 0.52)); }
+        ctx.fillStyle = cfg.textCol; ctx.fillText(cfg.text, ix + iw / 2, iy + ih * (cfg.sub ? 0.42 : 0.52));
+        if (cfg.sub) {
+          ctx.font = fitText(ctx, cfg.sub, iw - 34, ih * 0.18, '700', FONT_GOTHIC);
+          ctx.fillStyle = cfg.subCol || cfg.textCol; ctx.fillText(cfg.sub, ix + iw / 2, iy + ih * 0.78);
+        }
+        const vg = ctx.createLinearGradient(ix, iy, ix, iy + ih);
+        vg.addColorStop(0, 'rgba(0,0,0,0.40)'); vg.addColorStop(0.20, 'rgba(0,0,0,0)');
+        vg.addColorStop(0.80, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.46)');
+        ctx.fillStyle = vg; ctx.fillRect(ix, iy, iw, ih);
+        if (isEmissive) { ctx.fillStyle = 'rgba(0,0,0,0.20)'; ctx.fillRect(ix, iy, iw, ih); }
+      }
+      ctx.restore();
+    };
+    drawTo(cctx, false);
+    drawTo(ectx, true);
+  }
+
+  const horizConfigs = [
+    { id: 'h_ramen',    text: '麺処 龍神',         sub: '豚骨・味噌・特製らーめん ¥850', bg1: '#700d0a', bg2: '#c72016', textCol: '#ffefc4', stroke: '#240303', border: '#e8b638', mincho: true, lightColor: [1.0, 0.22, 0.12], intensity: 1.78 },
+    { id: 'h_izakaya',  text: '大衆酒場 酔月',     sub: '焼き鳥・もつ煮・生ビール',      bg1: '#996a2e', bg2: '#e8cfa0', textCol: '#180d08', border: '#9e1712', mincho: true, lightColor: [1.0, 0.70, 0.34], intensity: 1.62 },
+    { id: 'h_bar',      text: 'BAR MIDNIGHT',     sub: 'WHISKY & COCKTAILS · 20:00-05:00', style: 'neon', glowCol: '#ff227d', subCol: '#45e6ff', lightColor: [1.0, 0.16, 0.52], intensity: 2.70 },
+    { id: 'h_cyber',    text: '24H 電脳喫茶',      sub: 'GAME · MANGA · COFFEE',         style: 'neon', glowCol: '#00dcff', subCol: '#ff429a', lightColor: [0.06, 0.86, 1.0], intensity: 2.70 },
+    { id: 'h_sushi',    text: '立喰い 寿司 江戸前', sub: '一貫百円より・深夜営業',        bg1: '#0f1c33', bg2: '#1b3661', textCol: '#fff3dc', border: '#d4ae5e', mincho: true, lightColor: [0.30, 0.56, 1.0], intensity: 1.78 },
+    { id: 'h_yakitori', text: '炭火焼鳥 とり源',   sub: '秘伝タレ・塩・ハイボール',      bg1: '#752006', bg2: '#d65510', textCol: '#fff2d0', stroke: '#220602', mincho: true, lightColor: [1.0, 0.44, 0.10], intensity: 1.78 },
+    { id: 'h_arch1',    text: '新宿 一番街',       sub: 'SHINJUKU ICHIBANGAI · 飲食街',  style: 'neon', glowCol: '#ff2e44', subCol: '#ffe285', mincho: true, lightColor: [1.0, 0.20, 0.25], intensity: 2.95 },
+    { id: 'h_arch2',    text: '思い出横丁',        sub: 'OMOIDE YOKOCHO · 24H',         bg1: '#6e0d0a', bg2: '#bd1e14', textCol: '#fff4cf', stroke: '#1f0302', border: '#f0c448', mincho: true, lightColor: [1.0, 0.34, 0.14], intensity: 2.05 }
+  ];
+  horizConfigs.forEach((cfg, i) => {
+    const col = i % 4, row = Math.floor(i / 4);
+    drawHorizSign(cfg.id, col * 510 + 4, 468 + row * 170, 502, 162, cfg);
+  });
+
+  // Row 2 (y=816..1344): PHOTOREALISTIC TOKYO SHOPFRONTS (Natural frosted glass, real bottle/shelf depth, subtle neon!)
+  function drawShopfront(id, x, y, w, h, cfg) {
+    reg(id, x, y, w, h, { lightColor: cfg.lightColor, intensity: cfg.intensity || 1.60 });
+    const drawTo = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+
+      // Rich interior lighting depth (warm ceiling glow fading softly to shadowed rear walls)
+      const g = ctx.createRadialGradient(x + w * 0.5, y + h * 0.30, 24, x + w * 0.5, y + h * 0.52, w * 0.72);
+      g.addColorStop(0.0, cfg.innerBright);
+      g.addColorStop(0.50, cfg.innerMid);
+      g.addColorStop(0.86, cfg.innerDark);
+      g.addColorStop(1.0, '#070506');
+      ctx.fillStyle = g;
+      ctx.fillRect(x, y, w, h);
+
+      // Subtle architectural interior depth: dark ceiling beam, back wooden counter, bar shelves
+      ctx.fillStyle = 'rgba(14, 7, 5, 0.58)';
+      ctx.fillRect(x, y, w, h * 0.14);
+      ctx.fillRect(x, y + h * 0.60, w, h * 0.40);
+
+      // Two horizontal shelf ledges with realistic tapered sake/whisky bottle silhouettes!
+      for (let shelf = 0; shelf < 2; shelf++) {
+        const sy = y + h * (shelf === 0 ? 0.38 : 0.55);
+        ctx.fillStyle = 'rgba(16, 8, 5, 0.55)';
+        ctx.fillRect(x + 28, sy, w - 56, 6);
+        for (let bx = x + 38; bx < x + w - 42; bx += 22) {
+          if (hash2(bx, shelf * 17 + x) < 0.26) continue;
+          const bh = 22 + hash2(bx + 3, y + shelf) * 20;
+          const bw = 9 + hash2(shelf, bx) * 4;
+          // Tapered bottle body + neck
+          ctx.fillStyle = `rgba(18, 9, 6, ${0.42 + hash2(y, bx) * 0.22})`;
+          ctx.fillRect(bx, sy - bh, bw, bh);
+          ctx.fillRect(bx + bw * 0.28, sy - bh - 11, bw * 0.44, 11);
+          // Warm amber glass edge glint
+          ctx.fillStyle = 'rgba(255, 195, 110, 0.14)';
+          ctx.fillRect(bx + 1.5, sy - bh + 3, 2, bh * 0.65);
+        }
+      }
+
+      // Soft warm ceiling light wash (gentle natural diffusion — NO circular polka-dot orbs!)
+      const topGlow = ctx.createLinearGradient(x, y + h * 0.12, x, y + h * 0.66);
+      topGlow.addColorStop(0.0, cfg.topWash);
+      topGlow.addColorStop(0.5, 'rgba(255,180,100,0.06)');
+      topGlow.addColorStop(1.0, 'rgba(0,0,0,0.22)');
+      ctx.fillStyle = topGlow;
+      ctx.fillRect(x, y + h * 0.12, w, h * 0.54);
+
+      // Fine organic frosted-glass mist & subtle vertical rain runoff streaks (NO thick zebra stripes!)
+      for (let s = 0; s < 110; s++) {
+        const sx = x + hash2(s * 1.3, x + 9) * w, sy = y + hash2(y + 5, s * 2.1) * h * 0.75;
+        ctx.fillStyle = (s % 3 === 0) ? 'rgba(255,245,230,0.045)' : 'rgba(8,6,10,0.08)';
+        ctx.fillRect(sx, sy, 1.5 + hash2(sx, s) * 2.5, 24 + hash2(s, sx) * 95);
+      }
+
+      // Optional crisp small interior neon glass tube mounted cleanly inside dark bar/cafe window!
+      if (cfg.innerNeon) {
+        ctx.save();
+        const nx = x + w * 0.5, ny = y + h * 0.36;
+        // Thin dark suspension wires from top frame
+        ctx.strokeStyle = '#090a0e'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(nx - 62, y + 24); ctx.lineTo(nx - 62, ny - 28);
+        ctx.moveTo(nx + 62, y + 24); ctx.lineTo(nx + 62, ny - 28); ctx.stroke();
+
+        ctx.strokeStyle = cfg.innerNeonCol;
+        ctx.lineWidth = isEmissive ? 4.5 : 3.5;
+        ctx.shadowColor = cfg.innerNeonCol;
+        ctx.shadowBlur = isEmissive ? 20 : 9;
+        ctx.strokeRect(nx - 76, ny - 28, 152, 56);
+        ctx.font = `900 28px ${FONT_GOTHIC}`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = cfg.innerNeonCol; ctx.fillText(cfg.innerNeon, nx, ny);
+        ctx.fillStyle = '#fff6f9'; ctx.shadowBlur = 5; ctx.fillText(cfg.innerNeon, nx, ny);
+        ctx.restore();
+      }
+
+      // Authentic Japanese Wooden Sliding Door Frame (引き戸) & Lower Weathered Timber Kickboard
+      ctx.fillStyle = isEmissive ? '#000000' : cfg.woodCol;
+      ctx.fillRect(x, y, w, 26);
+      ctx.fillRect(x, y + h - 130, w, 130);
+      ctx.fillRect(x, y, 24, h);
+      ctx.fillRect(x + w - 24, y, 24, h);
+      ctx.fillRect(x + w * 0.5 - 12, y, 24, h);
+
+      if (!isEmissive) {
+        ctx.fillStyle = 'rgba(0,0,0,0.38)';
+        for (let kx = x + 24; kx < x + w - 24; kx += 22) ctx.fillRect(kx, y + h - 128, 2, 126);
+        ctx.fillStyle = '#5a5248';
+        ctx.fillRect(x + w * 0.5 - 30, y + h - 194, 8, 40);
+        ctx.fillRect(x + w * 0.5 + 22, y + h - 194, 8, 40);
+      }
+
+      // Fine Kumiko wooden lattice mullions
+      ctx.fillStyle = isEmissive ? '#000000' : cfg.woodCol;
+      const cols = cfg.cols || 8, rows = cfg.rows || 5;
+      for (let c = 1; c < cols; c++) ctx.fillRect(x + (w / cols) * c - 4, y, 8, h - 128);
+      for (let r = 1; r < rows; r++) ctx.fillRect(x, y + ((h - 128) / rows) * r - 4, w, 8);
+
+      // Authentic weathered warm-toned calligraphy menu strips pasted inside ramen/izakaya windows
+      if (cfg.menus) {
+        const words = ['中華そば', '焼餃子', '生ビール', '焼鳥盛'];
+        for (let m = 0; m < 4; m++) {
+          const mx = x + 46 + m * 112, my = y + 96;
+          ctx.fillStyle = isEmissive ? '#825d2c' : '#c9b48e';
+          ctx.fillRect(mx, my, 32, 110);
+          drawVerticalText(ctx, Array.from(words[m]), mx + 16, my + 17, 23, `800 17px ${FONT_MINCHO}`, '#180c07');
+        }
+      }
+
+      if (isEmissive && !cfg.innerNeon) {
+        ctx.fillStyle = 'rgba(0,0,0,0.28)';
+        ctx.fillRect(x, y, w, h);
+      }
+      ctx.restore();
+    };
+    drawTo(cctx, false);
+    drawTo(ectx, true);
+  }
+
+  drawShopfront('shop_ramen', 6, 816, 498, 520, {
+    innerBright: '#efa844', innerMid: '#9c4514', innerDark: '#2b0f05', topWash: 'rgba(255,212,130,0.32)',
+    woodCol: '#1f140d', cols: 8, rows: 5, menus: true, lightColor: [1.0, 0.52, 0.16], intensity: 1.65
+  });
+  drawShopfront('shop_izakaya', 516, 816, 498, 520, {
+    innerBright: '#f5c26c', innerMid: '#964412', innerDark: '#260d05', topWash: 'rgba(255,224,155,0.28)',
+    woodCol: '#17100b', cols: 10, rows: 4, menus: true, lightColor: [1.0, 0.60, 0.22], intensity: 1.55
+  });
+  drawShopfront('shop_bar', 1026, 816, 498, 520, {
+    innerBright: '#361a26', innerMid: '#150d1a', innerDark: '#07050c', topWash: 'rgba(255,140,90,0.16)',
+    woodCol: '#101218', cols: 4, rows: 3, menus: false,
+    innerNeon: 'BAR · OPEN', innerNeonCol: '#ff2278',
+    lightColor: [0.95, 0.22, 0.50], intensity: 2.25
+  });
+  drawShopfront('shop_cafe', 1536, 816, 498, 520, {
+    innerBright: '#4d8a96', innerMid: '#183846', innerDark: '#09141d', topWash: 'rgba(180,242,248,0.22)',
+    woodCol: '#15181e', cols: 6, rows: 4, menus: false,
+    innerNeon: '珈琲 · 24H', innerNeonCol: '#1ee0ff',
+    lightColor: [0.20, 0.78, 0.94], intensity: 2.15
+  });
+
+  // Row 3 (y=1348..2042): Vending, Fabric-Draped Noren Panels, Chochin Lanterns, A-Frames, Upper Windows
+  reg('vending', 6, 1348, 352, 690, { lightColor: [0.76, 0.92, 1.0], intensity: 1.92 });
+  {
+    const x = 6, y = 1348, w = 352, h = 690;
+    const drawVend = (ctx, isEmissive) => {
+      ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+      ctx.fillStyle = isEmissive ? '#000' : '#aeb5c2'; ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = isEmissive ? '#002642' : '#153e6b'; ctx.fillRect(x, y, w, 62);
+      ctx.font = `800 20px ${FONT_GOTHIC}`; ctx.fillStyle = isEmissive ? '#82dfff' : '#e8f4ff';
+      ctx.textAlign = 'center'; ctx.fillText('DRINK · 24H 自動販売機', x + w / 2, y + 38);
+
+      const dx = x + 18, dy = y + 70, dw = w - 36, dh = 330;
+      const wg = ctx.createLinearGradient(dx, dy, dx, dy + dh);
+      wg.addColorStop(0, '#dff4ff'); wg.addColorStop(0.5, '#b8e0f8'); wg.addColorStop(1, '#98cce8');
+      ctx.fillStyle = wg; ctx.fillRect(dx, dy, dw, dh);
+
+      const drinkCols = ['#d92626', '#1678e0', '#249e42', '#e8961c', '#5e3820', '#e8dec4', '#e03e82', '#009688', '#ebb800'];
+      for (let row = 0; row < 3; row++) {
+        const sy = dy + 18 + row * 104;
+        ctx.fillStyle = 'rgba(18,34,54,0.32)'; ctx.fillRect(dx, sy + 70, dw, 10);
+        for (let col = 0; col < 9; col++) {
+          const cx = dx + 10 + col * 33, bh = row === 2 ? 58 : 44;
+          ctx.fillStyle = drinkCols[(row * 5 + col * 3) % drinkCols.length];
+          ctx.fillRect(cx, sy + 68 - bh, 22, bh);
+          ctx.fillStyle = 'rgba(255,255,255,0.72)'; ctx.fillRect(cx + 2, sy + 68 - bh * 0.64, 18, bh * 0.26);
+          ctx.fillStyle = (row === 0 && col < 4) ? '#e62424' : '#0078e8'; ctx.fillRect(cx, sy + 80, 22, 8);
+          ctx.fillStyle = '#fff2a6'; ctx.fillRect(cx + 6, sy + 92, 10, 5);
+        }
+      }
+      ctx.fillStyle = isEmissive ? '#000' : '#1d2129'; ctx.fillRect(x + 18, y + 416, w - 36, 86);
+      ctx.fillStyle = isEmissive ? '#1ce65c' : '#2eff70'; ctx.font = '700 22px monospace'; ctx.textAlign = 'left';
+      ctx.fillText('¥130', x + 236, y + 462);
+      ctx.fillStyle = isEmissive ? '#126099' : '#1a7ac2'; ctx.fillRect(x + 28, y + 428, 182, 60);
+      ctx.fillStyle = '#ffffff'; ctx.font = `900 24px ${FONT_GOTHIC}`; ctx.fillText('つめたい', x + 56, y + 466);
+      ctx.fillStyle = isEmissive ? '#000' : '#101216'; ctx.fillRect(x + 28, y + 526, w - 56, 128);
+      ctx.strokeStyle = isEmissive ? '#000' : '#3a404c'; ctx.lineWidth = 4; ctx.strokeRect(x + 28, y + 526, w - 56, 128);
+      ctx.restore();
+    };
+    drawVend(cctx, false); drawVend(ectx, true);
+  }
+
+  // 4 Noren Curtain Fabric Banners (designed to span across 4 split swaying cloth panels!)
+  const norenList = [
+    { id: 'noren_red',   bg: '#68120f', chars: ['ら', 'ー', 'め', 'ん'], textCol: '#f2e4cc' },
+    { id: 'noren_navy',  bg: '#101e38', chars: ['居', '酒', '屋', '呑'], textCol: '#ebe0cc' },
+    { id: 'noren_cream', bg: '#b09d7c', chars: ['炭', '火', '焼', '鳥'], textCol: '#1b100b' },
+    { id: 'noren_wine',  bg: '#3d1022', chars: ['名', '代', '酒', '処'], textCol: '#f2d8b6' }
+  ];
+  norenList.forEach((n, i) => {
+    const x = 372 + i * 206, y = 1350, w = 198, h = 290;
+    reg(n.id, x, y, w, h, { lightColor: [0.9, 0.5, 0.25], intensity: 0.16 });
+    const drawN = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.fillStyle = isEmissive ? 'rgba(255, 140, 58, 0.08)' : n.bg;
+      ctx.fillRect(x, y, w, h);
+      if (!isEmissive) {
+        const fg = ctx.createLinearGradient(x, y, x + w, y);
+        fg.addColorStop(0.0, 'rgba(0,0,0,0.28)'); fg.addColorStop(0.25, 'rgba(255,255,255,0.06)');
+        fg.addColorStop(0.5, 'rgba(0,0,0,0.12)'); fg.addColorStop(0.75, 'rgba(255,255,255,0.05)');
+        fg.addColorStop(1.0, 'rgba(0,0,0,0.32)');
+        ctx.fillStyle = fg; ctx.fillRect(x, y, w, h);
+        for (let yy = y; yy < y + h; yy += 3) { ctx.fillStyle = 'rgba(0,0,0,0.08)'; ctx.fillRect(x, yy, w, 1); }
+      }
+      // One crisp bold calligraphy kanji centered in each of the 4 panels + subtle crest circle behind center
+      ctx.strokeStyle = isEmissive ? 'rgba(255,190,120,0.10)' : n.textCol;
+      ctx.lineWidth = 3;
+      ctx.globalAlpha = isEmissive ? 0.5 : 0.35;
+      ctx.beginPath(); ctx.arc(x + w * 0.5, y + h * 0.48, 66, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1.0;
+      ctx.font = `900 36px ${FONT_MINCHO}`;
+      ctx.fillStyle = isEmissive ? 'rgba(255,205,145,0.18)' : n.textCol;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      for (let ci = 0; ci < 4; ci++) {
+        ctx.fillText(n.chars[ci], x + (ci + 0.5) * (w / 4), y + h * 0.48);
+      }
+      ctx.restore();
+    };
+    drawN(cctx, false); drawN(ectx, true);
+  });
+
+  // 4 Chochin Paper Lanterns
+  const lanternList = [
+    { id: 'lantern_red',     cCenter: '#ff521c', cEdge: '#9e0e06', text: '酒',   textCol: '#120503', lightColor: [1.0, 0.28, 0.08] },
+    { id: 'lantern_warm',    cCenter: '#ffe49e', cEdge: '#c9741c', text: '焼鳥', textCol: '#180904', lightColor: [1.0, 0.66, 0.24] },
+    { id: 'lantern_crimson', cCenter: '#f5362c', cEdge: '#80080c', text: '麺',   textCol: '#fff0cc', lightColor: [1.0, 0.18, 0.12] },
+    { id: 'lantern_amber',   cCenter: '#ffbd4a', cEdge: '#b3420a', text: '呑',   textCol: '#160602', lightColor: [1.0, 0.50, 0.14] }
+  ];
+  lanternList.forEach((lt, i) => {
+    const x = 372 + i * 206, y = 1660, w = 198, h = 376;
+    reg(lt.id, x, y, w, h, { lightColor: lt.lightColor, intensity: 2.38 });
+    const drawL = (ctx, isEmissive) => {
+      ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+      const g = ctx.createLinearGradient(x, y, x, y + h);
+      g.addColorStop(0.0, '#0e0604'); g.addColorStop(0.12, lt.cEdge);
+      g.addColorStop(0.50, lt.cCenter); g.addColorStop(0.88, lt.cEdge); g.addColorStop(1.0, '#0e0604');
+      ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
+      for (let ry = y + 40; ry < y + h - 36; ry += 22) { ctx.fillStyle = 'rgba(18, 5, 2, 0.42)'; ctx.fillRect(x, ry, w, 3); }
+      const chars = Array.from(lt.text);
+      const font = `900 ${chars.length > 1 ? 46 : 72}px ${FONT_MINCHO}`;
+      drawVerticalText(ctx, chars, x + w * 0.25, y + h * (chars.length > 1 ? 0.39 : 0.50), 64, font, lt.textCol);
+      drawVerticalText(ctx, chars, x + w * 0.75, y + h * (chars.length > 1 ? 0.39 : 0.50), 64, font, lt.textCol);
+      ctx.fillStyle = isEmissive ? '#000' : '#0c0b0e';
+      ctx.fillRect(x, y, w, 38); ctx.fillRect(x, y + h - 38, w, 38);
+      ctx.restore();
+    };
+    drawL(cctx, false); drawL(ectx, true);
+  });
+
+  // 3 Standing Illuminated A-Frame Sidewalk Boards
+  const standList = [
+    { id: 'stand_ramen',   title: '特製ラーメン', lines: ['醤油 ¥850', '味噌 ¥900', '餃子 ¥450'], bg: '#ebdcb8', accent: '#b31812', lightColor: [1.0, 0.72, 0.40] },
+    { id: 'stand_bar',     title: 'BAR 深夜',    lines: ['WHISKY ¥700', 'COCKTAIL', 'OPEN 20:00'], bg: '#101529', accent: '#e02275', textCol: '#6ce8ff', lightColor: [0.95, 0.24, 0.62] },
+    { id: 'stand_izakaya', title: '生ビール',    lines: ['¥390 税込', '焼鳥各種', '歓迎 1名様'],   bg: '#e8c438', accent: '#180e0a', lightColor: [1.0, 0.76, 0.22] }
+  ];
+  standList.forEach((st, i) => {
+    const x = 1214 + i * 274, y = 1350, w = 264, h = 382;
+    reg(st.id, x, y, w, h, { lightColor: st.lightColor, intensity: 1.72 });
+    const drawS = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.fillStyle = isEmissive ? '#000' : '#16181e'; ctx.fillRect(x, y, w, h);
+      const p = 12;
+      ctx.fillStyle = st.bg; ctx.fillRect(x + p, y + p, w - p * 2, h - p * 2);
+      ctx.fillStyle = st.accent; ctx.fillRect(x + p, y + p, w - p * 2, 76);
+      ctx.font = fitText(ctx, st.title, w - 36, 34, '900', FONT_GOTHIC);
+      ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(st.title, x + w / 2, y + p + 38);
+      ctx.fillStyle = st.textCol || '#1a0e0a';
+      st.lines.forEach((ln, li) => {
+        ctx.font = fitText(ctx, ln, w - 40, 28, '800', FONT_GOTHIC);
+        ctx.fillText(ln, x + w / 2, y + 142 + li * 68);
+      });
+      if (isEmissive) { ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(x + p, y + p, w - p * 2, h - p * 2); }
+      ctx.restore();
+    };
+    drawS(cctx, false); drawS(ectx, true);
+  });
+
+  // Upper Apartment / Office Windows
+  const winList = [
+    { id: 'win_dark', bg: '#0a0f18', emi: '#010306', blinds: true },
+    { id: 'win_warm', bg: '#c48038', emi: '#8f5018', blinds: true },
+    { id: 'win_cool', bg: '#4e84a2', emi: '#24526b', blinds: false },
+    { id: 'win_dim',  bg: '#2b242c', emi: '#180f14', blinds: true }
+  ];
+  winList.forEach((wn, i) => {
+    const x = 1214 + i * 206, y = 1756, w = 198, h = 280;
+    reg(wn.id, x, y, w, h, { intensity: 1.0 });
+    const drawW = (ctx, isEmissive) => {
+      ctx.save();
+      ctx.fillStyle = isEmissive ? '#000' : '#14171e'; ctx.fillRect(x, y, w, h);
+      const p = 10;
+      ctx.fillStyle = isEmissive ? wn.emi : wn.bg; ctx.fillRect(x + p, y + p, w - p * 2, h - p * 2);
+      if (wn.blinds) {
+        ctx.fillStyle = 'rgba(0,0,0,0.34)';
+        for (let by = y + p + 8; by < y + h - p; by += 12) ctx.fillRect(x + p, by, w - p * 2, 4);
+      }
+      ctx.fillStyle = isEmissive ? '#000' : '#181c24';
+      ctx.fillRect(x + w / 2 - 4, y, 8, h); ctx.fillRect(x, y + h * 0.55, w, 8);
+      ctx.restore();
+    };
+    drawW(cctx, false); drawW(ectx, true);
+  });
+
+  return {
+    albedo: createCanvasTexture(colCnv, { srgb: true, wrap: gl.CLAMP_TO_EDGE }),
+    emissive: createCanvasTexture(emiCnv, { srgb: true, wrap: gl.CLAMP_TO_EDGE }),
+    rects
+  };
+}
+
+// ============================================================================
+// 4. PROCEDURAL 3D TOKYO ALLEY GEOMETRY BUILDER
+// ============================================================================
+class MeshBuilder {
+  constructor() { this.verts = []; this.indices = []; this.vCount = 0; }
+  pushVert(px, py, pz, nx, ny, nz, u, v, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr) {
+    this.verts.push(px, py, pz, nx, ny, nz, u, v, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr);
+    return this.vCount++;
+  }
+  addQuad(p0, p1, p2, p3, n, u0, v0, u1, v1, mat, tint) {
+    const [atlasId, emiGain, flicker, sway] = mat;
+    const [tr, tg, tb, roughOvr] = tint;
+    const i0 = this.pushVert(p0[0], p0[1], p0[2], n[0], n[1], n[2], u0, v1, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr);
+    const i1 = this.pushVert(p1[0], p1[1], p1[2], n[0], n[1], n[2], u1, v1, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr);
+    const i2 = this.pushVert(p2[0], p2[1], p2[2], n[0], n[1], n[2], u1, v0, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr);
+    const i3 = this.pushVert(p3[0], p3[1], p3[2], n[0], n[1], n[2], u0, v0, atlasId, emiGain, flicker, sway, tr, tg, tb, roughOvr);
+    this.indices.push(i0, i1, i2, i0, i2, i3);
+  }
+  addBox(cx, cy, cz, sx, sy, sz, uvRect, mat, tint = [1, 1, 1, 0], faces = 63) {
+    const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+    const x0 = cx - hx, x1 = cx + hx, y0 = cy - hy, y1 = cy + hy, z0 = cz - hz, z1 = cz + hz;
+    const { u0, v0, u1, v1 } = uvRect;
+    if (faces & 1)  this.addQuad([x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1], [1,0,0],  u0,v0,u1,v1, mat, tint);
+    if (faces & 2)  this.addQuad([x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0], [-1,0,0], u0,v0,u1,v1, mat, tint);
+    if (faces & 4)  this.addQuad([x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0], [0,1,0],  u0,v0,u1,v1, mat, tint);
+    if (faces & 8)  this.addQuad([x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1], [0,-1,0], u0,v0,u1,v1, mat, tint);
+    if (faces & 16) this.addQuad([x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1], [0,0,1],  u0,v0,u1,v1, mat, tint);
+    if (faces & 32) this.addQuad([x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0], [0,0,-1], u0,v0,u1,v1, mat, tint);
+  }
+  addCylinder(cx, y0, y1, cz, rBot, rTop, segs, uvRect, mat, tint = [1, 1, 1, 0]) {
+    const base = this.vCount;
+    const [atlasId, emiGain, flicker, sway] = mat;
+    const [tr, tg, tb, ro] = tint;
+    for (let i = 0; i <= segs; i++) {
+      const a = (i / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      const u = lerp(uvRect.u0, uvRect.u1, i / segs);
+      this.pushVert(cx + ca * rBot, y0, cz + sa * rBot, ca, 0, sa, u, uvRect.v1, atlasId, emiGain, flicker, sway, tr, tg, tb, ro);
+      this.pushVert(cx + ca * rTop, y1, cz + sa * rTop, ca, 0, sa, u, uvRect.v0, atlasId, emiGain, flicker, sway, tr, tg, tb, ro);
+    }
+    for (let i = 0; i < segs; i++) {
+      const a = base + i * 2, b = a + 1, c = a + 2, d = a + 3;
+      this.indices.push(a, c, d, a, d, b);
+    }
+  }
+  addLantern(cx, cy, cz, rx, ry, uvRect, emiGain, flicker) {
+    const segs = 14, rings = 10, base = this.vCount;
+    for (let r = 0; r <= rings; r++) {
+      const t = r / rings, phi = t * Math.PI;
+      const rib = 1.0 + 0.05 * Math.sin(t * Math.PI * 9);
+      const rad = Math.sin(phi) * rx * rib + 0.035 * rx;
+      const py = cy + Math.cos(phi) * ry;
+      const v = lerp(uvRect.v0, uvRect.v1, t);
+      const sway = t * 0.024;
+      for (let s = 0; s <= segs; s++) {
+        const a = (s / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+        const nx = ca * Math.sin(phi), ny = Math.cos(phi) * 0.5, nz = sa * Math.sin(phi);
+        const nl = Math.hypot(nx, ny, nz) || 1;
+        this.pushVert(cx + ca * rad, py, cz + sa * rad, nx/nl, ny/nl, nz/nl, lerp(uvRect.u0, uvRect.u1, s / segs), v, 1.0, emiGain, flicker, sway, 1, 1, 1, 0);
+      }
+    }
+    const stride = segs + 1;
+    for (let r = 0; r < rings; r++) {
+      for (let s = 0; s < segs; s++) {
+        const a = base + r * stride + s, b = a + 1, c = a + stride, d = c + 1;
+        this.indices.push(a, c, d, a, d, b);
+      }
+    }
+  }
+  addSphereLamp(cx, cy, cz, rad, emiGain, col) {
+    const segs = 10, rings = 7, base = this.vCount;
+    for (let r = 0; r <= rings; r++) {
+      const phi = (r / rings) * Math.PI, sp = Math.sin(phi), cp = Math.cos(phi);
+      for (let s = 0; s <= segs; s++) {
+        const a = (s / segs) * Math.PI * 2;
+        const nx = Math.cos(a) * sp, ny = cp, nz = Math.sin(a) * sp;
+        this.pushVert(cx + nx * rad, cy + ny * rad, cz + nz * rad, nx, ny, nz, 0.5, 0.5, 2.0, emiGain, 0, 0, col[0], col[1], col[2], 0.1);
+      }
+    }
+    const st = segs + 1;
+    for (let r = 0; r < rings; r++) {
+      for (let s = 0; s < segs; s++) {
+        const a = base + r * st + s, b = a + 1, c = a + st, d = c + 1;
+        this.indices.push(a, c, d, a, d, b);
+      }
+    }
+  }
+  addCable(pA, pB, sag, radius, segs = 12) {
+    const pts = [];
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      pts.push([lerp(pA[0], pB[0], t), lerp(pA[1], pB[1], t) - sag * 4 * t * (1 - t), lerp(pA[2], pB[2], t)]);
+    }
+    const sides = 5, base = this.vCount;
+    for (let i = 0; i <= segs; i++) {
+      const p = pts[i], prev = pts[Math.max(0, i - 1)], next = pts[Math.min(segs, i + 1)];
+      let tx = next[0] - prev[0], ty = next[1] - prev[1], tz = next[2] - prev[2];
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      tx /= tl; ty /= tl; tz /= tl;
+      let ux = 0, uy = 1, uz = 0;
+      if (Math.abs(ty) > 0.9) { ux = 1; uy = 0; }
+      let bx = ty * uz - tz * uy, by = tz * ux - tx * uz, bz = tx * uy - ty * ux;
+      const bl = Math.hypot(bx, by, bz) || 1;
+      bx /= bl; by /= bl; bz /= bl;
+      ux = by * tz - bz * ty; uy = bz * tx - bx * tz; uz = bx * ty - by * tx;
+      const t = i / segs, sway = 0.010 * 4 * t * (1 - t);
+      for (let s = 0; s <= sides; s++) {
+        const a = (s / sides) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+        const nx = bx * ca + ux * sa, ny = by * ca + uy * sa, nz = bz * ca + uz * sa;
+        this.pushVert(p[0] + nx * radius, p[1] + ny * radius, p[2] + nz * radius, nx, ny, nz, 0.5, 0.5, 2.0, 0, 0, sway, 0.06, 0.07, 0.09, 0.22);
+      }
+    }
+    const st = sides + 1;
+    for (let i = 0; i < segs; i++) {
+      for (let s = 0; s < sides; s++) {
+        const a = base + i * st + s, b = a + 1, c = a + st, d = c + 1;
+        this.indices.push(a, c, d, a, d, b);
+      }
+    }
+  }
+  addAwning(xWall, side, yTop, z0, z1, depth, drop, uvSlot, tint) {
+    const dir = -side, xOut = xWall + dir * depth, yOut = yTop - drop, th = 0.06;
+    const hyp = Math.hypot(depth, drop), nx = dir * (drop / hyp), ny = depth / hyp;
+    const mat = [0, 0, 0, 0];
+    if (side < 0) {
+      this.addQuad([xWall, yTop, z1], [xOut, yOut, z1], [xOut, yOut, z0], [xWall, yTop, z0], [nx, ny, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, tint);
+      this.addQuad([xWall, yTop - th, z0], [xOut, yOut - th, z0], [xOut, yOut - th, z1], [xWall, yTop - th, z1], [-nx, -ny, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, [0.32,0.34,0.38,0]);
+      this.addQuad([xOut, yOut - th - 0.08, z1], [xOut, yOut - th - 0.08, z0], [xOut, yOut, z0], [xOut, yOut, z1], [dir, 0, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, [0.42,0.44,0.48,0]);
+    } else {
+      this.addQuad([xWall, yTop, z0], [xOut, yOut, z0], [xOut, yOut, z1], [xWall, yTop, z1], [nx, ny, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, tint);
+      this.addQuad([xWall, yTop - th, z1], [xOut, yOut - th, z1], [xOut, yOut - th, z0], [xWall, yTop - th, z0], [-nx, -ny, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, [0.32,0.34,0.38,0]);
+      this.addQuad([xOut, yOut - th - 0.08, z0], [xOut, yOut - th - 0.08, z1], [xOut, yOut, z1], [xOut, yOut, z0], [dir, 0, 0], uvSlot.u0, uvSlot.v0, uvSlot.u1, uvSlot.v1, mat, [0.42,0.44,0.48,0]);
+    }
+    const strutX = xWall + dir * (depth * 0.45);
+    this.addBox(strutX, yOut - 0.14, z0 - 0.12, depth * 0.82, 0.04, 0.04, uvSlot, [2,0,0,0], [0.14,0.15,0.18,0.32]);
+    this.addBox(strutX, yOut - 0.14, z1 + 0.12, depth * 0.82, 0.04, 0.04, uvSlot, [2,0,0,0], [0.14,0.15,0.18,0.32]);
+  }
+  upload() {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(this.verts), gl.STATIC_DRAW);
+    const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    const useU32 = this.vCount > 65535;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, useU32 ? new Uint32Array(this.indices) : new Uint16Array(this.indices), gl.STATIC_DRAW);
+    const stride = 16 * 4;
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, stride, 24);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 32);
+    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 4, gl.FLOAT, false, stride, 48);
+    gl.bindVertexArray(null);
+    return { vao, count: this.indices.length, indexType: useU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT };
+  }
+}
+
+function archSlot(col, row) {
+  const px = 0.004, py = 0.004;
+  return { u0: col * 0.25 + px, v0: row / 3 + py, u1: (col + 1) * 0.25 - px, v1: (row + 1) / 3 - py };
+}
+const ARCH = {
+  tile:     archSlot(0, 0), concrete: archSlot(1, 0), metal:   archSlot(2, 0), wood:    archSlot(3, 0),
+  shutter:  archSlot(0, 1), slate:    archSlot(1, 1), ac:      archSlot(2, 1), grate:   archSlot(3, 1),
+  vendSide: archSlot(0, 2), recycle:  archSlot(1, 2), meter:   archSlot(2, 2), pole:    archSlot(3, 2)
+};
+const SOLID_UV = { u0: 0.5, v0: 0.5, u1: 0.5, v1: 0.5 };
+const LOOP_LEN = 72.0;
+
+function buildTokyoAlleyScene(signRects) {
+  const mb = new MeshBuilder();
+  const lights = [];
+  const steamEmitters = [];
+  const halos = [];
+
+  const bladeLeft = [
+    'blade_ramen', 'blade_karaoke', 'blade_yakitori', 'blade_bar',
+    'blade_sake', 'blade_arcade', 'blade_gyoza', 'blade_snack',
+    'blade_sushi', 'blade_horumon', 'blade_izakaya', 'blade_coffee',
+    'blade_hotel', 'blade_mahjong', 'blade_jazz', 'blade_pub'
+  ];
+  const bladeRight = [
+    'blade_izakaya', 'blade_bar', 'blade_mahjong', 'blade_sushi',
+    'blade_horumon', 'blade_coffee', 'blade_hotel', 'blade_ramen',
+    'blade_jazz', 'blade_karaoke', 'blade_pub', 'blade_yakitori',
+    'blade_snack', 'blade_arcade', 'blade_sake', 'blade_gyoza'
+  ];
+  const horizIds = ['h_ramen', 'h_izakaya', 'h_bar', 'h_cyber', 'h_sushi', 'h_yakitori'];
+  const shopIds = ['shop_ramen', 'shop_izakaya', 'shop_bar', 'shop_cafe'];
+  const norenIds = ['noren_red', 'noren_navy', 'noren_cream', 'noren_wine'];
+  const lanternIds = ['lantern_red', 'lantern_warm', 'lantern_crimson', 'lantern_amber'];
+  const standIds = ['stand_ramen', 'stand_bar', 'stand_izakaya'];
+  const winIds = ['win_dark', 'win_warm', 'win_cool', 'win_dim'];
+  const wallStyles = [ARCH.tile, ARCH.concrete, ARCH.slate, ARCH.metal, ARCH.tile, ARCH.concrete];
+
+  let horizCursor = 0;
+
+  for (const side of [-1, 1]) {
+    const dir = -side;
+    const frontFaceBit = side < 0 ? 1 : 2;
+    const bList = side < 0 ? bladeLeft : bladeRight;
+    let bCursor = 0;
+    let z = side < 0 ? 0.0 : -1.4;
+    const zEndLimit = side < 0 ? -LOOP_LEN : -(LOOP_LEN + 1.4);
+    let bayIdx = 0;
+
+    if (side > 0) {
+      mb.addBox(2.26 + 2.75, 8.0, -0.7, 5.5, 16.0, 1.4, ARCH.concrete, [0,0,0,0], [0.76,0.78,0.82,0], 2 | 16 | 32 | 4);
+    }
+
+    while (z > zEndLimit + 0.5) {
+      let bayLen = rand(4.3, 6.2);
+      if (z - bayLen < zEndLimit) bayLen = z - zEndLimit;
+      if (bayLen < 2.6) bayLen = z - zEndLimit;
+      const z0 = z, z1 = z - bayLen, zMid = (z0 + z1) * 0.5;
+
+      // Narrow dark side-alley alcove
+      const isAlleyGap = (bayIdx === 4 && side === -1) || (bayIdx === 9 && side === 1);
+      if (isAlleyGap && bayLen >= 3.2) {
+        const recessX = side * 8.2, wallX = side * 2.35;
+        mb.addBox((wallX + recessX) * 0.5, 7.0, z0 + 0.15, Math.abs(recessX - wallX), 14.0, 0.3, ARCH.concrete, [0,0,0,0], [0.70,0.72,0.78,0]);
+        mb.addBox((wallX + recessX) * 0.5, 7.0, z1 - 0.15, Math.abs(recessX - wallX), 14.0, 0.3, ARCH.tile, [0,0,0,0], [0.68,0.70,0.76,0]);
+        mb.addBox(recessX, 7.0, zMid, 0.4, 14.0, bayLen + 0.4, ARCH.slate, [0,0,0,0], [0.55,0.58,0.65,0]);
+        const rSign = signRects[side < 0 ? 'blade_bar' : 'blade_karaoke'];
+        const sx = side * 5.4;
+        mb.addBox(sx, 3.8, zMid, 0.22, 2.3, 0.72, rSign, [1, 2.7, 1.3, 0], [1,1,1,0]);
+        const lc = rSign.lightColor;
+        lights.push({ x: side * 3.8, y: 3.5, z: zMid, r: lc[0], g: lc[1], b: lc[2], radius: 11.0, flicker: 1.3 });
+        halos.push({ x: sx, y: 3.8, z: zMid, r: lc[0], g: lc[1], b: lc[2], size: 2.1, flicker: 1.3 });
+        for (let k = 0; k < 2; k++) {
+          mb.addLantern(side * (3.1 + k * 1.1), 2.85, zMid + (k - 0.5) * 0.85, 0.18, 0.30, signRects[lanternIds[(bayIdx + k) % 4]], 2.4, 0);
+        }
+        lights.push({ x: side * 3.2, y: 2.6, z: zMid, r: 1.0, g: 0.44, b: 0.14, radius: 8.5, flicker: 0 });
+        steamEmitters.push({ x: side * 2.8, y: 0.30, z: zMid, vx: dir * 0.20, vy: 0.52, vz: 0.04, scale: 1.50, r: lc[0], g: lc[1], b: lc[2] });
+        z = z1; bayIdx++;
+        continue;
+      }
+
+      const wallX = side * (2.22 + rand(-0.10, 0.24));
+      const bHeight = rand(12.5, 21.0);
+      const bDepth = 5.5, bCenterX = wallX + side * (bDepth * 0.5);
+      const wallSlot = wallStyles[(bayIdx + (side > 0 ? 3 : 0)) % wallStyles.length];
+      const wallTint = [rand(0.74, 0.98), rand(0.76, 1.0), rand(0.80, 1.05), 0];
+
+      mb.addBox(bCenterX, 3.2 + (bHeight - 3.2) * 0.5, zMid, bDepth, bHeight - 3.2, bayLen - 0.10, wallSlot, [0,0,0,0], wallTint, frontFaceBit | 16 | 32 | 4);
+
+      for (let fy = 3.25; fy < bHeight - 1.5; fy += 3.1) {
+        mb.addBox(wallX + dir * 0.09, fy, zMid, 0.20, 0.13, bayLen - 0.12, ARCH.concrete, [0,0,0,0], [0.52, 0.55, 0.60, 0]);
+      }
+
+      const isClosed = (side < 0 && bayIdx % 4 === 2) || (side > 0 && bayIdx % 4 === 3);
+      const recess = isClosed ? 0.18 : 0.44;
+      const shopFaceX = wallX + side * recess;
+      const pillarW = 0.46;
+
+      mb.addBox(wallX + side * 0.35, 1.6, z0 - pillarW * 0.5, 0.72, 3.2, pillarW, wallSlot, [0,0,0,0], wallTint);
+      mb.addBox(wallX + side * 0.35, 1.6, z1 + pillarW * 0.5, 0.72, 3.2, pillarW, wallSlot, [0,0,0,0], wallTint);
+      mb.addBox(wallX + side * (recess * 0.5), 3.12, zMid, recess + 0.1, 0.18, bayLen - pillarW * 2, ARCH.concrete, [0,0,0,0], [0.35, 0.37, 0.42, 0]);
+      mb.addBox(wallX + side * (recess * 0.5), 0.06, zMid, recess + 0.16, 0.12, bayLen - pillarW * 2, ARCH.concrete, [0,0,0,0], [0.46, 0.48, 0.52, 0]);
+
+      if (isClosed) {
+        mb.addBox(shopFaceX + side * 0.1, 1.55, zMid, 0.2, 3.1, bayLen - pillarW * 2 + 0.04, ARCH.shutter, [0,0,0,0], [0.88, 0.92, 0.98, 0]);
+
+        const vmZ = zMid + rand(-0.55, 0.55);
+        const vmX = wallX + dir * 0.28, vmFaceX = vmX + dir * 0.36;
+        mb.addBox(vmX, 0.96, vmZ, 0.70, 1.92, 1.06, ARCH.vendSide, [0,0,0,0], [0.92, 0.95, 1.0, 0], 63 ^ frontFaceBit);
+        const vmRect = signRects['vending'];
+        if (side < 0) {
+          mb.addQuad([vmFaceX, 0.04, vmZ + 0.50], [vmFaceX, 0.04, vmZ - 0.50], [vmFaceX, 1.88, vmZ - 0.50], [vmFaceX, 1.88, vmZ + 0.50], [dir, 0, 0], vmRect.u0, vmRect.v0, vmRect.u1, vmRect.v1, [1, vmRect.intensity, 0, 0], [1,1,1,0]);
+        } else {
+          mb.addQuad([vmFaceX, 0.04, vmZ - 0.50], [vmFaceX, 0.04, vmZ + 0.50], [vmFaceX, 1.88, vmZ + 0.50], [vmFaceX, 1.88, vmZ - 0.50], [dir, 0, 0], vmRect.u0, vmRect.v0, vmRect.u1, vmRect.v1, [1, vmRect.intensity, 0, 0], [1,1,1,0]);
+        }
+        // Recycling bin: drop-holes ONLY on front face, plain metal casing on other faces!
+        mb.addBox(vmX + dir * 0.04, 0.44, vmZ + 0.80, 0.46, 0.88, 0.46, ARCH.vendSide, [0,0,0,0], [0.60, 0.68, 0.80, 0], 63 ^ frontFaceBit);
+        mb.addBox(vmX + dir * 0.04, 0.44, vmZ + 0.80, 0.46, 0.88, 0.46, ARCH.recycle, [0,0,0,0], [0.92, 0.96, 1.0, 0], frontFaceBit);
+        lights.push({ x: vmFaceX + dir * 0.45, y: 1.25, z: vmZ, r: 0.65, g: 0.88, b: 1.0, radius: 7.5, flicker: 0 });
+        halos.push({ x: vmFaceX + dir * 0.14, y: 1.32, z: vmZ, r: 0.62, g: 0.86, b: 1.0, size: 1.15, flicker: 0 });
+      } else {
+        const sId = shopIds[(bayIdx * 3 + (side > 0 ? 2 : 0)) % shopIds.length];
+        const sRect = signRects[sId];
+        const doorW = Math.min(bayLen - pillarW * 2 - 0.10, 3.6);
+        mb.addBox(shopFaceX + side * 0.15, 1.55, zMid, 0.3, 3.1, bayLen - pillarW * 2 + 0.06, ARCH.wood, [0,0,0,0], [0.80,0.78,0.75,0]);
+        const dx = shopFaceX + dir * 0.02;
+        if (side < 0) {
+          mb.addQuad([dx, 0.10, zMid + doorW * 0.5], [dx, 0.10, zMid - doorW * 0.5], [dx, 2.52, zMid - doorW * 0.5], [dx, 2.52, zMid + doorW * 0.5], [dir, 0, 0], sRect.u0, sRect.v0, sRect.u1, sRect.v1, [1, sRect.intensity, 0, 0], [1,1,1,0]);
+        } else {
+          mb.addQuad([dx, 0.10, zMid - doorW * 0.5], [dx, 0.10, zMid + doorW * 0.5], [dx, 2.52, zMid + doorW * 0.5], [dx, 2.52, zMid - doorW * 0.5], [dir, 0, 0], sRect.u0, sRect.v0, sRect.u1, sRect.v1, [1, sRect.intensity, 0, 0], [1,1,1,0]);
+        }
+        mb.addSphereLamp(wallX + dir * 0.16, 2.18, z0 - 0.28, 0.082, 2.5, [1.0, 0.78, 0.44]);
+
+        const lc = sRect.lightColor;
+        lights.push({ x: wallX + dir * 0.60, y: 1.50, z: zMid, r: lc[0] * 1.08, g: lc[1] * 1.08, b: lc[2] * 1.08, radius: 8.8, flicker: 0 });
+
+        // SPLIT 3D NOREN CURTAIN (4 separate swaying fabric panels sharing one continuous banner UV so crest splits authentically across gaps!)
+        if (sId === 'shop_ramen' || sId === 'shop_izakaya') {
+          const nRect = signRects[norenIds[(bayIdx + (side > 0 ? 2 : 0)) % norenIds.length]];
+          const nx = wallX + dir * 0.04, nW = Math.min(doorW * 0.72, 1.96);
+          mb.addBox(nx, 2.38, zMid, 0.036, 0.036, nW + 0.18, ARCH.wood, [2,0,0,0], [0.26, 0.18, 0.12, 0.5]);
+          const panels = 4, gap = 0.036;
+          const pW = (nW - gap * (panels - 1)) / panels;
+          for (let pi = 0; pi < panels; pi++) {
+            const pMat = [1, 0.28, 0, 0.020 + (pi % 2) * 0.011];
+            const pu0 = lerp(nRect.u0, nRect.u1, pi / panels);
+            const pu1 = lerp(nRect.u0, nRect.u1, (pi + 1) / panels);
+            if (side < 0) {
+              // Left wall: viewer looking -X sees +Z on left, -Z on right!
+              const pzLeft  = (zMid + nW * 0.5) - pi * (pW + gap);
+              const pzRight = pzLeft - pW;
+              mb.addQuad([nx, 1.62, pzLeft], [nx, 1.62, pzRight], [nx, 2.36, pzRight], [nx, 2.36, pzLeft], [dir, 0, 0],  pu0, nRect.v0, pu1, nRect.v1, pMat, [1,1,1,0]);
+              mb.addQuad([nx, 1.62, pzRight], [nx, 1.62, pzLeft], [nx, 2.36, pzLeft], [nx, 2.36, pzRight], [-dir, 0, 0], pu1, nRect.v0, pu0, nRect.v1, pMat, [1,1,1,0]);
+            } else {
+              // Right wall: viewer looking +X sees -Z on left, +Z on right!
+              const pzLeft  = (zMid - nW * 0.5) + pi * (pW + gap);
+              const pzRight = pzLeft + pW;
+              mb.addQuad([nx, 1.62, pzLeft], [nx, 1.62, pzRight], [nx, 2.36, pzRight], [nx, 2.36, pzLeft], [dir, 0, 0],  pu0, nRect.v0, pu1, nRect.v1, pMat, [1,1,1,0]);
+              mb.addQuad([nx, 1.62, pzRight], [nx, 1.62, pzLeft], [nx, 2.36, pzLeft], [nx, 2.36, pzRight], [-dir, 0, 0], pu1, nRect.v0, pu0, nRect.v1, pMat, [1,1,1,0]);
+            }
+          }
+        }
+
+        // Occasional Red Japanese Izakaya Stool + leaning wet Tokyo vinyl umbrella outside doorway!
+        if (sId === 'shop_izakaya' && bayIdx % 2 === 1) {
+          const stX = wallX + dir * 0.32, stZ = z1 + 0.65;
+          mb.addCylinder(stX, 0.44, 0.49, stZ, 0.16, 0.16, 10, SOLID_UV, [2,0,0,0], [0.68, 0.12, 0.10, 0.25]);
+          for (const [ox, oz] of [[-0.10,-0.10],[0.10,-0.10],[-0.10,0.10],[0.10,0.10]]) {
+            mb.addCylinder(stX + ox, 0.0, 0.45, stZ + oz, 0.014, 0.014, 5, SOLID_UV, [2,0,0,0], [0.55, 0.58, 0.62, 0.20]);
+          }
+        }
+        if (sId === 'shop_ramen' && bayIdx % 2 === 0) {
+          // Rolled translucent vinyl umbrella leaning against doorway pillar
+          const ux = wallX + dir * 0.22, uz = z0 - 0.52;
+          mb.addCylinder(ux, 0.02, 0.72, uz, 0.032, 0.048, 8, SOLID_UV, [2,0,0,0], [0.72, 0.78, 0.86, 0.12]);
+          mb.addCylinder(ux, 0.72, 0.86, uz, 0.012, 0.012, 6, SOLID_UV, [2,0,0,0], [0.85, 0.85, 0.88, 0.22]);
+        }
+
+        const awnDepth = rand(0.68, 0.90);
+        mb.addAwning(wallX, side, 3.05, z0 - 0.18, z1 + 0.18, awnDepth, 0.28, ARCH.metal, [0.66, 0.70, 0.78, 0]);
+
+        const hId = horizIds[horizCursor++ % horizIds.length];
+        const hRect = signRects[hId];
+        const hW = Math.min(bayLen - 0.58, 3.55), hH = 0.84, hX = wallX + dir * 0.14;
+        mb.addBox(wallX + dir * 0.06, 3.55, zMid, 0.15, hH + 0.06, hW + 0.06, ARCH.metal, [2,0,0,0], [0.10,0.11,0.14,0.32]);
+        if (side < 0) {
+          mb.addQuad([hX, 3.55 - hH * 0.5, zMid + hW * 0.5], [hX, 3.55 - hH * 0.5, zMid - hW * 0.5], [hX, 3.55 + hH * 0.5, zMid - hW * 0.5], [hX, 3.55 + hH * 0.5, zMid + hW * 0.5], [dir, 0, 0], hRect.u0, hRect.v0, hRect.u1, hRect.v1, [1, hRect.intensity, 0, 0], [1,1,1,0]);
+        } else {
+          mb.addQuad([hX, 3.55 - hH * 0.5, zMid - hW * 0.5], [hX, 3.55 - hH * 0.5, zMid + hW * 0.5], [hX, 3.55 + hH * 0.5, zMid + hW * 0.5], [hX, 3.55 + hH * 0.5, zMid - hW * 0.5], [dir, 0, 0], hRect.u0, hRect.v0, hRect.u1, hRect.v1, [1, hRect.intensity, 0, 0], [1,1,1,0]);
+        }
+
+        if (bayIdx % 2 === 0 || sId === 'shop_ramen' || sId === 'shop_izakaya') {
+          const nLanterns = rand() < 0.55 ? 2 : 1;
+          for (let li = 0; li < nLanterns; li++) {
+            const lz = nLanterns === 1 ? (zMid + rand(-0.85, 0.85)) : (zMid + (li === 0 ? -1.02 : 1.02));
+            const lx = wallX + dir * (awnDepth * 0.72), ly = 2.28 + rand(-0.08, 0.08);
+            const ltRect = signRects[lanternIds[(bayIdx + li * 2) % lanternIds.length]];
+            mb.addCylinder(lx, ly + 0.27, 2.84, lz, 0.01, 0.01, 5, SOLID_UV, [2,0,0,0], [0.1,0.1,0.12,0.5]);
+            mb.addLantern(lx, ly, lz, 0.155, 0.265, ltRect, ltRect.intensity, 0);
+            if (li === 0) {
+              const c = ltRect.lightColor;
+              lights.push({ x: lx + dir * 0.22, y: ly, z: lz, r: c[0] * 1.1, g: c[1] * 1.1, b: c[2] * 1.1, radius: 6.5, flicker: 0 });
+              halos.push({ x: lx, y: ly, z: lz, r: c[0], g: c[1], b: c[2], size: 0.82, flicker: 0 });
+            }
+          }
+        }
+
+        if (bayIdx % 3 === 0) {
+          const stRect = signRects[standIds[(bayIdx + (side > 0 ? 1 : 0)) % standIds.length]];
+          const stZ = z0 - 0.70, stX = wallX + dir * 0.50;
+          mb.addBox(stX, 0.52, stZ, 0.16, 1.02, 0.52, ARCH.metal, [2,0,0,0], [0.12,0.13,0.16,0.3]);
+          mb.addQuad([stX - 0.21, 0.10, stZ + 0.09], [stX + 0.21, 0.10, stZ + 0.09], [stX + 0.21, 0.96, stZ + 0.09], [stX - 0.21, 0.96, stZ + 0.09], [0, 0, 1], stRect.u0, stRect.v0, stRect.u1, stRect.v1, [1, stRect.intensity, 0, 0], [1,1,1,0]);
+          mb.addQuad([stX + 0.21, 0.10, stZ - 0.09], [stX - 0.21, 0.10, stZ - 0.09], [stX - 0.21, 0.96, stZ - 0.09], [stX + 0.21, 0.96, stZ - 0.09], [0, 0, -1], stRect.u0, stRect.v0, stRect.u1, stRect.v1, [1, stRect.intensity, 0, 0], [1,1,1,0]);
+        }
+
+        // Kitchen Exhaust Vent + Asymmetric Rising Wispy Steam Plume
+        if (sId === 'shop_ramen' || (bayIdx % 5 === 1 && side < 0) || (bayIdx % 5 === 3 && side > 0)) {
+          const exZ = z1 + 0.55, exX = wallX + dir * 0.22;
+          mb.addBox(exX, 2.38, exZ, 0.44, 0.40, 0.50, ARCH.metal, [0,0,0,0], [0.76, 0.80, 0.88, 0]);
+          mb.addBox(wallX + dir * 0.14, 5.8, exZ, 0.25, 6.8, 0.28, ARCH.metal, [0,0,0,0], [0.72, 0.76, 0.84, 0]);
+          steamEmitters.push({
+            x: exX + dir * 0.30, y: 2.22, z: exZ,
+            vx: dir * 0.28, vy: 0.60, vz: rand(-0.08, 0.08),
+            scale: 1.42, r: lc[0], g: lc[1], b: lc[2]
+          });
+        }
+      }
+
+      // STREET-LEVEL CLUTTER & INFRASTRUCTURE (Face-specific UV mapping so NO repeated grilles/dials on side faces!)
+      if (bayIdx % 3 === 1) {
+        const crZ = z1 + 0.52, crX = wallX + dir * 0.24;
+        const crateColors = [[0.72, 0.14, 0.12], [0.84, 0.64, 0.12], [0.14, 0.36, 0.72]];
+        const nStack = randInt(2, 3);
+        for (let k = 0; k < nStack; k++) {
+          const cc = crateColors[(bayIdx + k) % 3];
+          mb.addBox(crX + rand(-0.02, 0.02), 0.16 + k * 0.32, crZ + rand(-0.02, 0.02), 0.38, 0.31, 0.46, ARCH.grate, [0,0,0,0], [cc[0], cc[1], cc[2], 0]);
+        }
+      }
+      // AC Units: circular fan grille ONLY on alley-facing front face, clean sheet metal on sides & top!
+      const nAC = randInt(1, 2);
+      for (let ai = 0; ai < nAC; ai++) {
+        const acY = ai === 0 && rand() < 0.45 ? 0.34 : rand(3.8, 9.0);
+        const acZ = lerp(z0 - 0.7, z1 + 0.7, (ai + 0.3) / nAC);
+        const acX = wallX + dir * 0.22;
+        mb.addBox(acX, acY, acZ, 0.40, 0.58, 0.76, ARCH.vendSide, [0,0,0,0], [0.78, 0.77, 0.74, 0], 63 ^ frontFaceBit);
+        mb.addBox(acX, acY, acZ, 0.40, 0.58, 0.76, ARCH.ac, [0,0,0,0], [0.86, 0.85, 0.82, 0], frontFaceBit);
+        if (acY > 1.0) {
+          mb.addBox(acX, acY - 0.32, acZ - 0.26, 0.42, 0.04, 0.04, ARCH.metal, [2,0,0,0], [0.18,0.20,0.24,0.38]);
+          mb.addBox(acX, acY - 0.32, acZ + 0.26, 0.42, 0.04, 0.04, ARCH.metal, [2,0,0,0], [0.18,0.20,0.24,0.38]);
+        }
+      }
+      // Vertical rain downspouts, conduit bundle, and Meter Box (window ONLY on front face!)
+      const pipeX = wallX + dir * 0.06;
+      mb.addCylinder(pipeX, 0.0, bHeight - 0.5, z0 - 0.16, 0.055, 0.055, 6, SOLID_UV, [2,0,0,0], [0.22, 0.24, 0.28, 0.22]);
+      mb.addCylinder(pipeX, 0.0, bHeight * 0.72, z0 - 0.28, 0.028, 0.028, 5, SOLID_UV, [2,0,0,0], [0.30, 0.28, 0.26, 0.30]);
+      mb.addBox(wallX + dir * 0.11, 1.65, z0 - 0.26, 0.20, 0.44, 0.30, ARCH.vendSide, [0,0,0,0], [0.65, 0.68, 0.72, 0], 63 ^ frontFaceBit);
+      mb.addBox(wallX + dir * 0.11, 1.65, z0 - 0.26, 0.20, 0.44, 0.30, ARCH.meter, [0,0,0,0], [0.92, 0.94, 0.98, 0], frontFaceBit);
+
+      if (bayIdx % 2 === 0) {
+        const gX = side * 1.84;
+        mb.addBox(gX, 0.008, zMid, 0.34, 0.02, 1.15, ARCH.grate, [0,0,0,0], [0.64, 0.68, 0.74, 0]);
+        if ((side < 0 && bayIdx % 6 === 2) || (side > 0 && bayIdx % 6 === 5)) {
+          steamEmitters.push({
+            x: gX + dir * 0.14, y: 0.08, z: zMid,
+            vx: dir * 0.11, vy: 0.48, vz: 0.05,
+            scale: 1.40, r: 0.74, g: 0.82, b: 0.96
+          });
+        }
+      }
+
+      if (bayIdx % 5 === 3) {
+        const bX = side * 1.70;
+        mb.addCylinder(bX, 0.0, 0.76, z0 - 0.45, 0.052, 0.052, 8, SOLID_UV, [2,0,0,0], [0.80, 0.66, 0.12, 0.24]);
+        mb.addCylinder(bX, 0.50, 0.60, z0 - 0.45, 0.056, 0.056, 8, SOLID_UV, [2,0,0,0], [0.10, 0.10, 0.12, 0.30]);
+      }
+
+      // PROTRUDING VERTICAL NEON BLADE SIGNS
+      const nBlades = (bayIdx % 3 === 2) ? 1 : 2;
+      for (let bi = 0; bi < nBlades; bi++) {
+        const bId = bList[bCursor++ % bList.length];
+        const bRect = signRects[bId];
+        const bH = bi === 0 ? rand(2.25, 3.35) : rand(2.75, 4.25);
+        const bW = rand(0.66, 0.92), bThick = 0.18;
+        const proj = bi === 0 ? rand(0.74, 1.14) : rand(0.90, 1.34);
+        const sY = bi === 0 ? rand(4.35, 6.15) : rand(7.6, 11.4);
+        if (sY + bH * 0.5 > bHeight - 0.4) continue;
+        const sZ = bi === 0 ? (zMid + rand(-0.6, 0.8)) : (zMid + rand(-1.4, -0.1));
+        // Keep clean clearance zone around overhead alley arches (z = -22.5, -58.5) so arches never clip!
+        if ((Math.abs(sZ - (-22.5)) < 2.2 || Math.abs(sZ - (-58.5)) < 2.2) && sY > 4.0 && sY < 8.4) continue;
+        const sX = wallX + dir * proj;
+
+        const strutLen = proj - bW * 0.5 + 0.1, strutX = wallX + dir * (strutLen * 0.5);
+        mb.addBox(strutX, sY + bH * 0.34, sZ, strutLen, 0.055, 0.055, ARCH.metal, [2,0,0,0], [0.12,0.13,0.17,0.35]);
+        mb.addBox(strutX, sY - bH * 0.34, sZ, strutLen, 0.055, 0.055, ARCH.metal, [2,0,0,0], [0.12,0.13,0.17,0.35]);
+        mb.addBox(sX, sY, sZ, bW + 0.05, bH + 0.05, bThick, ARCH.metal, [2,0,0,0], [0.09,0.10,0.13,0.30], 1 | 2 | 4 | 8);
+
+        const flick = ((bCursor + (side > 0 ? 2 : 0)) % 6 === 0) ? (1.0 + bCursor * 0.83) : 0.0;
+        const emi = bRect.intensity * rand(0.92, 1.16);
+        const xL = sX - bW * 0.5, xR = sX + bW * 0.5, yB = sY - bH * 0.5, yT = sY + bH * 0.5;
+        const zF = sZ + bThick * 0.5 + 0.005, zB = sZ - bThick * 0.5 - 0.005;
+        mb.addQuad([xL, yB, zF], [xR, yB, zF], [xR, yT, zF], [xL, yT, zF], [0, 0, 1],  bRect.u0, bRect.v0, bRect.u1, bRect.v1, [1, emi, flick, 0], [1,1,1,0]);
+        mb.addQuad([xR, yB, zB], [xL, yB, zB], [xL, yT, zB], [xR, yT, zB], [0, 0, -1], bRect.u0, bRect.v0, bRect.u1, bRect.v1, [1, emi, flick, 0], [1,1,1,0]);
+
+        const lc = bRect.lightColor, power = bi === 0 ? 1.28 : 0.98;
+        lights.push({ x: sX + dir * 0.25, y: sY, z: sZ, r: lc[0] * power, g: lc[1] * power, b: lc[2] * power, radius: bi === 0 ? 12.0 : 14.0, flicker: flick });
+        halos.push({ x: sX, y: sY, z: sZ, r: lc[0], g: lc[1], b: lc[2], size: Math.max(bW, bH) * 0.66, flicker: flick });
+      }
+
+      // UPPER FLOOR WINDOWS & BALCONIES
+      for (let wy = 4.9; wy < bHeight - 1.6; wy += 3.1) {
+        const nWin = Math.max(1, Math.floor((bayLen - 0.9) / 1.75));
+        for (let wi = 0; wi < nWin; wi++) {
+          const wz = lerp(z0 - 1.0, z1 + 1.0, nWin === 1 ? 0.5 : wi / (nWin - 1));
+          const wId = rand() < 0.56 ? 'win_dark' : pick(winIds);
+          const wRect = signRects[wId];
+          const winW = 1.05, winH = 1.38, wx = wallX + dir * 0.03;
+          mb.addBox(wallX + dir * 0.08, wy - winH * 0.5 - 0.05, wz, 0.22, 0.08, winW + 0.16, ARCH.concrete, [0,0,0,0], [0.46,0.48,0.52,0]);
+          const wEmi = wId === 'win_dark' ? 0.04 : (wId === 'win_warm' ? 1.05 : 0.78);
+          if (side < 0) {
+            mb.addQuad([wx, wy - winH * 0.5, wz + winW * 0.5], [wx, wy - winH * 0.5, wz - winW * 0.5], [wx, wy + winH * 0.5, wz - winW * 0.5], [wx, wy + winH * 0.5, wz + winW * 0.5], [dir, 0, 0], wRect.u0, wRect.v0, wRect.u1, wRect.v1, [1, wEmi, 0, 0], [1,1,1,0]);
+          } else {
+            mb.addQuad([wx, wy - winH * 0.5, wz - winW * 0.5], [wx, wy - winH * 0.5, wz + winW * 0.5], [wx, wy + winH * 0.5, wz + winW * 0.5], [wx, wy + winH * 0.5, wz - winW * 0.5], [dir, 0, 0], wRect.u0, wRect.v0, wRect.u1, wRect.v1, [1, wEmi, 0, 0], [1,1,1,0]);
+          }
+        }
+        if ((bayIdx + Math.floor(wy)) % 4 === 0) {
+          const rx = wallX + dir * 0.42;
+          mb.addBox(wallX + dir * 0.22, wy - 0.72, zMid, 0.48, 0.07, bayLen - 0.65, ARCH.metal, [2,0,0,0], [0.14,0.16,0.20,0.35]);
+          mb.addBox(rx, wy - 0.05, zMid, 0.04, 0.04, bayLen - 0.65, ARCH.metal, [2,0,0,0], [0.16,0.18,0.22,0.30]);
+          for (let rz = z1 + 0.4; rz <= z0 - 0.4; rz += 0.42) {
+            mb.addBox(rx, wy - 0.38, rz, 0.025, 0.68, 0.025, ARCH.metal, [2,0,0,0], [0.14,0.16,0.20,0.35]);
+          }
+        }
+      }
+
+      z = z1; bayIdx++;
+    }
+  }
+
+  // ICONIC OVERHEAD TOKYO ALLEY ENTRY ARCHES (新宿一番街 / 思い出横丁) spanning across the alley!
+  const arches = [
+    { z: -22.5, y: 5.85, id: 'h_arch1' },
+    { z: -58.5, y: 6.15, id: 'h_arch2' }
+  ];
+  for (const ar of arches) {
+    const aRect = signRects[ar.id];
+    const w = 3.55, h = 0.96, th = 0.22;
+    // Steel truss support beams spanning wall-to-wall
+    mb.addBox(0, ar.y + h * 0.5 + 0.14, ar.z, 4.6, 0.09, 0.12, ARCH.metal, [2,0,0,0], [0.10,0.11,0.14,0.32]);
+    mb.addBox(0, ar.y - h * 0.5 - 0.10, ar.z, 4.6, 0.07, 0.10, ARCH.metal, [2,0,0,0], [0.10,0.11,0.14,0.32]);
+    // Dark metal housing
+    mb.addBox(0, ar.y, ar.z, w + 0.08, h + 0.08, th, ARCH.metal, [2,0,0,0], [0.09,0.10,0.13,0.30], 1 | 2 | 4 | 8);
+    // Double-sided glowing arch banner faces (+Z and -Z)
+    const xL = -w * 0.5, xR = w * 0.5, yB = ar.y - h * 0.5, yT = ar.y + h * 0.5;
+    mb.addQuad([xL, yB, ar.z + th * 0.5 + 0.006], [xR, yB, ar.z + th * 0.5 + 0.006], [xR, yT, ar.z + th * 0.5 + 0.006], [xL, yT, ar.z + th * 0.5 + 0.006], [0, 0, 1], aRect.u0, aRect.v0, aRect.u1, aRect.v1, [1, aRect.intensity, 0, 0], [1,1,1,0]);
+    mb.addQuad([xR, yB, ar.z - th * 0.5 - 0.006], [xL, yB, ar.z - th * 0.5 - 0.006], [xL, yT, ar.z - th * 0.5 - 0.006], [xR, yT, ar.z - th * 0.5 - 0.006], [0, 0, -1], aRect.u0, aRect.v0, aRect.u1, aRect.v1, [1, aRect.intensity, 0, 0], [1,1,1,0]);
+    const lc = aRect.lightColor;
+    lights.push({ x: 0, y: ar.y - 0.3, z: ar.z, r: lc[0] * 1.35, g: lc[1] * 1.35, b: lc[2] * 1.35, radius: 13.5, flicker: 0 });
+    halos.push({ x: 0, y: ar.y, z: ar.z, r: lc[0], g: lc[1], b: lc[2], size: 2.3, flicker: 0 });
+  }
+
+  // UTILITY POLES, TRANSFORMERS & TANGLED OVERHEAD POWER CABLES
+  const poleZs = [-6.5, -19.0, -31.5, -44.0, -56.5, -68.5];
+  for (let pi = 0; pi < poleZs.length; pi++) {
+    const pz = poleZs[pi], side = (pi & 1) ? 1 : -1, px = side * 1.92, dir = -side;
+    mb.addCylinder(px, 0.0, 3.6, pz, 0.13, 0.12, 10, ARCH.pole, [0,0,0,0], [0.95, 0.96, 1.0, 0]);
+    mb.addCylinder(px, 3.6, 11.8, pz, 0.12, 0.09, 10, ARCH.concrete, [0,0,0,0], [0.65, 0.68, 0.72, 0]);
+    mb.addBox(px + dir * 0.25, 6.8, pz, 0.96, 0.08, 0.08, ARCH.metal, [2,0,0,0], [0.14,0.15,0.18,0.38]);
+    mb.addBox(px + dir * 0.25, 8.5, pz, 0.96, 0.08, 0.08, ARCH.metal, [2,0,0,0], [0.14,0.15,0.18,0.38]);
+    mb.addCylinder(px + dir * 0.34, 6.05, 6.72, pz + 0.12, 0.21, 0.21, 10, ARCH.metal, [0,0,0,0], [0.55, 0.58, 0.64, 0]);
+    const lampX = px + dir * 0.74, lampY = 5.50;
+    mb.addBox(px + dir * 0.37, lampY + 0.08, pz, 0.78, 0.04, 0.04, ARCH.metal, [2,0,0,0], [0.15,0.16,0.19,0.35]);
+    mb.addBox(lampX, lampY, pz, 0.30, 0.07, 0.15, SOLID_UV, [2, 3.8, 0, 0], [1.0, 0.82, 0.56, 0.1]);
+    lights.push({ x: lampX, y: lampY - 0.15, z: pz, r: 0.95, g: 0.72, b: 0.44, radius: 13.0, flicker: 0 });
+    halos.push({ x: lampX, y: lampY - 0.05, z: pz, r: 1.0, g: 0.75, b: 0.46, size: 1.35, flicker: 0 });
+  }
+
+  for (let seg = 0; seg < 6; seg++) {
+    const za = -seg * 12.0, zb = -(seg + 1) * 12.0;
+    for (const side of [-1, 1]) {
+      const baseX = side * 1.66;
+      for (let w = 0; w < 5; w++) {
+        const yH = 5.5 + w * 0.58 + (w % 2) * 0.18;
+        const xOff = (w - 2) * 0.12;
+        mb.addCable([baseX + xOff, yH, za], [baseX + xOff, yH, zb], 0.26 + w * 0.05, 0.014 + (w === 0 ? 0.012 : 0), 10);
+      }
+    }
+    for (let c = 0; c < 5; c++) {
+      const zStart = za - rand(0.5, 11.5), zEnd = zStart + rand(-5.2, 5.2);
+      const y1 = rand(4.7, 9.6), y2 = y1 + rand(-0.8, 0.8);
+      mb.addCable([-2.2, y1, zStart], [2.2, y2, zEnd], rand(0.22, 0.65), rand(0.011, 0.022), 10);
+    }
+  }
+
+  mb.addBox(-2.12, 0.055, -LOOP_LEN * 0.5, 0.24, 0.11, LOOP_LEN, ARCH.concrete, [0,0,0,0], [0.50, 0.52, 0.58, 0]);
+  mb.addBox( 2.12, 0.055, -LOOP_LEN * 0.5, 0.24, 0.11, LOOP_LEN, ARCH.concrete, [0,0,0,0], [0.50, 0.52, 0.58, 0]);
+
+  return { mesh: mb.upload(), lights, steamEmitters, halos };
+}
+
+// Distant Tokyo High-Rise Skyline (soft horizontal office window strips — zero sharp 1px star dots!)
+function buildDistantSkylineMesh(signRects) {
+  const mb = new MeshBuilder();
+  const towers = [
+    { x: -11.5, z: -104, w: 12,  h: 52, d: 10 },
+    { x: -3.2,  z: -118, w: 9.5, h: 68, d: 10 },
+    { x:  4.5,  z: -110, w: 11,  h: 60, d: 10 },
+    { x:  13.0, z: -102, w: 13,  h: 46, d: 10 },
+    { x:  0.4,  z: -130, w: 14,  h: 84, d: 12 }
+  ];
+  for (const t of towers) {
+    mb.addBox(t.x, t.h * 0.5, t.z, t.w, t.h, t.d, ARCH.slate, [2, 0, 0, 0], [0.020, 0.026, 0.050, 0.7], 16 | 1 | 2);
+    // Authentic horizontal office floor ribbon bands (hazy & soft, never tiny noisy pixel dots!)
+    for (let wy = 16; wy < t.h - 5; wy += 4.2) {
+      if (rand() < 0.45) {
+        const segW = rand(2.2, t.w * 0.65);
+        const cx = t.x + rand(-t.w * 0.18, t.w * 0.18);
+        const col = rand() < 0.58 ? [0.85, 0.62, 0.36, 0] : [0.42, 0.66, 0.85, 0];
+        mb.addQuad(
+          [cx - segW * 0.5, wy - 0.35, t.z + t.d * 0.5 + 0.1],
+          [cx + segW * 0.5, wy - 0.35, t.z + t.d * 0.5 + 0.1],
+          [cx + segW * 0.5, wy + 0.35, t.z + t.d * 0.5 + 0.1],
+          [cx - segW * 0.5, wy + 0.35, t.z + t.d * 0.5 + 0.1],
+          [0, 0, 1], 0, 0, 1, 1, [2, 0.55, 0, 0], col
+        );
+      }
+    }
+    if (t.h > 54) {
+      mb.addBox(t.x, t.h + 0.8, t.z + t.d * 0.4, 0.62, 0.62, 0.62, SOLID_UV, [2, 5.2, 2.7, 0], [1.0, 0.08, 0.06, 0]);
+    }
+  }
+  const farR1 = signRects['blade_karaoke'];
+  mb.addQuad([-2.6, 9.0, -96], [-0.4, 9.0, -96], [-0.4, 23.0, -96], [-2.6, 23.0, -96], [0,0,1], farR1.u0, farR1.v0, farR1.u1, farR1.v1, [1, 2.4, 0, 0], [1,1,1,0]);
+  const farR2 = signRects['blade_bar'];
+  mb.addQuad([0.8, 11.0, -99], [3.0, 11.0, -99], [3.0, 26.0, -99], [0.8, 26.0, -99], [0,0,1], farR2.u0, farR2.v0, farR2.u1, farR2.v1, [1, 2.3, 0, 0], [1,1,1,0]);
+  mb.addSphereLamp(-0.9, 1.1, -92, 0.28, 4.5, [1.0, 0.12, 0.08]);
+  mb.addSphereLamp( 0.6, 1.1, -92, 0.28, 4.5, [1.0, 0.12, 0.08]);
+  mb.addSphereLamp( 1.9, 5.2, -90, 0.30, 4.8, [0.10, 0.95, 0.52]);
+
+  return mb.upload();
+}
+
+function buildGroundMesh() {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const verts = new Float32Array([-9.0,0.0,14.0, 9.0,0.0,14.0, 9.0,0.0,-110.0, -9.0,0.0,-110.0]);
+  const idx = new Uint16Array([0, 1, 2, 0, 2, 3]);
+  const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: 6 };
+}
+
+// ============================================================================
+// 5. GLSL SHADERS
+// ============================================================================
+const MAX_LIGHTS = 28;
+
+const COMMON_LIGHT_GLSL = /* glsl */`
+#define MAX_LIGHTS ${MAX_LIGHTS}
+uniform vec4 uLightPos[MAX_LIGHTS];
+uniform vec4 uLightCol[MAX_LIGHTS];
+uniform float uTime;
+
+float D_GGX(float NoH, float a) {
+  float a2 = a * a;
+  float d = (NoH * NoH) * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159265 * d * d + 1e-5);
+}
+float G_Smith(float NoV, float NoL, float rough) {
+  float k = (rough + 1.0);
+  k = (k * k) * 0.125;
+  return (NoV / (NoV * (1.0 - k) + k)) * (NoL / (NoL * (1.0 - k) + k));
+}
+vec3 F_Schlick(float VoH, vec3 F0) {
+  return F0 + (1.0 - F0) * pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
+}
+float lightAtten(float d2, float radius) {
+  float r2 = radius * radius;
+  float ratio = clamp(1.0 - (d2 * d2) / (r2 * r2), 0.0, 1.0);
+  return (ratio * ratio) / (d2 + 0.55);
+}
+
+vec3 applyAlleyFog(vec3 color, vec3 worldPos, vec3 camPos) {
+  vec3 toFrag = worldPos - camPos;
+  float dist = length(toFrag);
+  vec3 rd = toFrag / max(dist, 1e-4);
+
+  float heightFalloff = exp(-max(worldPos.y, 0.0) * 0.05);
+  float fogDensity = 0.0135 + 0.0055 * heightFalloff;
+  float fogFactor = clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.88);
+
+  vec3 lowFog  = vec3(0.012, 0.015, 0.028);
+  vec3 midFog  = vec3(0.020, 0.014, 0.030);
+  vec3 highFog = vec3(0.006, 0.010, 0.022);
+  vec3 fogCol = mix(lowFog, highFog, smoothstep(-0.05, 0.45, rd.y));
+  fogCol = mix(fogCol, midFog, smoothstep(10.0, 62.0, dist) * 0.42);
+
+  vec3 scatter = vec3(0.0);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    vec3 lp = uLightPos[i].xyz;
+    float rad = uLightPos[i].w;
+    if (rad <= 0.0) continue;
+    vec3 oc = lp - camPos;
+    float tClosest = clamp(dot(oc, rd), 0.0, dist);
+    vec3 diff = (camPos + rd * tClosest) - lp;
+    float d2 = dot(diff, diff);
+    float fade = smoothstep(rad * 1.1, 0.0, sqrt(d2));
+    scatter += uLightCol[i].rgb * (1.0 / (d2 + 3.2)) * fade * 0.0036;
+  }
+
+  return mix(color, fogCol, fogFactor) + scatter * min(dist * 0.06, 0.85);
+}
+`;
+
+// 5A. Scene PBR Shader (enhanced wet grazing specular bounce on facades/metal/props!)
+const SCENE_VS = /* glsl */`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNorm;
+layout(location=2) in vec2 aUV;
+layout(location=3) in vec4 aMat;
+layout(location=4) in vec4 aTint;
+
+uniform mat4 uViewProj;
+uniform float uZOffset;
+uniform float uTime;
+
+out vec3 vWorldPos;
+out vec3 vNorm;
+out vec2 vUV;
+out vec4 vMat;
+out vec4 vTint;
+
+void main() {
+  vec3 wp = aPos + vec3(0.0, 0.0, uZOffset);
+  if (aMat.w > 0.0001) {
+    float phase = wp.z * 0.65 + wp.x * 0.9 + uTime * 2.0;
+    wp.x += sin(phase) * aMat.w;
+    wp.z += cos(phase * 0.77 + 1.1) * aMat.w * 0.55;
+  }
+  vWorldPos = wp; vNorm = aNorm; vUV = aUV; vMat = aMat; vTint = aTint;
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}
+`;
+
+const SCENE_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec3 vWorldPos;
+in vec3 vNorm;
+in vec2 vUV;
+in vec4 vMat;
+in vec4 vTint;
+
+uniform sampler2D uArchAlbedo;
+uniform sampler2D uArchRMA;
+uniform sampler2D uArchNormal;
+uniform sampler2D uSignAlbedo;
+uniform sampler2D uSignEmissive;
+uniform vec3 uCamPos;
+uniform vec3 uLightCamPos;
+uniform float uClipY;
+
+${COMMON_LIGHT_GLSL}
+
+out vec4 outColor;
+
+float evalFlicker(float id) {
+  if (id < 0.01) return 1.0;
+  float t = uTime * 9.0 + id * 17.3;
+  float n = fract(sin(floor(t) * 127.1 + id * 311.7) * 43758.5453);
+  float buzz = 0.94 + 0.06 * sin(uTime * 52.0 + id * 5.0);
+  return buzz * ((n > 0.94) ? 0.25 : (n > 0.89 ? 0.66 : 1.0));
+}
+
+vec3 perturbNormal(vec3 N, vec3 pos, vec2 uv, vec3 mapN) {
+  vec3 dp1 = dFdx(pos), dp2 = dFdy(pos);
+  vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+  vec3 dp2perp = cross(dp2, N), dp1perp = cross(N, dp1);
+  vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+  vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+  float invmax = inversesqrt(max(dot(T, T), dot(B, B)) + 1e-8);
+  return normalize(mat3(T * invmax, B * invmax, N) * mapN);
+}
+
+void main() {
+  if (uClipY > 0.5 && vWorldPos.y < -0.015) discard;
+
+  vec3 N = normalize(vNorm);
+  vec3 V = normalize(uLightCamPos - vWorldPos);
+  float atlasId = vMat.x, emiGain = vMat.y, flick = evalFlicker(vMat.z);
+
+  vec3 albedo = vTint.rgb;
+  float rough = 0.42, metal = 0.05, ao = 1.0;
+  vec3 emissive = vec3(0.0);
+
+  if (atlasId < 0.5) {
+    vec3 texAlb = texture(uArchAlbedo, vUV).rgb;
+    vec3 texRMA = texture(uArchRMA, vUV).rgb;
+    vec3 mapN = texture(uArchNormal, vUV).xyz * 2.0 - 1.0;
+    albedo = texAlb * vTint.rgb;
+    rough = texRMA.r; metal = texRMA.g; ao = texRMA.b;
+    N = perturbNormal(N, vWorldPos, vUV, mapN);
+
+    float wetZone = smoothstep(2.8, 0.0, vWorldPos.y) * 0.55 + max(N.y, 0.0) * 0.68 + 0.25;
+    float drip = sin(vWorldPos.z * 7.5 + vWorldPos.x * 5.0) * 0.5 + 0.5;
+    float wetness = clamp(wetZone + drip * 0.12, 0.0, 0.94);
+    albedo *= mix(1.0, 0.56, wetness * (1.0 - metal));
+    rough = mix(rough, max(0.09, rough * 0.34), wetness);
+  } else if (atlasId < 1.5) {
+    albedo = texture(uSignAlbedo, vUV).rgb * vTint.rgb;
+    vec3 texEmi = texture(uSignEmissive, vUV).rgb;
+    rough = 0.14; metal = 0.04;
+    emissive = texEmi * emiGain * flick;
+  } else {
+    rough = vTint.a > 0.01 ? vTint.a : 0.32;
+    metal = rough < 0.36 ? 0.72 : 0.15;
+    rough = max(0.10, rough * 0.68);
+    if (emiGain > 0.01) emissive = vTint.rgb * emiGain * flick;
+  }
+
+  ao *= mix(0.62, 1.0, smoothstep(0.0, 1.6, vWorldPos.y));
+  vec3 F0 = mix(vec3(0.045), albedo, metal);
+  float NoV = max(dot(N, V), 0.001);
+
+  // Deep rainy midnight ambient with subtle cool-indigo sky & warm street neon clearcoat rim
+  vec3 skyAmb = vec3(0.015, 0.022, 0.042);
+  vec3 groundBounce = vec3(0.036, 0.022, 0.036);
+  vec3 ambient = mix(groundBounce, skyAmb, N.y * 0.5 + 0.5) * albedo * ao * (1.0 - metal * 0.72);
+  vec3 R = reflect(-V, N);
+  vec3 envSpec = mix(vec3(0.036, 0.022, 0.042), vec3(0.032, 0.056, 0.102), clamp(R.y * 0.5 + 0.5, 0.0, 1.0));
+  vec3 color = ambient + envSpec * F_Schlick(NoV, F0) * (1.0 - rough * 0.62) * ao * 1.35;
+
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    vec3 lpos = uLightPos[i].xyz;
+    float rad = uLightPos[i].w;
+    if (rad <= 0.0) continue;
+    vec3 Lvec = lpos - vWorldPos;
+    float d2 = dot(Lvec, Lvec);
+    if (d2 > rad * rad) continue;
+    vec3 L = Lvec * inversesqrt(d2 + 1e-5);
+    float NoL = max(dot(N, L), 0.0);
+    if (NoL <= 0.0) continue;
+
+    vec3 radiance = uLightCol[i].rgb * lightAtten(d2, rad);
+    vec3 H = normalize(V + L);
+    float NoH = max(dot(N, H), 0.0), VoH = max(dot(V, H), 0.0);
+    float D = D_GGX(NoH, max(rough * rough, 0.016));
+    float G = G_Smith(NoV, NoL, rough);
+    vec3 F = F_Schlick(VoH, F0);
+    vec3 spec = (D * G * F) / (4.0 * NoV * NoL + 0.001);
+    vec3 diff = (1.0 - F) * (1.0 - metal) * albedo / 3.14159265;
+    color += (diff * 1.15 + spec * 1.25) * radiance * NoL * ao;
+  }
+
+  color += emissive;
+  color = applyAlleyFog(color, vWorldPos, uCamPos);
+  outColor = vec4(color, 1.0);
+}
+`;
+
+// 5B. MASTERPIECE PHOTOREALISTIC WET ASPHALT PAVEMENT SHADER
+//     - Crisp contrast between ~38% mirror-smooth standing puddles (with tiny realistic 7-16cm concentric raindrop ripples!)
+//       and ~62% coarse gritty glistening wet asphalt (with sparkling stone aggregate & strong 11-tap vertical anisotropic neon streaks!)
+const GROUND_VS = /* glsl */`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uViewProj;
+uniform float uCamZ;
+out vec3 vWorldPos;
+void main() {
+  vec3 wp = vec3(aPos.x, 0.0, aPos.z + uCamZ);
+  vWorldPos = wp;
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}
+`;
+
+const GROUND_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec3 vWorldPos;
+
+uniform sampler2D uReflectionTex;
+uniform sampler2D uAsphaltData;
+uniform sampler2D uAsphaltNormal;
+uniform vec2 uResolution;
+uniform vec3 uCamPos;
+
+${COMMON_LIGHT_GLSL}
+
+out vec4 outColor;
+
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// Physically scaled raindrop concentric capillary waves (7cm - 18cm diameter!)
+// Returns xy = sharp normal gradient (bends reflected neon crisply!), z = subtle crest highlight
+vec3 rainRipples(vec2 p, float t) {
+  vec2 grad = vec2(0.0);
+  float crest = 0.0;
+  for (int layer = 0; layer < 3; layer++) {
+    float scale = (layer == 0) ? 3.8 : (layer == 1 ? 6.2 : 9.4);
+    float speed = (layer == 0) ? 1.45 : (layer == 1 ? 1.85 : 2.35);
+    vec2 uv = p * scale + vec2(float(layer) * 23.7, float(layer) * 13.1);
+    vec2 cell = floor(uv);
+    vec2 f = fract(uv);
+
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        vec2 g = vec2(float(i), float(j));
+        vec2 rnd = hash22(cell + g);
+        float cycle = fract(t * speed * 0.65 + rnd.x * 9.31 + rnd.y * 5.17);
+        vec2 center = g + 0.18 + 0.64 * rnd;
+        vec2 diff = f - center;
+        float dist = length(diff);
+
+        float radius = cycle * 0.56;
+        float ringDist = dist - radius;
+        float env = exp(-ringDist * ringDist * 130.0) * (1.0 - cycle) * smoothstep(0.0, 0.07, cycle);
+        float wave = sin(ringDist * 64.0);
+        vec2 dir = diff / max(dist, 0.001);
+        grad += dir * wave * env * (0.48 / sqrt(scale));
+        crest += max(0.0, wave) * env * (1.0 - cycle);
+      }
+    }
+  }
+  return vec3(grad, crest);
+}
+
+void main() {
+  vec2 wp = vWorldPos.xz;
+  vec3 V = normalize(uCamPos - vWorldPos);
+  float dist = length(uCamPos - vWorldPos);
+
+  // 3-scale seamless asphalt sampling for real photographic coarse tarmac grit + macro drainage basins
+  vec2 uvMicro = wp * 1.45;
+  vec2 uvFine  = wp * 0.42;
+  vec2 uvMacro = wp * 0.095 + vec2(0.41, 0.23);
+  vec4 dataU = texture(uAsphaltData, uvMicro);
+  vec4 dataF = texture(uAsphaltData, uvFine);
+  vec4 dataM = texture(uAsphaltData, uvMacro);
+  vec3 normU = texture(uAsphaltNormal, uvMicro).xyz * 2.0 - 1.0;
+  vec3 normF = texture(uAsphaltNormal, uvFine).xyz * 2.0 - 1.0;
+
+  // Concrete side drainage curb slabs (側溝) along x in [1.66..2.02]
+  float inGutter = smoothstep(1.65, 1.69, abs(wp.x)) * smoothstep(2.04, 1.98, abs(wp.x));
+  float slabJoint = smoothstep(0.024, 0.0, abs(fract(wp.y * 0.85) - 0.5) - 0.476);
+
+  // Authentic circular cast-iron Tokyo Manhole Covers every 14.5m
+  vec2 mhCell = vec2(wp.x - 0.24, mod(wp.y + 4.0, 14.5) - 7.25);
+  float mhR = length(mhCell);
+  float isManhole = smoothstep(0.36, 0.34, mhR);
+  float mhRim = smoothstep(0.032, 0.01, abs(mhR - 0.33));
+  float mhPattern = (sin(mhR * 64.0) * 0.5 + 0.5) * (sin(atan(mhCell.y, mhCell.x) * 16.0) * 0.5 + 0.5);
+
+  // Subtle darker asphalt patch repairs
+  float patchMask = smoothstep(0.60, 0.64, dataM.g) * smoothstep(0.28, 0.32, abs(fract(wp.y * 0.075) - 0.5));
+
+  // BALANCED PUDDLE vs COARSE WET ASPHALT ISLANDS (~38% crisp mirror puddles, ~62% coarse shimmering tarmac!)
+  float gutterPool = smoothstep(1.22, 1.78, abs(wp.x)) * 0.24;
+  float wheelTrack = smoothstep(0.65, 0.12, abs(abs(wp.x) - 0.68)) * 0.14;
+  float basin = (1.0 - dataM.g) * 0.78 + (1.0 - dataF.g) * 0.22 + gutterPool + wheelTrack;
+  // Crisp shoreline transition: distinct organic puddles surrounded by rough glistening aggregate!
+  float puddle = smoothstep(0.58, 0.65, basin) * (1.0 - isManhole * 0.88);
+  float wetShore = smoothstep(0.45, 0.59, basin);
+
+  // Crisp realistic concentric raindrop ripples inside puddles (fade smoothly in distance)
+  float rippleFade = exp(-dist * 0.068);
+  vec3 rip = rainRipples(wp, uTime);
+  vec2 rGrad = rip.xy * (0.04 + 0.96 * puddle) * rippleFade;
+  float rCrest = rip.z * puddle * rippleFade;
+
+  // Strong tactile coarse stone normal on damp asphalt vs. flat mirror water normal in puddles!
+  // Plus close-range high-frequency procedural volcanic pebble micro-grit (anti-aliased via dist fade!)
+  float gritFade = exp(-dist * 0.13);
+  vec2 g1 = hash22(floor(wp * 26.0)) - 0.5;
+  vec2 g2 = hash22(floor(wp * 54.0 + 7.1)) - 0.5;
+  vec2 microPebble = (g1 * 0.65 + g2 * 0.35) * gritFade;
+  float pebbleGlint = smoothstep(0.32, 0.49, max(abs(g1.x), abs(g2.y))) * gritFade;
+
+  vec3 asphaltN = normalize(vec3(
+    (normU.x * 0.62 + normF.x * 0.38) * 0.92 + microPebble.x * 0.42,
+    1.0,
+    (normU.y * 0.62 + normF.y * 0.38) * 0.92 + microPebble.y * 0.42
+  ));
+  vec3 waterN = normalize(vec3(rGrad.x * 1.45, 1.0, rGrad.y * 1.45));
+  vec3 N = normalize(mix(asphaltN, waterN, puddle * 0.96));
+  if (isManhole > 0.1) {
+    N = normalize(mix(N, normalize(vec3((mhPattern - 0.5) * 0.35, 1.0, mhRim * 0.4)), isManhole * 0.65));
+  }
+
+  // Distinct roughness: calm puddle = 0.018 (mirror); rough damp asphalt = 0.20..0.40 (lush vertical neon stretch!)
+  float gritRough = mix(0.20, 0.40, dataU.b * 0.68 + dataF.b * 0.32);
+  gritRough = mix(gritRough, gritRough * 0.65, wetShore);
+  float rough = mix(gritRough, 0.018, puddle);
+  rough = mix(rough, 0.18, isManhole);
+  rough = mix(rough, 0.32, inGutter * (1.0 - puddle));
+
+  // Rich tactile wet Tokyo asphalt albedo (crisp stone grain crowns, deep soaked obsidian puddles!)
+  float stoneGrain = dataU.r * 0.68 + dataF.r * 0.32;
+  float tone = 0.030 + stoneGrain * 0.062 + pebbleGlint * 0.014;
+  vec3 albedo = vec3(tone * 0.95, tone * 0.98, tone * 1.07);
+  albedo = mix(albedo, albedo * 0.56, patchMask * 0.65);
+  albedo = mix(albedo, vec3(0.072, 0.076, 0.086) * (1.0 - slabJoint * 0.62), inGutter);
+  albedo = mix(albedo, vec3(0.056, 0.060, 0.068) * (0.75 + 0.5 * mhPattern), isManhole);
+  // Worn faded Japanese white road edge line at x = +-1.60
+  float edgeLine = smoothstep(0.064, 0.032, abs(abs(wp.x) - 1.60)) * (0.35 + 0.65 * stoneGrain);
+  albedo = mix(albedo, vec3(0.24, 0.25, 0.27), edgeLine * 0.58 * (1.0 - puddle * 0.65));
+  albedo *= (1.0 - dataF.a * 0.55);
+  albedo *= mix(0.86, 0.20, puddle);
+
+  // ===== PLANAR MIRROR REFLECTION WITH STRONG ANISOTROPIC ROUGH-ASPHALT STRETCHING =====
+  vec2 screenUV = gl_FragCoord.xy / uResolution;
+  float NoV = max(dot(N, V), 0.001);
+
+  // Crisp ripple distortion in puddles; fine stone micro-jitter on rough wet asphalt
+  vec2 distAmt = N.xz * mix(0.046, 0.032, puddle) * (0.45 + 0.55 / (1.0 + dist * 0.11));
+  vec2 baseReflUV = clamp(screenUV + vec2(distAmt.x, -distAmt.y * 0.72), 0.002, 0.998);
+
+  // 11-tap vertically elongated anisotropic cone filter
+  float r2 = rough * rough;
+  float spreadY = r2 * (0.36 + 0.44 * (1.0 - NoV));
+  float spreadX = r2 * 0.040;
+  vec3 reflSum = vec3(0.0);
+  const float offs[11] = float[11](-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0);
+  const float wts[11]  = float[11](0.032, 0.058, 0.088, 0.118, 0.136, 0.140, 0.136, 0.118, 0.088, 0.058, 0.032);
+  for (int k = 0; k < 11; k++) {
+    float o = offs[k];
+    vec2 jit = vec2(sin(float(k) * 2.9 + wp.x * 27.0 + wp.y * 19.0) * spreadX, o * spreadY);
+    vec2 suv = clamp(baseReflUV + jit, 0.002, 0.998);
+    reflSum += texture(uReflectionTex, suv).rgb * wts[k];
+  }
+  vec3 reflColor = reflSum;
+
+  // Water Fresnel + crisp wet stone-grit sparkle outside puddles!
+  float fresnel = 0.024 + (1.0 - 0.024) * pow(1.0 - NoV, 3.8);
+  float puddleRefl = max(fresnel * 1.28, 0.54);
+  // Thin glossy wet shoreline collar around puddles transitions organically into sparkling coarse tarmac!
+  float shoreline = exp(-pow((puddle - 0.48) * 5.0, 2.0)) * 0.14;
+  float dampRefl = clamp(fresnel * (0.80 + 0.60 * wetShore) + 0.10 * wetShore + shoreline, 0.08, 0.76);
+  float reflStrength = mix(dampRefl, puddleRefl, puddle);
+
+  // Sparkling wet aggregate quartz stones catching vivid neon pinpoints outside puddles!
+  float sparkle = pow(clamp(dataU.r, 0.0, 1.0), 3.4) * 2.1 + pebbleGlint * 1.35;
+  float gritMod = mix(0.60 + 0.65 * dataU.r + sparkle * 0.52, 1.0, puddle);
+  vec3 color = albedo * vec3(0.020, 0.025, 0.044) + reflColor * reflStrength * gritMod;
+
+  // Crisp subtle neon glint ONLY where bright reflected neon hits a ripple wave crest (never grey rings on dark tarmac!)
+  float reflBright = max(reflColor.r, max(reflColor.g, reflColor.b));
+  color += reflColor * rCrest * smoothstep(0.08, 0.65, reflBright) * 0.52;
+
+  // Direct GGX PBR specular & diffuse pools from the 28 local alley lights
+  vec3 F0 = mix(vec3(0.030), vec3(0.20), isManhole);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    vec3 lpos = uLightPos[i].xyz;
+    float rad = uLightPos[i].w;
+    if (rad <= 0.0) continue;
+    vec3 Lvec = lpos - vWorldPos;
+    float d2 = dot(Lvec, Lvec);
+    if (d2 > rad * rad) continue;
+
+    vec3 L = Lvec * inversesqrt(d2 + 1e-5);
+    float NoL = max(dot(N, L), 0.0);
+    if (NoL <= 0.0) continue;
+
+    vec3 radiance = uLightCol[i].rgb * lightAtten(d2, rad);
+    vec3 H = normalize(V + L);
+    float NoH = max(dot(N, H), 0.0), VoH = max(dot(V, H), 0.0);
+    float D = D_GGX(NoH, max(rough * rough, 0.012));
+    float G = G_Smith(NoV, NoL, rough);
+    vec3 F = F_Schlick(VoH, F0);
+    vec3 spec = (D * G * F) / (4.0 * NoV * NoL + 0.001);
+    vec3 diff = (1.0 - F) * albedo / 3.14159265;
+    color += (diff * 1.55 + spec * (0.38 + 0.72 * (1.0 - puddle))) * radiance * NoL;
+  }
+
+  color = applyAlleyFog(color, vWorldPos, uCamPos);
+  outColor = vec4(color, 1.0);
+}
+`;
+
+// 5C. Deep Rainy Midnight Overcast Tokyo Sky Dome
+const SKY_VS = /* glsl */`#version 300 es
+precision highp float;
+out vec2 vUV;
+void main() {
+  vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUV = pos;
+  gl_Position = vec4(pos * 2.0 - 1.0, 0.9999, 1.0);
+}
+`;
+const SKY_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform mat4 uInvViewProj;
+uniform vec3 uCamPos;
+uniform float uTime;
+out vec4 outColor;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), f.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { v += a * noise(p); p *= 2.03; a *= 0.5; }
+  return v;
+}
+
+void main() {
+  vec4 wp = uInvViewProj * vec4(vUV * 2.0 - 1.0, 1.0, 1.0);
+  vec3 rd = normalize(wp.xyz / wp.w - uCamPos);
+  float elev = clamp(abs(rd.y), 0.0, 1.0);
+
+  vec3 horizonCol = vec3(0.032, 0.020, 0.044);
+  vec3 midCol     = vec3(0.010, 0.015, 0.036);
+  vec3 zenithCol  = vec3(0.003, 0.005, 0.014);
+
+  vec3 col = mix(horizonCol, midCol, smoothstep(0.0, 0.25, elev));
+  col = mix(col, zenithCol, smoothstep(0.20, 0.78, elev));
+
+  vec2 cloudUV = rd.xz / (elev + 0.22) * 1.45 + vec2(uTime * 0.016, uTime * 0.011);
+  float c = fbm(cloudUV), c2 = fbm(cloudUV * 2.2 - vec2(uTime * 0.01, 0.0));
+  vec3 cloudGlow = mix(vec3(0.048, 0.018, 0.048), vec3(0.015, 0.034, 0.056), c2);
+  col += cloudGlow * smoothstep(0.35, 0.86, c) * (1.0 - elev * 0.55) * 0.55;
+
+  float alleyEnd = pow(max(dot(normalize(vec3(rd.x, rd.y * 1.8, rd.z)), vec3(0.0, 0.03, -1.0)), 0.0), 16.0);
+  col += vec3(0.088, 0.038, 0.070) * alleyEnd;
+
+  outColor = vec4(col, 1.0);
+}
+`;
+
+// 5D. Gossamer Translucent Rising Curl-Noise Steam Shader (also reflected cleanly in wet pavement!)
+const STEAM_VS = /* glsl */`#version 300 es
+precision highp float;
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 aOriginSeed;
+layout(location=2) in vec4 aVelScale;
+layout(location=3) in vec4 aColorLife;
+
+uniform mat4 uViewProj;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform float uTime;
+uniform float uZOffset;
+
+out vec2 vLocalUV;
+out vec3 vWorldPos;
+out vec3 vTint;
+out float vAge;
+out float vSeed;
+
+void main() {
+  float life = aColorLife.w;
+  float age = fract(uTime / life + aOriginSeed.w);
+  vec3 origin = aOriginSeed.xyz + vec3(0.0, 0.0, uZOffset);
+
+  float t = age * life;
+  float curlX = sin(t * 1.15 + aOriginSeed.w * 25.0) * 0.24 * age;
+  float curlZ = cos(t * 0.90 + aOriginSeed.w * 19.0) * 0.20 * age;
+  vec3 pos = origin + aVelScale.xyz * t + vec3(curlX, age * age * 0.78, curlZ);
+
+  float szW = aVelScale.w * (0.34 + age * 0.98);
+  float szH = szW * (1.20 + age * 0.34);
+  float rot = aOriginSeed.w * 6.283 + age * 0.55 * (fract(aOriginSeed.w * 7.3) > 0.5 ? 1.0 : -1.0);
+  float cr = cos(rot), sr = sin(rot);
+  vec2 rc = vec2(aCorner.x * cr - aCorner.y * sr, aCorner.x * sr + aCorner.y * cr);
+
+  vec3 wp = pos + uCamRight * (rc.x * szW) + uCamUp * (rc.y * szH);
+  vWorldPos = wp;
+  vLocalUV = aCorner * 2.0;
+  vTint = aColorLife.rgb;
+  vAge = age;
+  vSeed = aOriginSeed.w;
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}
+`;
+
+const STEAM_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vLocalUV;
+in vec3 vWorldPos;
+in vec3 vTint;
+in float vAge;
+in float vSeed;
+
+uniform vec3 uCamPos;
+uniform float uClipY;
+${COMMON_LIGHT_GLSL}
+
+out vec4 outColor;
+
+float hash21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1,0)), f.x), mix(hash21(i + vec2(0,1)), hash21(i + vec2(1,1)), f.x), f.y);
+}
+float steamFbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    s += a * vnoise(p);
+    p = mat2(0.8, 0.6, -0.6, 0.8) * p * 2.08;
+    a *= 0.5;
+  }
+  return s;
+}
+
+void main() {
+  if (uClipY > 0.5 && vWorldPos.y < 0.0) discard;
+  float r2 = dot(vLocalUV, vLocalUV);
+  if (r2 > 1.0) discard;
+
+  vec2 p = vLocalUV * vec2(2.3, 1.75) + vec2(vSeed * 13.7, -uTime * 0.36);
+  vec2 warp = vec2(steamFbm(p + vec2(1.7, 9.2)), steamFbm(p + vec2(8.3, 2.8)));
+  float n = steamFbm(p + (warp - 0.5) * 1.65);
+  float wisp = smoothstep(0.35, 0.82, n);
+
+  float radial = pow(1.0 - r2, 2.25);
+  float lifeFade = smoothstep(0.0, 0.14, vAge) * smoothstep(1.0, 0.28, vAge);
+  float groundSoft = smoothstep(-0.04, 0.32, vWorldPos.y);
+  float camDist = length(vWorldPos - uCamPos);
+  float camFade = smoothstep(2.3, 4.8, camDist) * exp(-camDist * 0.030);
+
+  float density = wisp * radial * lifeFade * groundSoft * camFade;
+  if (density < 0.002) discard;
+
+  vec3 lit = vec3(0.05, 0.06, 0.09) + vTint * 0.10;
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    vec3 lp = uLightPos[i].xyz;
+    float rad = uLightPos[i].w;
+    if (rad <= 0.0) continue;
+    vec3 lv = lp - vWorldPos;
+    float d2 = dot(lv, lv);
+    if (d2 > rad * rad) continue;
+    lit += uLightCol[i].rgb * lightAtten(d2, rad) * 0.92;
+  }
+  lit = lit / (vec3(1.0) + lit * 0.55);
+
+  outColor = vec4(lit * density * 0.24, 0.0);
+}
+`;
+
+// 5E. Soft Controlled Mie Neon Halos
+const HALO_VS = /* glsl */`#version 300 es
+precision highp float;
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 aPosSize;
+layout(location=2) in vec4 aColFlick;
+
+uniform mat4 uViewProj;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform vec3 uCamPos;
+uniform float uZOffset;
+uniform float uTime;
+
+out vec2 vUV;
+out vec3 vCol;
+out float vCamDist;
+
+float evalFlicker(float id) {
+  if (id < 0.01) return 1.0;
+  float t = uTime * 9.0 + id * 17.3;
+  float n = fract(sin(floor(t) * 127.1 + id * 311.7) * 43758.5453);
+  return (0.94 + 0.06 * sin(uTime * 52.0 + id * 5.0)) * (n > 0.94 ? 0.25 : (n > 0.89 ? 0.66 : 1.0));
+}
+
+void main() {
+  vec3 c = aPosSize.xyz + vec3(0.0, 0.0, uZOffset);
+  vec3 wp = c + (uCamRight * aCorner.x + uCamUp * aCorner.y) * aPosSize.w;
+  vUV = aCorner * 2.0;
+  vCol = aColFlick.rgb * evalFlicker(aColFlick.w);
+  vCamDist = length(c - uCamPos);
+  gl_Position = uViewProj * vec4(wp, 1.0);
+}
+`;
+const HALO_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+in vec3 vCol;
+in float vCamDist;
+out vec4 outColor;
+void main() {
+  float r = length(vUV);
+  if (r > 1.0) discard;
+  float g = exp(-r * r * 5.2) * 0.60 + pow(1.0 - r, 3.2) * 0.40;
+  float fade = exp(-vCamDist * 0.022) * smoothstep(1.5, 4.0, vCamDist);
+  outColor = vec4(vCol * g * 0.082 * fade, 0.0);
+}
+`;
+
+// 5F. 3-Layer Photographic Falling Rain (Near Crisp + Dense Mid/Far Sheet + Soft Foreground Lens Bokeh Streaks) + Subtle Splash Arcs
+const RAIN_VS = /* glsl */`#version 300 es
+precision highp float;
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 aSeedPos;
+
+uniform mat4 uViewProj;
+uniform vec3 uCamPos;
+uniform vec3 uCamRight;
+uniform float uTime;
+uniform float uMode; // 0 = near/mid crisp, 1 = dense mid/far downpour, 2 = ultra-subtle splash arcs, 3 = soft foreground lens bokeh streaks
+
+out vec2 vUV;
+out vec3 vWorldPos;
+out float vSeed;
+out float vCamDist;
+
+void main() {
+  if (uMode < 1.5 || uMode > 2.5) {
+    bool isFar = (uMode > 0.5 && uMode < 1.5);
+    bool isBokeh = (uMode > 2.5);
+    vec3 boxSize = isBokeh ? vec3(4.2, 5.2, 4.8) : (isFar ? vec3(7.4, 13.0, 32.0) : vec3(6.6, 11.0, 16.5));
+    vec3 volCenter = vec3(0.0, isBokeh ? 2.4 : (isFar ? 5.6 : 4.8), uCamPos.z - (isBokeh ? 2.6 : (isFar ? 18.0 : 8.5)));
+
+    float fallSpeed = (isBokeh ? 13.5 : (isFar ? 11.8 : 10.8)) + aSeedPos.w * 4.8;
+    vec3 raw = aSeedPos.xyz * boxSize;
+    raw.y -= uTime * fallSpeed;
+    raw.x += uTime * 1.15; // crisp consistent Tokyo rain wind angle (~6 deg)
+
+    vec3 p;
+    p.x = mod(raw.x - volCenter.x + boxSize.x * 0.5, boxSize.x) - boxSize.x * 0.5 + volCenter.x;
+    p.y = mod(raw.y, boxSize.y) + 0.04;
+    p.z = mod(raw.z - volCenter.z + boxSize.z * 0.5, boxSize.z) - boxSize.z * 0.5 + volCenter.z;
+
+    vec3 velDir = normalize(vec3(1.15, -fallSpeed, 0.0));
+    float camD = length(p - uCamPos);
+    // Keep far rain streaks long & wide enough to form smooth silky falling rain curtains (zero 1px dotted aliasing!)
+    float streakLen = isBokeh ? (0.36 + aSeedPos.w * 0.24) : (isFar ? (0.62 + aSeedPos.w * 0.42) : (0.28 + aSeedPos.w * 0.24));
+    float width = isBokeh
+      ? (0.015 + aSeedPos.w * 0.010)
+      : (isFar
+        ? (0.0085 + aSeedPos.w * 0.0040)
+        : (mix(0.0064, 0.0042, smoothstep(1.3, 8.0, camD)) * (0.80 + aSeedPos.w * 0.46)));
+
+    vec3 toCam = normalize(uCamPos - p);
+    vec3 side = normalize(cross(velDir, toCam));
+    vec3 wp = p + side * (aCorner.x * width) - velDir * (aCorner.y * streakLen);
+
+    vWorldPos = wp;
+    vUV = vec2(aCorner.x + 0.5, aCorner.y);
+    vSeed = aSeedPos.w;
+    vCamDist = camD;
+    gl_Position = uViewProj * vec4(wp, 1.0);
+  } else {
+    vec3 volCenter = vec3(0.0, 0.0, uCamPos.z - 8.0);
+    float cycle = fract(uTime * (3.2 + aSeedPos.w * 2.2) + aSeedPos.y * 9.13);
+    vec3 p;
+    p.x = (aSeedPos.x - 0.5) * 3.8;
+    p.z = mod(aSeedPos.z * 16.0 - volCenter.z + 8.0, 16.0) - 8.0 + volCenter.z;
+    p.y = 0.004 + sin(cycle * 3.14159) * 0.026;
+    float sz = (0.018 + cycle * 0.028);
+    vec3 wp = p + uCamRight * (aCorner.x * sz) + vec3(0.0, aCorner.y * sz * 0.55, 0.0);
+    vWorldPos = wp;
+    vUV = vec2(aCorner.x + 0.5, aCorner.y);
+    vSeed = cycle;
+    vCamDist = length(p - uCamPos);
+    gl_Position = uViewProj * vec4(wp, 1.0);
+  }
+}
+`;
+
+const RAIN_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+in vec3 vWorldPos;
+in float vSeed;
+in float vCamDist;
+
+uniform float uMode;
+${COMMON_LIGHT_GLSL}
+
+out vec4 outColor;
+
+void main() {
+  float mask;
+  if (uMode < 1.5 || uMode > 2.5) {
+    bool isFar = (uMode > 0.5 && uMode < 1.5);
+    bool isBokeh = (uMode > 2.5);
+    float across = pow(clamp(1.0 - abs(vUV.x * 2.0 - 1.0), 0.0, 1.0), isBokeh ? 1.2 : 1.85);
+    float along = smoothstep(0.0, 0.14, vUV.y) * pow(smoothstep(1.0, 0.08, vUV.y), isBokeh ? 1.0 : 1.3);
+    float depthMask = isBokeh
+      ? (smoothstep(0.75, 1.4, vCamDist) * smoothstep(3.8, 1.8, vCamDist))
+      : (isFar
+        ? (smoothstep(4.2, 8.2, vCamDist) * exp(-vCamDist * 0.068) * smoothstep(11.5, 5.5, vWorldPos.y))
+        : (smoothstep(1.1, 2.4, vCamDist) * exp(-vCamDist * 0.075)));
+    mask = across * along * depthMask;
+  } else {
+    vec2 q = (vUV - vec2(0.5, 0.08)) * vec2(2.0, 2.2);
+    float r = length(q);
+    float arc = exp(-pow((r - 0.55) * 6.5, 2.0)) * smoothstep(-0.05, 0.25, q.y);
+    float life = (1.0 - vSeed) * smoothstep(0.0, 0.18, vSeed);
+    mask = arc * life * smoothstep(1.4, 3.0, vCamDist) * exp(-vCamDist * 0.14);
+  }
+  if (mask < 0.002) discard;
+
+  vec3 lit = vec3(0.072, 0.098, 0.160);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    vec3 lp = uLightPos[i].xyz;
+    float rad = uLightPos[i].w;
+    if (rad <= 0.0) continue;
+    vec3 lv = lp - vWorldPos;
+    float d2 = dot(lv, lv);
+    if (d2 > rad * rad) continue;
+    lit += uLightCol[i].rgb * lightAtten(d2, rad) * 2.15;
+  }
+  lit = lit / (vec3(1.0) + lit * 0.34);
+
+  float strength = (uMode < 0.5) ? 0.34 : (uMode < 1.5 ? 0.14 : (uMode < 2.5 ? 0.15 : 0.11));
+  outColor = vec4(lit * mask * strength, 0.0);
+}
+`;
+
+// 5G. Multi-Pass HDR Bloom, Anamorphic Streak & Filmic ACES Composite
+const FULLSCREEN_VS = /* glsl */`#version 300 es
+precision highp float;
+out vec2 vUV;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUV = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+const BLOOM_EXTRACT_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform float uThreshold;
+uniform float uKnee;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(uTex, vUV).rgb;
+  float br = max(c.r, max(c.g, c.b));
+  float soft = clamp(br - uThreshold + uKnee, 0.0, 2.0 * uKnee);
+  soft = (soft * soft) / (4.0 * uKnee + 1e-5);
+  float contrib = max(soft, br - uThreshold) / max(br, 1e-5);
+  outColor = vec4(min(c * contrib, vec3(10.0)), 1.0);
+}
+`;
+const BLUR_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uDir;
+out vec4 outColor;
+void main() {
+  vec3 sum = texture(uTex, vUV).rgb * 0.227027;
+  sum += (texture(uTex, vUV + uDir * 1.384615).rgb + texture(uTex, vUV - uDir * 1.384615).rgb) * 0.316216;
+  sum += (texture(uTex, vUV + uDir * 3.230769).rgb + texture(uTex, vUV - uDir * 3.230769).rgb) * 0.070270;
+  outColor = vec4(sum, 1.0);
+}
+`;
+const ANAMORPHIC_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uTexel;
+out vec4 outColor;
+void main() {
+  vec3 acc = vec3(0.0);
+  float wsum = 0.0;
+  for (int i = -11; i <= 11; i++) {
+    float fi = float(i);
+    float w = exp(-abs(fi) * 0.21);
+    vec2 uv = clamp(vUV + vec2(fi * uTexel.x * 3.6, 0.0), 0.001, 0.999);
+    acc += texture(uTex, uv).rgb * w;
+    wsum += w;
+  }
+  outColor = vec4(acc / wsum, 1.0);
+}
+`;
+const COMPOSITE_FS = /* glsl */`#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uScene;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform sampler2D uBloom3;
+uniform sampler2D uStreak;
+uniform float uTime;
+uniform vec2 uResolution;
+out vec4 outColor;
+
+vec3 acesFilm(vec3 x) {
+  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+void main() {
+  vec2 centered = vUV - 0.5;
+  float r2 = dot(centered, centered);
+  vec2 caOff = centered * r2 * 0.0038;
+  vec3 hdr;
+  hdr.r = texture(uScene, vUV + caOff).r;
+  hdr.g = texture(uScene, vUV).g;
+  hdr.b = texture(uScene, vUV - caOff).b;
+
+  vec3 b1 = texture(uBloom1, vUV).rgb;
+  vec3 b2 = texture(uBloom2, vUV).rgb;
+  vec3 b3 = texture(uBloom3, vUV).rgb;
+  vec3 st = texture(uStreak, vUV).rgb;
+  hdr += b1 * 0.18 + b2 * 0.22 + b3 * 0.25 + st * vec3(0.11, 0.09, 0.15);
+
+  hdr *= 1.05;
+  vec3 col = acesFilm(hdr);
+  col = mix(col, col * col * (3.0 - 2.0 * col), 0.12);
+
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col *= mix(vec3(0.93, 0.98, 1.07), vec3(1.04, 1.00, 0.96), smoothstep(0.06, 0.65, lum));
+
+  float vig = 1.0 - smoothstep(0.22, 0.94, r2 * 1.40);
+  col *= mix(0.62, 1.0, vig);
+
+  col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
+
+  float grain = (hash12(gl_FragCoord.xy + fract(uTime * 17.31) * 517.0) - 0.5) * 0.024 * (1.0 - lum * 0.65);
+  col = clamp(col + grain, 0.0, 1.0);
+
+  outColor = vec4(col, 1.0);
+}
+`;
+
+// ============================================================================
+// 6. INSTANCED PARTICLE BUFFERS
+// ============================================================================
+function buildQuadBuffer() {
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5,-0.5, 0.5,-0.5, 0.5,0.5, -0.5,-0.5, 0.5,0.5, -0.5,0.5]), gl.STATIC_DRAW);
+  return b;
+}
+function buildStreakQuadBuffer() {
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5,0.0, 0.5,0.0, 0.5,1.0, -0.5,0.0, 0.5,1.0, -0.5,1.0]), gl.STATIC_DRAW);
+  return b;
+}
+
+function buildSteamVAO(quadVBO, emitters) {
+  const perEmitter = 15, total = emitters.length * perEmitter;
+  const origins = new Float32Array(total * 4), vels = new Float32Array(total * 4), cols = new Float32Array(total * 4);
+  let idx = 0;
+  for (const em of emitters) {
+    for (let k = 0; k < perEmitter; k++) {
+      origins[idx * 4 + 0] = em.x + rand(-0.14, 0.14);
+      origins[idx * 4 + 1] = em.y + rand(-0.06, 0.10);
+      origins[idx * 4 + 2] = em.z + rand(-0.18, 0.18);
+      origins[idx * 4 + 3] = k / perEmitter + rand(0, 0.05);
+
+      vels[idx * 4 + 0] = em.vx + rand(-0.07, 0.07);
+      vels[idx * 4 + 1] = em.vy + rand(-0.08, 0.14);
+      vels[idx * 4 + 2] = em.vz + rand(-0.07, 0.07);
+      vels[idx * 4 + 3] = em.scale * rand(0.75, 1.22);
+
+      cols[idx * 4 + 0] = em.r; cols[idx * 4 + 1] = em.g; cols[idx * 4 + 2] = em.b;
+      cols[idx * 4 + 3] = rand(4.2, 6.8);
+      idx++;
+    }
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, origins, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
+  const b2 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, vels, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(2, 1);
+  const b3 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b3); gl.bufferData(gl.ARRAY_BUFFER, cols, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(3, 1);
+  gl.bindVertexArray(null);
+  return { vao, count: total };
+}
+
+function buildHaloVAO(quadVBO, halos) {
+  const n = halos.length;
+  const posSize = new Float32Array(n * 4), colFlick = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const h = halos[i];
+    posSize[i * 4 + 0] = h.x; posSize[i * 4 + 1] = h.y; posSize[i * 4 + 2] = h.z; posSize[i * 4 + 3] = h.size * 2.0;
+    colFlick[i * 4 + 0] = h.r; colFlick[i * 4 + 1] = h.g; colFlick[i * 4 + 2] = h.b; colFlick[i * 4 + 3] = h.flicker;
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, posSize, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
+  const b2 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, colFlick, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(2, 1);
+  gl.bindVertexArray(null);
+  return { vao, count: n };
+}
+
+function buildRainVAO(streakVBO, count) {
+  const seeds = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    seeds[i * 4 + 0] = rand(0, 1); seeds[i * 4 + 1] = rand(0, 1);
+    seeds[i * 4 + 2] = rand(0, 1); seeds[i * 4 + 3] = rand(0, 1);
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, streakVBO); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
+  gl.bindVertexArray(null);
+  return { vao, count };
+}
+
+// ============================================================================
+// 7. INITIALIZE SCENE, SHADERS & FRAMEBUFFERS
+// ============================================================================
+const archTex = buildArchitectureAtlas();
+const asphaltTex = buildAsphaltTextures();
+const signAtlas = buildSignageAtlas();
+
+const alley = buildTokyoAlleyScene(signAtlas.rects);
+const skylineMesh = buildDistantSkylineMesh(signAtlas.rects);
+const groundMesh = buildGroundMesh();
+
+const quadVBO = buildQuadBuffer();
+const streakVBO = buildStreakQuadBuffer();
+const steamVAO = buildSteamVAO(quadVBO, alley.steamEmitters);
+const haloVAO = buildHaloVAO(quadVBO, alley.halos);
+const rainNearVAO   = buildRainVAO(streakVBO, 3600);
+const rainFarVAO    = buildRainVAO(streakVBO, 3800);
+const rainBokehVAO  = buildRainVAO(streakVBO, 340);
+const rainSplashVAO = buildRainVAO(streakVBO, 420);
+const emptyVAO = gl.createVertexArray();
+
+const progScene      = createProgram(SCENE_VS, SCENE_FS, 'Scene');
+const progGround     = createProgram(GROUND_VS, GROUND_FS, 'Ground');
+const progSky        = createProgram(SKY_VS, SKY_FS, 'Sky');
+const progSteam      = createProgram(STEAM_VS, STEAM_FS, 'Steam');
+const progHalo       = createProgram(HALO_VS, HALO_FS, 'Halo');
+const progRain       = createProgram(RAIN_VS, RAIN_FS, 'Rain');
+const progExtract    = createProgram(FULLSCREEN_VS, BLOOM_EXTRACT_FS, 'BloomExtract');
+const progBlur       = createProgram(FULLSCREEN_VS, BLUR_FS, 'Blur');
+const progAnamorphic = createProgram(FULLSCREEN_VS, ANAMORPHIC_FS, 'Anamorphic');
+const progComposite  = createProgram(FULLSCREEN_VS, COMPOSITE_FS, 'Composite');
+
+let W = 1280, H = 720;
+let fboMain, fboRefl;
+let fboBloom1A, fboBloom1B, fboBloom2A, fboBloom2B, fboBloom3A, fboBloom3B, fboStreak;
+
+function resize() {
+  const dpr = FIXED_TIME !== null ? 1 : Math.min(window.devicePixelRatio || 1, 1.75);
+  const nw = Math.max(320, Math.floor(window.innerWidth * dpr));
+  const nh = Math.max(180, Math.floor(window.innerHeight * dpr));
+  if (canvas.width === nw && canvas.height === nh && fboMain) return;
+  W = canvas.width = nw; H = canvas.height = nh;
+  [fboMain, fboRefl, fboBloom1A, fboBloom1B, fboBloom2A, fboBloom2B, fboBloom3A, fboBloom3B, fboStreak].forEach(destroyFBO);
+  fboMain = createFBO(W, H, { hdr: true, depthRB: true });
+  const rw = Math.max(256, Math.floor(W * 0.75)), rh = Math.max(144, Math.floor(H * 0.75));
+  fboRefl = createFBO(rw, rh, { hdr: true, depthRB: true });
+  const b1w = Math.max(64, W >> 1), b1h = Math.max(36, H >> 1);
+  const b2w = Math.max(32, W >> 2), b2h = Math.max(18, H >> 2);
+  const b3w = Math.max(16, W >> 3), b3h = Math.max(9,  H >> 3);
+  fboBloom1A = createFBO(b1w, b1h, { hdr: true }); fboBloom1B = createFBO(b1w, b1h, { hdr: true });
+  fboBloom2A = createFBO(b2w, b2h, { hdr: true }); fboBloom2B = createFBO(b2w, b2h, { hdr: true });
+  fboBloom3A = createFBO(b3w, b3h, { hdr: true }); fboBloom3B = createFBO(b3w, b3h, { hdr: true });
+  fboStreak  = createFBO(b2w, b2h, { hdr: true });
+}
+window.addEventListener('resize', () => {
+  resize();
+  if (FIXED_TIME !== null) { render(FIXED_TIME); gl.finish(); }
+});
+resize();
+
+// ============================================================================
+// 8. DYNAMIC LIGHT SELECTION, CINEMATIC HUMAN WALK CAMERA & AUDIO
+// ============================================================================
+const lightPosArr = new Float32Array(MAX_LIGHTS * 4);
+const lightColArr = new Float32Array(MAX_LIGHTS * 4);
+
+function evalLightFlickerJS(id, t) {
+  if (id < 0.01) return 1.0;
+  const ft = t * 9.0 + id * 17.3;
+  const s = Math.sin(Math.floor(ft) * 127.1 + id * 311.7) * 43758.5453;
+  const n = s - Math.floor(s);
+  return (0.94 + 0.06 * Math.sin(t * 52.0 + id * 5.0)) * ((n > 0.94) ? 0.25 : (n > 0.89 ? 0.66 : 1.0));
+}
+
+function updateActiveLights(camZ, t, zOffsets) {
+  const candidates = [];
+  for (const zOff of zOffsets) {
+    for (const lt of alley.lights) {
+      const wz = lt.z + zOff;
+      if (wz < camZ + 12.0 && wz > camZ - 54.0) {
+        const dz = wz - (camZ - 10.5);
+        candidates.push({ lt, wz, score: dz * dz + lt.x * lt.x * 0.5 });
+      }
+    }
+  }
+  candidates.sort((a, b) => a.score - b.score);
+  const count = Math.min(MAX_LIGHTS, candidates.length);
+  for (let i = 0; i < MAX_LIGHTS; i++) {
+    if (i < count) {
+      const { lt, wz } = candidates[i];
+      const f = evalLightFlickerJS(lt.flicker, t);
+      lightPosArr[i * 4 + 0] = lt.x;
+      lightPosArr[i * 4 + 1] = lt.y;
+      lightPosArr[i * 4 + 2] = wz;
+      lightPosArr[i * 4 + 3] = lt.radius;
+      lightColArr[i * 4 + 0] = lt.r * f * 2.30;
+      lightColArr[i * 4 + 1] = lt.g * f * 2.30;
+      lightColArr[i * 4 + 2] = lt.b * f * 2.30;
+      lightColArr[i * 4 + 3] = 1.0;
+    } else {
+      lightPosArr[i * 4 + 3] = 0.0;
+      lightColArr[i * 4 + 0] = lightColArr[i * 4 + 1] = lightColArr[i * 4 + 2] = 0.0;
+    }
+  }
+}
+
+let userYaw = 0, userPitch = 0, targetYaw = 0, targetPitch = 0;
+let isDragging = false, lastMX = 0, lastMY = 0, paused = false;
+
+canvas.addEventListener('pointerdown', e => { isDragging = true; lastMX = e.clientX; lastMY = e.clientY; });
+window.addEventListener('pointerup', () => { isDragging = false; });
+window.addEventListener('pointermove', e => {
+  if (!isDragging) return;
+  targetYaw = clamp(targetYaw - (e.clientX - lastMX) * 0.0032, -0.78, 0.78);
+  targetPitch = clamp(targetPitch - (e.clientY - lastMY) * 0.0028, -0.50, 0.54);
+  lastMX = e.clientX; lastMY = e.clientY;
+});
+canvas.addEventListener('dblclick', () => { targetYaw = 0; targetPitch = 0; });
+
+let audioCtx = null, audioGain = null, audioOn = false;
+function toggleAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audioCtx = new AC();
+    const master = audioCtx.createGain();
+    master.gain.value = 0.0; master.connect(audioCtx.destination);
+    audioGain = master;
+
+    const sr = audioCtx.sampleRate, len = sr * 4;
+    const buf = audioCtx.createBuffer(2, len, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      let b0 = 0, b1 = 0, b2 = 0;
+      for (let i = 0; i < len; i++) {
+        const w = Math.random() * 2 - 1;
+        b0 = 0.997 * b0 + w * 0.029; b1 = 0.985 * b1 + w * 0.032; b2 = 0.950 * b2 + w * 0.048;
+        d[i] = (b0 + b1 + b2 + w * 0.14) * 0.35;
+      }
+    }
+    const rainSrc = audioCtx.createBufferSource(); rainSrc.buffer = buf; rainSrc.loop = true;
+    const rainBP = audioCtx.createBiquadFilter(); rainBP.type = 'bandpass'; rainBP.frequency.value = 2500; rainBP.Q.value = 0.55;
+    rainSrc.connect(rainBP); rainBP.connect(master); rainSrc.start();
+
+    const humSrc = audioCtx.createBufferSource(); humSrc.buffer = buf; humSrc.loop = true;
+    const humLP = audioCtx.createBiquadFilter(); humLP.type = 'lowpass'; humLP.frequency.value = 135;
+    const humG = audioCtx.createGain(); humG.gain.value = 0.85;
+    humSrc.connect(humLP); humLP.connect(humG); humG.connect(master); humSrc.start();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  audioOn = !audioOn;
+  audioGain.gain.setTargetAtTime(audioOn ? 0.42 : 0.0, audioCtx.currentTime, 0.35);
+}
+
+const hudEl = document.getElementById('hud');
+if (SHOW_HUD_INIT) hudEl.classList.remove('hidden');
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); paused = !paused; }
+  else if (e.key === 'm' || e.key === 'M') toggleAudio();
+  else if (e.key === 'h' || e.key === 'H') hudEl.classList.toggle('hidden');
+  else if (e.key === 'r' || e.key === 'R') { targetYaw = 0; targetPitch = 0; }
+});
+
+// Grounded, Natural Cinematic First-Person Human Walk
+function computeCamera(t) {
+  const camZ = -t * WALK_SPEED;
+  const stepFreq = 1.54 * WALK_SPEED;
+  const stepPhase = t * Math.PI * stepFreq;
+
+  // Natural asymmetric heel-strike vertical gait cadence
+  const s = Math.sin(stepPhase);
+  const verticalBob = (Math.abs(s) - 0.56) * 0.040 + Math.sin(stepPhase * 2.0 - 0.65) * 0.008;
+  // Footfall left/right lateral weight transfer
+  const lateralBob = Math.sin(stepPhase * 0.5) * 0.038;
+  // Gentle organic meander down the wet narrow alley
+  const pathX = Math.sin(t * 0.17 + 0.3) * 0.28 + Math.sin(t * 0.41 + 1.5) * 0.09;
+
+  const eyeX = (OVERRIDE_X !== null) ? OVERRIDE_X : (pathX + lateralBob);
+  const eyeY = (OVERRIDE_Y !== null) ? OVERRIDE_Y : (1.56 + verticalBob);
+
+  // Expressive curious human gaze: subtle lingering pans toward glowing shopfronts,
+  // natural upward glance when approaching the glowing overhead Tokyo arches (z = -22.5, -58.5),
+  // and gentle heel-strike micro-nod!
+  const modZ = ((-camZ) % LOOP_LEN + LOOP_LEN) % LOOP_LEN; // distance walked within [0..72]
+  const dArch1 = Math.min(Math.abs(modZ - 15.0), LOOP_LEN - Math.abs(modZ - 15.0));
+  const dArch2 = Math.min(Math.abs(modZ - 51.0), LOOP_LEN - Math.abs(modZ - 51.0));
+  const archLook = (Math.exp(-(dArch1 * dArch1) / 18.0) + Math.exp(-(dArch2 * dArch2) / 18.0)) * 0.085;
+
+  const autoYaw = Math.sin(t * 0.25 + 0.4) * 0.135 + Math.sin(t * 0.56 + 1.1) * 0.042;
+  const heelNod = -Math.pow(Math.max(0, -Math.cos(stepPhase)), 3.0) * 0.010;
+  const autoPitch = 0.020 + archLook + Math.sin(t * 0.20 - 0.65) * 0.072 + heelNod;
+
+  userYaw = lerp(userYaw, targetYaw, 0.08);
+  userPitch = lerp(userPitch, targetPitch, 0.08);
+
+  const yaw = (OVERRIDE_YAW !== null) ? OVERRIDE_YAW : (autoYaw + userYaw);
+  const pitch = (OVERRIDE_PITCH !== null) ? OVERRIDE_PITCH : (autoPitch + userPitch);
+  const roll = -Math.sin(stepPhase * 0.5) * 0.011 + Math.sin(t * 0.33) * 0.004;
+
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const fwd = [sy * cp, sp, -cy * cp];
+  const rawUp = [Math.sin(roll), Math.cos(roll), 0];
+
+  const eye = [eyeX, eyeY, camZ];
+  const target = [eyeX + fwd[0], eyeY + fwd[1], camZ + fwd[2]];
+  const view = mat4Create();
+  mat4LookAt(view, eye, target, rawUp);
+
+  return { eye, target, view, right: [view[0], view[4], view[8]], up: [view[1], view[5], view[9]] };
+}
+
+// ============================================================================
+// 9. RENDER PIPELINE
+// ============================================================================
+const matProj = mat4Create(), matVP = mat4Create(), matReflVP = mat4Create(), matInvVP = mat4Create();
+
+function bindSceneTextures() {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, archTex.albedo);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, archTex.rma);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, archTex.normal);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, signAtlas.albedo);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, signAtlas.emissive);
+}
+
+function drawAlleyGeometry(vpMatrix, camPos, lightCamPos, t, zOffsets, isReflection) {
+  gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+  gl.useProgram(progSky.prog);
+  invertMat4(matInvVP, vpMatrix);
+  gl.uniformMatrix4fv(progSky.u.uInvViewProj, false, matInvVP);
+  gl.uniform3fv(progSky.u.uCamPos, isReflection ? [camPos[0], -camPos[1], camPos[2]] : camPos);
+  gl.uniform1f(progSky.u.uTime, t);
+  gl.bindVertexArray(emptyVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+  gl.frontFace(isReflection ? gl.CW : gl.CCW);
+
+  gl.useProgram(progScene.prog);
+  bindSceneTextures();
+  gl.uniform1i(progScene.u.uArchAlbedo, 0);
+  gl.uniform1i(progScene.u.uArchRMA, 1);
+  gl.uniform1i(progScene.u.uArchNormal, 2);
+  gl.uniform1i(progScene.u.uSignAlbedo, 3);
+  gl.uniform1i(progScene.u.uSignEmissive, 4);
+  gl.uniformMatrix4fv(progScene.u.uViewProj, false, vpMatrix);
+  gl.uniform3fv(progScene.u.uCamPos, camPos);
+  gl.uniform3fv(progScene.u.uLightCamPos, lightCamPos);
+  gl.uniform1f(progScene.u.uTime, t);
+  gl.uniform1f(progScene.u.uClipY, isReflection ? 1.0 : 0.0);
+  gl.uniform4fv(progScene.u.uLightPos, lightPosArr);
+  gl.uniform4fv(progScene.u.uLightCol, lightColArr);
+
+  gl.bindVertexArray(alley.mesh.vao);
+  for (const zOff of zOffsets) {
+    gl.uniform1f(progScene.u.uZOffset, zOff);
+    gl.drawElements(gl.TRIANGLES, alley.mesh.count, alley.mesh.indexType, 0);
+  }
+  gl.bindVertexArray(skylineMesh.vao);
+  gl.uniform1f(progScene.u.uZOffset, camPos[2]);
+  gl.drawElements(gl.TRIANGLES, skylineMesh.count, skylineMesh.indexType, 0);
+}
+
+function drawSteamAndHalos(vpMatrix, camRight, camUp, camPos, t, zOffsets, isReflection) {
+  gl.frontFace(gl.CCW); gl.disable(gl.CULL_FACE);
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(false);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+
+  gl.useProgram(progHalo.prog);
+  gl.uniformMatrix4fv(progHalo.u.uViewProj, false, vpMatrix);
+  gl.uniform3fv(progHalo.u.uCamRight, camRight);
+  gl.uniform3fv(progHalo.u.uCamUp, camUp);
+  gl.uniform3fv(progHalo.u.uCamPos, camPos);
+  gl.uniform1f(progHalo.u.uTime, t);
+  gl.bindVertexArray(haloVAO.vao);
+  for (const zOff of zOffsets) {
+    gl.uniform1f(progHalo.u.uZOffset, zOff);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, haloVAO.count);
+  }
+
+  gl.useProgram(progSteam.prog);
+  gl.uniformMatrix4fv(progSteam.u.uViewProj, false, vpMatrix);
+  gl.uniform3fv(progSteam.u.uCamRight, camRight);
+  gl.uniform3fv(progSteam.u.uCamUp, camUp);
+  gl.uniform3fv(progSteam.u.uCamPos, camPos);
+  gl.uniform1f(progSteam.u.uTime, t);
+  gl.uniform1f(progSteam.u.uClipY, isReflection ? 1.0 : 0.0);
+  gl.uniform4fv(progSteam.u.uLightPos, lightPosArr);
+  gl.uniform4fv(progSteam.u.uLightCol, lightColArr);
+  gl.bindVertexArray(steamVAO.vao);
+  for (const zOff of zOffsets) {
+    gl.uniform1f(progSteam.u.uZOffset, zOff);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, steamVAO.count);
+  }
+}
+
+function drawFullscreenQuad() {
+  gl.bindVertexArray(emptyVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function runBlurPass(srcFBO, tmpFBO, dstFBO) {
+  gl.useProgram(progBlur.prog);
+  gl.uniform1i(progBlur.u.uTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, tmpFBO.fbo);
+  gl.viewport(0, 0, tmpFBO.w, tmpFBO.h);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcFBO.color);
+  gl.uniform2f(progBlur.u.uDir, 1.0 / srcFBO.w, 0.0);
+  drawFullscreenQuad();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO.fbo);
+  gl.viewport(0, 0, dstFBO.w, dstFBO.h);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tmpFBO.color);
+  gl.uniform2f(progBlur.u.uDir, 0.0, 1.0 / tmpFBO.h);
+  drawFullscreenQuad();
+}
+
+function render(t) {
+  const NEAR = 0.14, FAR = 200.0;
+  const cam = computeCamera(t);
+  mat4Perspective(matProj, 53 * Math.PI / 180, W / H, NEAR, FAR);
+  mat4Mul(matVP, matProj, cam.view);
+  mat4ScaleYNeg(matReflVP, matVP);
+
+  const baseLoop = Math.floor((cam.eye[2] + 10.0) / LOOP_LEN) * LOOP_LEN;
+  const zOffsets = [baseLoop + LOOP_LEN, baseLoop, baseLoop - LOOP_LEN];
+  updateActiveLights(cam.eye[2], t, zOffsets);
+
+  // PASS 1: PLANAR MIRROR REFLECTION FBO (includes buildings, neon signs, lanterns, arch, halos AND glowing steam!)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboRefl.fbo);
+  gl.viewport(0, 0, fboRefl.w, fboRefl.h);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawAlleyGeometry(matReflVP, cam.eye, [cam.eye[0], -cam.eye[1], cam.eye[2]], t, zOffsets, true);
+  drawSteamAndHalos(matReflVP, cam.right, [cam.up[0], -cam.up[1], cam.up[2]], cam.eye, t, zOffsets, true);
+  gl.disable(gl.BLEND); gl.depthMask(true);
+
+  // PASS 2: MAIN SCENE HDR FBO
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMain.fbo);
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawAlleyGeometry(matVP, cam.eye, cam.eye, t, zOffsets, false);
+
+  // Wet Reflective Asphalt Pavement
+  gl.frontFace(gl.CCW); gl.disable(gl.CULL_FACE);
+  gl.useProgram(progGround.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboRefl.color);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, asphaltTex.data);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, asphaltTex.normal);
+  gl.uniform1i(progGround.u.uReflectionTex, 0);
+  gl.uniform1i(progGround.u.uAsphaltData, 1);
+  gl.uniform1i(progGround.u.uAsphaltNormal, 2);
+  gl.uniformMatrix4fv(progGround.u.uViewProj, false, matVP);
+  gl.uniform1f(progGround.u.uCamZ, cam.eye[2]);
+  gl.uniform2f(progGround.u.uResolution, W, H);
+  gl.uniform3fv(progGround.u.uCamPos, cam.eye);
+  gl.uniform1f(progGround.u.uTime, t);
+  gl.uniform4fv(progGround.u.uLightPos, lightPosArr);
+  gl.uniform4fv(progGround.u.uLightCol, lightColArr);
+  gl.bindVertexArray(groundMesh.vao);
+  gl.drawElements(gl.TRIANGLES, groundMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  // PASS 3: ATMOSPHERIC HALOS, RISING STEAM & 3-LAYER FALLING RAIN + MICRO-SPLASHES
+  drawSteamAndHalos(matVP, cam.right, cam.up, cam.eye, t, zOffsets, false);
+
+  gl.useProgram(progRain.prog);
+  gl.uniformMatrix4fv(progRain.u.uViewProj, false, matVP);
+  gl.uniform3fv(progRain.u.uCamPos, cam.eye);
+  gl.uniform3fv(progRain.u.uCamRight, cam.right);
+  gl.uniform1f(progRain.u.uTime, t);
+  gl.uniform4fv(progRain.u.uLightPos, lightPosArr);
+  gl.uniform4fv(progRain.u.uLightCol, lightColArr);
+
+  gl.uniform1f(progRain.u.uMode, 0.0);
+  gl.bindVertexArray(rainNearVAO.vao);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, rainNearVAO.count);
+
+  gl.uniform1f(progRain.u.uMode, 1.0);
+  gl.bindVertexArray(rainFarVAO.vao);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, rainFarVAO.count);
+
+  gl.uniform1f(progRain.u.uMode, 3.0);
+  gl.bindVertexArray(rainBokehVAO.vao);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, rainBokehVAO.count);
+
+  gl.uniform1f(progRain.u.uMode, 2.0);
+  gl.bindVertexArray(rainSplashVAO.vao);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, rainSplashVAO.count);
+
+  gl.disable(gl.BLEND); gl.depthMask(true); gl.disable(gl.DEPTH_TEST);
+
+  // PASS 4: SELECTIVE HDR BLOOM & ANAMORPHIC LENS STREAK
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboBloom1A.fbo);
+  gl.viewport(0, 0, fboBloom1A.w, fboBloom1A.h);
+  gl.useProgram(progExtract.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboMain.color);
+  gl.uniform1i(progExtract.u.uTex, 0);
+  gl.uniform1f(progExtract.u.uThreshold, 1.04);
+  gl.uniform1f(progExtract.u.uKnee, 0.50);
+  drawFullscreenQuad();
+
+  runBlurPass(fboBloom1A, fboBloom1B, fboBloom1A);
+  runBlurPass(fboBloom1A, fboBloom2B, fboBloom2A);
+  runBlurPass(fboBloom2A, fboBloom2B, fboBloom2A);
+  runBlurPass(fboBloom2A, fboBloom3B, fboBloom3A);
+  runBlurPass(fboBloom3A, fboBloom3B, fboBloom3A);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboStreak.fbo);
+  gl.viewport(0, 0, fboStreak.w, fboStreak.h);
+  gl.useProgram(progAnamorphic.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboBloom2A.color);
+  gl.uniform1i(progAnamorphic.u.uTex, 0);
+  gl.uniform2f(progAnamorphic.u.uTexel, 1.0 / fboStreak.w, 1.0 / fboStreak.h);
+  drawFullscreenQuad();
+
+  // PASS 5: FINAL ACES FILMIC COMPOSITE
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(progComposite.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboMain.color);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fboBloom1A.color);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fboBloom2A.color);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, fboBloom3A.color);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, fboStreak.color);
+  gl.uniform1i(progComposite.u.uScene, 0);
+  gl.uniform1i(progComposite.u.uBloom1, 1);
+  gl.uniform1i(progComposite.u.uBloom2, 2);
+  gl.uniform1i(progComposite.u.uBloom3, 3);
+  gl.uniform1i(progComposite.u.uStreak, 4);
+  gl.uniform1f(progComposite.u.uTime, t);
+  gl.uniform2f(progComposite.u.uResolution, W, H);
+  drawFullscreenQuad();
+}
+
+// ============================================================================
+// 10. ANIMATION LOOP / DETERMINISTIC SNAPSHOT ENTRYPOINT
+// ============================================================================
+if (FIXED_TIME !== null) {
+  const drawFixed = () => {
+    resize();
+    render(FIXED_TIME);
+    gl.finish();
+    window.__RENDER_DONE = true;
+  };
+  drawFixed();
+  requestAnimationFrame(drawFixed);
+} else {
+  let simTime = 0.0;
+  let lastTS = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - lastTS) * 0.001);
+    lastTS = now;
+    if (!paused) simTime += dt;
+    resize();
+    render(simTime);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+})();
+</script>
+</body>
+</html>

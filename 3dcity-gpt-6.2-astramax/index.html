@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#1c2526" />
+    <title>Cityform — Procedural city explorer</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231c2526'/%3E%3Cpath d='m5 16 7-4v12l-7-4zm8-7 7-4v23l-7-4zm8 6 6-4v13l-6 4z' fill='%23f68e54'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./style.css" />
+    <script type="importmap">
+      { "imports": { "three": "./vendor/three/three.module.min.js" } }
+    </script>
+  </head>
+  <body>
+    <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <symbol id="i-sun" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" />
+      </symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24">
+        <path d="M20.4 14.5a8.7 8.7 0 0 1-11-11 8.7 8.7 0 1 0 11 11Z" />
+      </symbol>
+      <symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5M9 20H4v-5" /></symbol>
+      <symbol id="i-collapse" viewBox="0 0 24 24"><path d="m6 14.5 6-6 6 6" /></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="8" y="8" width="12" height="13" rx="2" />
+        <path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m4.5 12.5 5 5 10-11" /></symbol>
+      <symbol id="i-regen" viewBox="0 0 24 24">
+        <path d="M20 5v5h-5M4 19v-5h5" />
+        <path d="M5.4 8.4A7.4 7.4 0 0 1 18 6.3l2 3.1M4 14.6l2 3.1a7.4 7.4 0 0 0 12.6-2.1" />
+      </symbol>
+      <symbol id="i-orbit" viewBox="0 0 24 24">
+        <ellipse cx="12" cy="12" rx="10" ry="4.7" transform="rotate(-32 12 12)" />
+        <circle cx="12" cy="12" r="2.2" />
+        <path d="M7.2 6.1a7 7 0 0 1 11.3 6.4M5.5 11.5a7 7 0 0 0 11.3 6.4" />
+      </symbol>
+      <symbol id="i-fly" viewBox="0 0 24 24"><path d="m21 3-7 18-3.4-7.6L3 10zM10.6 13.4 21 3" /></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14" /></symbol>
+      <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8M6 9v11h12V9m-8 11v-6h4v6" /></symbol>
+      <symbol id="i-map" viewBox="0 0 24 24">
+        <path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3zM9 3v15m6-12v15" />
+      </symbol>
+      <symbol id="i-keyboard" viewBox="0 0 24 24">
+        <rect x="2.5" y="5.5" width="19" height="13" rx="2.5" />
+        <path d="M6 9.5h.1m3.9 0h.1m3.9 0h.1m3.9 0h.1M6 13h.1m3.9 2h4m3.9-2h.1" />
+      </symbol>
+      <symbol id="i-mouse" viewBox="0 0 24 24">
+        <rect x="6" y="2.5" width="12" height="19" rx="6" />
+        <path d="M12 6v3.5" />
+      </symbol>
+      <symbol id="i-up" viewBox="0 0 24 24"><path d="m5 14 7-7 7 7" /></symbol>
+    </svg>
+    <header class="topbar">
+      <div class="identity">
+        <svg class="brand-mark" viewBox="0 0 38 38" aria-hidden="true">
+          <g fill="currentColor">
+            <path d="m2 18 8-4.5v17L2 26z" />
+            <path d="m12 11 8-4.5v29L12 31z" />
+            <path d="m22 5.5 6-3.5v19l-6 3.5zM22 27l13-7.5v8L22 35z" />
+          </g>
+        </svg>
+        <span class="wordmark">Cityform</span><span class="header-rule"></span
+        ><span class="descriptor">City explorer</span>
+      </div>
+      <div class="header-tools">
+        <div class="day-switch" role="group" aria-label="Time of day">
+          <button id="day" aria-pressed="true">
+            <svg><use href="#i-sun" /></svg><span>Day</span>
+          </button>
+          <button id="night" aria-pressed="false">
+            <svg><use href="#i-moon" /></svg><span>Night</span>
+          </button>
+        </div>
+        <span class="header-rule"></span>
+        <button
+          class="icon-button fullscreen"
+          id="fullscreen"
+          title="Toggle fullscreen"
+          aria-label="Toggle fullscreen"
+        >
+          <svg><use href="#i-full" /></svg>
+        </button>
+      </div>
+    </header>
+    <main id="viewport" aria-label="Interactive 3D city explorer">
+      <canvas
+        id="city"
+        tabindex="0"
+        aria-label="3D city. Drag to orbit, right-drag to pan, and scroll to zoom."
+      ></canvas>
+      <section class="overview" id="overview" aria-label="City overview">
+        <button
+          id="overview-toggle"
+          class="card-heading"
+          aria-expanded="true"
+          aria-controls="overview-body"
+        >
+          <span class="eyebrow"><span class="section-mark"></span>City overview</span>
+          <svg class="fold"><use href="#i-collapse" /></svg>
+        </button>
+        <h1 id="city-name">Port Alder</h1>
+        <span class="compact-seed" id="compact-seed"></span>
+        <div id="overview-body">
+          <dl class="stats">
+            <div>
+              <dt>Buildings</dt>
+              <dd id="building-count">—</dd>
+            </div>
+            <div>
+              <dt>Parks</dt>
+              <dd id="park-count">—</dd>
+            </div>
+            <div>
+              <dt>Vehicles</dt>
+              <dd id="vehicle-count">—</dd>
+            </div>
+          </dl>
+          <form id="seed-form" autocomplete="off">
+            <label for="seed">Generation seed</label>
+            <div class="seed-input">
+              <span aria-hidden="true">#</span
+              ><input
+                id="seed"
+                type="text"
+                maxlength="32"
+                spellcheck="false"
+                value="42861"
+                aria-label="Generation seed"
+              />
+              <button
+                type="button"
+                id="copy-seed"
+                class="icon-button"
+                aria-label="Copy seed"
+                title="Copy seed"
+              >
+                <svg><use href="#i-copy" /></svg>
+              </button>
+            </div>
+            <button type="submit" class="generate" id="generate">
+              <svg><use href="#i-regen" /></svg><span>Regenerate city</span>
+            </button>
+          </form>
+        </div>
+      </section>
+      <div class="view-tools" role="group" aria-label="View controls">
+        <button class="icon-button" id="zoom-in" title="Zoom in" aria-label="Zoom in">
+          <svg><use href="#i-plus" /></svg>
+        </button>
+        <button class="icon-button" id="zoom-out" title="Zoom out" aria-label="Zoom out">
+          <svg><use href="#i-minus" /></svg>
+        </button>
+        <button class="icon-button" id="home" title="Reset view" aria-label="Reset view">
+          <svg><use href="#i-home" /></svg>
+        </button>
+      </div>
+      <aside id="map-card" class="map-card">
+        <button id="map-toggle" class="map-label" aria-controls="minimap" aria-expanded="true">
+          <span
+            ><svg><use href="#i-map" /></svg>City map</span
+          ><svg class="fold"><use href="#i-collapse" /></svg>
+        </button>
+        <canvas
+          id="minimap"
+          width="380"
+          height="244"
+          tabindex="0"
+          role="button"
+          aria-label="City map. Click to move the camera here, or press Enter to center the view."
+        ></canvas>
+      </aside>
+      <div class="orientation" aria-hidden="true">
+        <svg id="compass" viewBox="0 0 42 42">
+          <circle cx="21" cy="21" r="19" />
+          <g id="needle">
+            <path d="M21 6.8 25.5 24 21 21.7z" fill="#f59053" />
+            <path d="M21 6.8 16.5 24 21 21.7z" fill="#ffc598" />
+            <path d="M21 35.2 16.5 24l4.5-2.3 4.5 2.3z" fill="#c8d1c9" />
+          </g>
+        </svg>
+        <div class="scale"><span id="scale-label">50 m</span><i id="scale-line"></i></div>
+      </div>
+      <div class="navigation">
+        <div class="nav-bar" role="group" aria-label="Camera mode">
+          <button id="orbit" class="mode" aria-pressed="true">
+            <svg><use href="#i-orbit" /></svg>Orbit
+          </button>
+          <button id="fly" class="mode" aria-pressed="false">
+            <svg><use href="#i-fly" /></svg>Fly
+          </button>
+          <span class="tool-rule"></span>
+          <button
+            id="help"
+            class="icon-button"
+            title="Camera controls"
+            aria-label="Camera controls"
+            aria-expanded="false"
+            aria-controls="help-panel"
+          >
+            <svg><use href="#i-keyboard" /></svg>
+          </button>
+        </div>
+      </div>
+      <div id="help-panel" class="help-panel" hidden>
+        <strong>Camera controls</strong>
+        <dl id="key-guide"></dl>
+      </div>
+      <div class="touch-flight" id="touch-flight" hidden aria-label="Flight controls">
+        <button data-key="KeyW" aria-label="Fly forward">↑</button
+        ><button data-key="KeyA" aria-label="Fly left">←</button
+        ><button data-key="KeyS" aria-label="Fly backward">↓</button
+        ><button data-key="KeyD" aria-label="Fly right">→</button
+        ><button data-key="KeyE" aria-label="Ascend">＋</button
+        ><button data-key="KeyQ" aria-label="Descend">−</button>
+      </div>
+      <div id="toast" role="status" class="toast" hidden></div>
+      <div id="loading" role="status">
+        <div class="loader"></div>
+        <span>Generating city…</span>
+      </div>
+    </main>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

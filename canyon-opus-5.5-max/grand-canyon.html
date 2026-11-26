@@ -1,0 +1,2081 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Grand Canyon · Drone Flight</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center;
+       font-family:"Avenir Next","Helvetica Neue",Helvetica,Arial,sans-serif;color:#f2ede6;user-select:none;-webkit-user-select:none}
+  #stage{position:relative;overflow:hidden;background:#000}
+  #gl{display:block;width:100%;height:100%;cursor:grab;touch-action:none}
+  #gl.drag{cursor:grabbing}
+  .ov{position:absolute;pointer-events:none;transition:opacity 1.2s ease}
+  #title{left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;opacity:0}
+  #title h1{margin:0;font-weight:200;font-size:clamp(22px,4.2vw,64px);letter-spacing:.62em;text-indent:.62em;text-shadow:0 2px 24px rgba(0,0,0,.35)}
+  #title p{margin:.9em 0 0;font-weight:300;font-size:clamp(10px,1.05vw,15px);letter-spacing:.45em;text-indent:.45em;opacity:.8;text-transform:uppercase}
+  #hint{left:0;right:0;bottom:14px;text-align:center;font-size:11px;letter-spacing:.14em;opacity:0;color:rgba(255,255,255,.72);text-shadow:0 1px 6px rgba(0,0,0,.6)}
+  #hint b{font-weight:600;color:#fff}
+  #bar{left:0;bottom:0;height:2px;width:0;background:rgba(255,255,255,.55);opacity:0}
+  #load{left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;font-size:12px;letter-spacing:.3em;text-transform:uppercase;color:rgba(255,255,255,.7)}
+  #load .ln{width:180px;height:1px;margin:14px auto 0;background:rgba(255,255,255,.15);overflow:hidden}
+  #load .ln i{display:block;height:100%;width:0;background:rgba(255,255,255,.8);transition:width .25s ease}
+  #err{left:8%;right:8%;top:40%;text-align:center;font-size:14px;line-height:1.6;color:#ffd9c9;display:none}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div id="title" class="ov"><h1>GRAND CANYON</h1><p>Colorado River · Arizona</p></div>
+  <div id="hint" class="ov"><b>drag</b> look &nbsp;·&nbsp; <b>space</b> pause &nbsp;·&nbsp; <b>← →</b> seek &nbsp;·&nbsp; <b>S</b> sound &nbsp;·&nbsp; <b>F</b> fullscreen &nbsp;·&nbsp; <b>L</b> letterbox &nbsp;·&nbsp; <b>H</b> hide</div>
+  <div id="bar" class="ov"></div>
+  <div id="load" class="ov">Generating terrain<div class="ln"><i id="loadbar"></i></div></div>
+  <div id="err" class="ov"></div>
+</div>
+<script>
+(() => {
+'use strict';
+
+/* ============================================================================
+   Grand Canyon drone flight
+   Everything is procedural: an erosion-distance field (river + side canyons +
+   buttes) is generated on the GPU, mapped through a stratigraphic cliff/slope
+   profile, then ray marched with precomputed sun-shadow heights, sky
+   visibility, a single-scattering sky, volumetric haze and a reflective river.
+   ========================================================================== */
+
+const Q = new URLSearchParams(location.hash.replace(/^#/, ''));
+const STILL = Q.has('still');
+const $ = id => document.getElementById(id);
+const stage = $('stage'), canvas = $('gl');
+
+function fail(msg) {
+  console.error('FAIL: ' + msg);
+  const e = $('err'); e.style.display = 'block'; e.style.opacity = 1; e.textContent = msg;
+  $('load').style.opacity = 0;
+  window.__error = msg;
+}
+
+const gl = canvas.getContext('webgl2', {antialias: false, alpha: false, depth: false, stencil: false,
+  premultipliedAlpha: false, preserveDrawingBuffer: STILL, powerPreference: 'high-performance'});
+if (!gl) { fail('This experience needs WebGL 2, which is not available in this browser.'); return; }
+if (!gl.getExtension('EXT_color_buffer_float')) { fail('This browser cannot render to floating point textures (EXT_color_buffer_float).'); return; }
+const FLOAT_LINEAR = !Q.has('nolinear') && !!gl.getExtension('OES_texture_float_linear');
+
+/* ---------------------------------------------------------------- settings */
+const COARSE = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+const FIELD_N = +(Q.get('field') || (COARSE ? 1024 : 2048));   // erosion field resolution
+const WORLD_SIZE = 40000;                         // metres covered by the field
+const WORLD_C = [0, 0];                           // world centre (x, z)
+const DURATION = 126;                             // seconds per flight loop
+const SUN_EL = 11.5 * Math.PI / 180;              // sun elevation
+const SUN_AZ = 240 * Math.PI / 180;               // bearing of the sun (+z is north, +x is east): WSW
+const HAZE = 1.2;                                 // Mie turbidity multiplier near the ground
+const SKY_HAZE = 1.9;                             // aerosol load used for the sky dome and sun colour
+const CANYON_HAZE = 0.35e-5;                       // extra low-level haze inside the canyon
+
+/* River centreline x = sum A*sin(z*2pi/L + P) */
+const RIVER = {A: [1550, 520, 140], L: [17000, 7300, 3100], P: [0.3, 2.1, 4.0]};
+const RF = RIVER.L.map(l => 2 * Math.PI / l);
+function riverX(z) { let s = 0; for (let i = 0; i < 3; i++) s += RIVER.A[i] * Math.sin(z * RF[i] + RIVER.P[i]); return s; }
+function riverXd(z) { let s = 0; for (let i = 0; i < 3; i++) s += RIVER.A[i] * RF[i] * Math.cos(z * RF[i] + RIVER.P[i]); return s; }
+
+/* Stratigraphic profile: [E0, E1, rise, k]. E is horizontal distance from the
+   nearest drainage; cliffs are short in E and tall, slopes are long and low.
+   k bends a segment into a concave bench (0 = straight ramp). */
+const PROFILE_BASE = -9;
+const PROFILE = [
+  [0,    45,    8, 0.0],   // river bed
+  [45,   75,    7, 0.6],   // banks and beaches
+  [75,   200, 240, 0.0],   // inner gorge, Vishnu schist
+  [200,  320, 120, 0.1],
+  [320,  345,  80, 0.0],   // Tapeats sandstone cliff
+  [345, 1000,  85, 0.9],   // Tonto platform (Bright Angel shale)
+  [1000,1050,  75, 0.0],   // Muav limestone
+  [1050,1105, 175, 0.0],   // Redwall limestone cliff
+  [1105,1250,  50, 0.45],  // Supai group: slopes and ledges
+  [1250,1272,  38, 0.0],
+  [1272,1420,  45, 0.45],
+  [1420,1442,  40, 0.0],
+  [1442,1580,  45, 0.45],
+  [1580,1602,  35, 0.0],
+  [1602,1850,  22, 0.3],   // Esplanade-like bench
+  [1850,2160, 100, 0.5],   // Hermit shale slope
+  [2160,2200, 110, 0.0],   // Coconino sandstone cliff
+  [2200,2370,  70, 0.4],   // Toroweap slope
+  [2370,2410,  90, 0.0],   // Kaibab limestone rim
+];
+const RIM_E = 2410, PLATEAU_SLOPE = 0.012, PLATEAU_RUN = 9000;
+function profileJS(E) {
+  let y = PROFILE_BASE;
+  for (const [a, b, h, k] of PROFILE) { const x = Math.min(1, Math.max(0, (E - a) / (b - a))); y += h * x * (1 - k + k * x); }
+  return y + PLATEAU_SLOPE * Math.min(PLATEAU_RUN, Math.max(0, E - RIM_E));
+}
+const fl = v => { let s = (+v).toPrecision(9).replace(/\.?0+$/, ''); if (!/[.e]/.test(s)) s += '.0'; return s; };
+const PROF_N = 4096, PROF_EMAX = 3072;
+function profileLUTGLSL() {
+  const yMax = profileJS(PROF_EMAX);
+  return `uniform sampler2D uProfile;
+vec2 profTex(float E){
+#ifdef MANUAL_BILINEAR
+  float x = max(E, 0.0)*${fl((PROF_N - 1) / PROF_EMAX)};
+  int i = int(x);
+  vec2 a = texelFetch(uProfile, ivec2(i, 0), 0).rg, b = texelFetch(uProfile, ivec2(min(i + 1, ${PROF_N - 1}), 0), 0).rg;
+  return mix(a, b, x - float(i));
+#else
+  return texture(uProfile, vec2(max(E, 0.0)*${fl((PROF_N - 1) / PROF_EMAX / PROF_N)} + ${fl(0.5 / PROF_N)}, 0.5)).rg;
+#endif
+}
+float profileY(float E){
+  if (E >= ${fl(PROF_EMAX)}) return ${fl(yMax)} + ${fl(PLATEAU_SLOPE)}*min(E - ${fl(PROF_EMAX)}, ${fl(PLATEAU_RUN - (PROF_EMAX - RIM_E))});
+  return profTex(E).r;
+}
+vec2 profileYD(float E){   // height and its slope dP/dE
+  if (E >= ${fl(PROF_EMAX)}) return vec2(profileY(E), ${fl(PLATEAU_SLOPE)});
+  return profTex(E);
+}
+`;
+}
+/* Free-standing buttes ("temples"): x, z, E at summit, flank steepness */
+const BUTTES = [[-850, -650, 1700, 1.1], [2250, -1450, 2120, 1.2], [-300, 1950, 1560, 1.15]];
+
+/* ------------------------------------------------------------- GLSL chunks */
+const HDR = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+`;
+const VS = `#version 300 es
+void main(){ vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }`;
+
+const COMMON = `
+#define PI 3.14159265359
+${FLOAT_LINEAR ? '' : '#define MANUAL_BILINEAR'}
+uniform vec4 uWorld;      // centre x, centre z, size, 1/size
+uniform vec2 uFieldRes;
+uniform sampler2D uField;
+
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz)*p3.zy); }
+float hash13(vec3 p3){ p3 = fract(p3*0.1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y)*p3.z); }
+
+float vnoise(vec2 x){
+  vec2 i = floor(x), f = fract(x);
+  vec2 u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+  float a = hash12(i), b = hash12(i + vec2(1.0, 0.0)), c = hash12(i + vec2(0.0, 1.0)), d = hash12(i + vec2(1.0, 1.0));
+  return -1.0 + 2.0*(a + (b - a)*u.x + (c - a)*u.y + (a - b - c + d)*u.x*u.y);
+}
+float vnoise3(vec3 x){
+  vec3 i = floor(x), f = fract(x);
+  vec3 u = f*f*(3.0 - 2.0*f);
+  float a = hash13(i), b = hash13(i + vec3(1,0,0)), c = hash13(i + vec3(0,1,0)), d = hash13(i + vec3(1,1,0));
+  float e = hash13(i + vec3(0,0,1)), f1 = hash13(i + vec3(1,0,1)), g = hash13(i + vec3(0,1,1)), h = hash13(i + vec3(1,1,1));
+  return -1.0 + 2.0*mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, f1, u.x), mix(g, h, u.x), u.y), u.z);
+}
+float gnoise(vec2 x){
+  vec2 i = floor(x), f = fract(x);
+  vec2 u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+  vec2 ga = hash22(i)*2.0 - 1.0, gb = hash22(i + vec2(1,0))*2.0 - 1.0, gc = hash22(i + vec2(0,1))*2.0 - 1.0, gd = hash22(i + vec2(1,1))*2.0 - 1.0;
+  float va = dot(ga, f), vb = dot(gb, f - vec2(1,0)), vc = dot(gc, f - vec2(0,1)), vd = dot(gd, f - vec2(1,1));
+  return 1.6*(va + u.x*(vb - va) + u.y*(vc - va) + u.x*u.y*(va - vb - vc + vd));
+}
+
+const vec3 RA = vec3(${RIVER.A.map(fl).join(',')});
+const vec3 RF = vec3(${RF.map(fl).join(',')});
+const vec3 RP = vec3(${RIVER.P.map(fl).join(',')});
+float riverX(float z){ return dot(RA, sin(z*RF + RP)); }
+float riverXd(float z){ return dot(RA*RF, cos(z*RF + RP)); }
+float riverXdd(float z){ return -dot(RA*RF*RF, sin(z*RF + RP)); }
+
+vec2 worldToUV(vec2 xz){ return (xz - uWorld.xy)*uWorld.w + 0.5; }
+
+uniform float uFieldLodK;   // 1/texel size in metres
+float fieldE(vec2 xz, float fp){
+#ifdef MANUAL_BILINEAR
+  vec2 st = worldToUV(xz)*uFieldRes - 0.5; vec2 i = floor(st); vec2 f = st - i;
+  ivec2 ii = ivec2(i), mx = ivec2(uFieldRes) - 1;
+  float a = texelFetch(uField, clamp(ii, ivec2(0), mx), 0).r, b = texelFetch(uField, clamp(ii + ivec2(1,0), ivec2(0), mx), 0).r;
+  float c = texelFetch(uField, clamp(ii + ivec2(0,1), ivec2(0), mx), 0).r, d = texelFetch(uField, clamp(ii + ivec2(1,1), ivec2(0), mx), 0).r;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+#else
+  return textureLod(uField, worldToUV(xz), max(log2(max(fp*uFieldLodK*1.3, 1e-3)), 0.0)).r;
+#endif
+}
+// Smooth (C2) cubic B-spline reconstruction with full-precision weights, for normals.
+float fieldEHQ(vec2 xz){
+  vec2 st = worldToUV(xz)*uFieldRes - 0.5; vec2 i = floor(st); vec2 f = st - i;
+  vec2 f2 = f*f, f3 = f2*f;
+  vec4 wx = vec4((1.0 - f.x)*(1.0 - f.x)*(1.0 - f.x), 3.0*f3.x - 6.0*f2.x + 4.0, -3.0*f3.x + 3.0*f2.x + 3.0*f.x + 1.0, f3.x)/6.0;
+  vec4 wy = vec4((1.0 - f.y)*(1.0 - f.y)*(1.0 - f.y), 3.0*f3.y - 6.0*f2.y + 4.0, -3.0*f3.y + 3.0*f2.y + 3.0*f.y + 1.0, f3.y)/6.0;
+  ivec2 ii = ivec2(i) - 1, mx = ivec2(uFieldRes) - 1;
+  float s = 0.0;
+  for (int y = 0; y < 4; y++){
+    float row = 0.0;
+    for (int x = 0; x < 4; x++) row += wx[x]*texelFetch(uField, clamp(ii + ivec2(x, y), ivec2(0), mx), 0).r;
+    s += wy[y]*row;
+  }
+  return s;
+}
+
+${profileLUTGLSL()}
+
+const vec4 MESAS[5] = vec4[5](vec4(-26000.0, -15000.0, 2600.0, 240.0), vec4(24000.0, 9000.0, 3400.0, 190.0),
+                               vec4(-19000.0, 22000.0, 2200.0, 160.0), vec4(30000.0, -21000.0, 4200.0, 260.0),
+                               vec4(-34000.0, 6000.0, 3000.0, 210.0));
+float plateauH(vec2 p, float E){
+  float m = smoothstep(${fl(RIM_E + 30)}, ${fl(RIM_E + 700)}, E);
+  if (m <= 0.0) return 0.0;
+  float h = 24.0*vnoise(p*(1.0/2900.0) + vec2(5.2, 1.3)) + 8.0*vnoise(p*(1.0/760.0) + vec2(2.1, 7.7));
+  float far = smoothstep(${fl(RIM_E + 1500)}, ${fl(RIM_E + 6000)}, E);
+  if (far > 0.0){
+    h += far*(70.0*vnoise(p*(1.0/13000.0) + vec2(1.1, 4.7)) + 30.0*vnoise(p*(1.0/5200.0) + vec2(8.2, 3.3)));
+    for (int i = 0; i < 5; i++){
+      vec4 ms = MESAS[i];
+      vec2 d = p - ms.xy;
+      float r0 = length(d);
+      if (r0 > ms.z*1.12 + 270.0) continue;
+      float r = r0 + 260.0*vnoise(p*(1.0/1400.0) + float(i)*5.0);
+      h += far*ms.w*(1.0 - smoothstep(ms.z*0.82, ms.z*1.12, r))*(0.9 + 0.1*smoothstep(ms.z*0.3, ms.z*0.8, r));
+    }
+  }
+  return m*h;
+}
+float baseH(vec2 p){ float E = fieldE(p, 0.0); return profileY(E) + plateauH(p, E); }
+`;
+
+/* Pass A: the drainage network is rasterised as seed lines (x, z, floor),
+   a jump-flood pass finds for every texel the channel point minimising
+   floor + distance, and the final pass adds wall irregularity and buttes. */
+const VS_SEED = `#version 300 es
+in vec3 aP;            // world x, world z, channel floor (in E units)
+uniform vec4 uWorld;
+out vec3 vP;
+void main(){ vP = aP; gl_Position = vec4((aP.xy - uWorld.xy)*uWorld.w*2.0, aP.z/12000.0*2.0 - 1.0, 1.0); }`;
+const FS_SEED = HDR + `in vec3 vP; out vec4 oCol; void main(){ oCol = vec4(vP, 1.0); }`;
+const FS_JFA = HDR + `
+uniform sampler2D uSeed; uniform vec4 uWorld; uniform vec2 uFieldRes; uniform int uStep;
+out vec4 oCol;
+void main(){
+  ivec2 ip = ivec2(gl_FragCoord.xy), mx = ivec2(uFieldRes) - 1;
+  vec2 p = uWorld.xy + (gl_FragCoord.xy/uFieldRes - 0.5)*uWorld.z;
+  vec4 best = vec4(0.0); float be = 1e30;
+  for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++){
+    ivec2 q = ip + ivec2(dx, dy)*uStep;
+    if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, mx))) continue;
+    vec4 s = texelFetch(uSeed, q, 0);
+    if (s.w < 0.5) continue;
+    float e = s.z + length(p - s.xy);
+    if (e < be){ be = e; best = s; }
+  }
+  oCol = best;
+}`;
+const FS_FIELD = HDR + COMMON + `
+uniform sampler2D uSeed;
+uniform vec4 uButtes[8];
+uniform int uNumButtes;
+uniform vec4 uFans[48];
+uniform int uNumFans;
+out vec4 oCol;
+float smax(float a, float b, float k){ float h = max(k - abs(a - b), 0.0)/k; return max(a, b) + h*h*k*0.25; }
+float seedE(vec2 p){
+  vec2 st = worldToUV(p)*uFieldRes - 0.5;
+  ivec2 i = ivec2(floor(st)), mx = ivec2(uFieldRes) - 1;
+  float e = 1e30;
+  for (int y = 0; y <= 1; y++) for (int x = 0; x <= 1; x++){
+    vec4 s = texelFetch(uSeed, clamp(i + ivec2(x, y), ivec2(0), mx), 0);
+    if (s.w > 0.5) e = min(e, s.z + length(p - s.xy));
+  }
+  return e > 1e29 ? 30000.0 : e;
+}
+float Ebase(vec2 p){
+  float E0 = seedE(p);
+  // gentle domain warp of the walls (none at the river itself)
+  float wa = smoothstep(90.0, 900.0, E0)*170.0;
+  vec2 wv = vec2(gnoise(p/2600.0 + vec2(3.3, 1.7)) + 0.5*gnoise(p/1100.0 + vec2(8.1, 2.2)),
+                 gnoise(p/2600.0 + vec2(7.9, 5.1)) + 0.5*gnoise(p/1100.0 + vec2(1.4, 9.6)));
+  float E = seedE(p + wv*wa);
+  // large and medium scale irregularity of the walls; fades out on the plateau
+  float a = clamp(E*0.22, 0.0, 330.0)*(1.0 - smoothstep(${fl(RIM_E + 150)}, ${fl(RIM_E + 900)}, E));
+  float n = 0.0, amp = 1.0, sc = 1.0/4000.0; vec2 q = p;
+  for (int i = 0; i < 6; i++){ n += amp*gnoise(q*sc + vec2(float(i)*7.13, float(i)*3.71)); q = mat2(0.8, 0.6, -0.6, 0.8)*q; sc *= 2.0; amp *= 0.55; }
+  E += a*n*0.75;
+  // river width varies; banks wander
+  float rb = 1.0 - smoothstep(60.0, 260.0, E);
+  E += rb*(22.0*gnoise(p/900.0 + vec2(2.0, 9.0)) + 9.0*gnoise(p/260.0 + vec2(6.0, 1.0)));
+  // rocky shores: the beach shrinks to nothing along many stretches
+  float rocky = smoothstep(-0.1, 0.4, gnoise(p/700.0 + vec2(9.1, 3.3)) + 0.4*gnoise(p/170.0));
+  E += rocky*26.0*smoothstep(42.0, 75.0, E);
+  // debris fans at side-canyon mouths push into the river
+  for (int i = 0; i < 48; i++){
+    if (i >= uNumFans) break;
+    vec4 f = uFans[i];
+    vec2 d = p - f.xy;
+    float r = length(d) + 25.0*gnoise(p/90.0 + float(i));
+    E = smax(E, f.z - r*0.85, 40.0);
+  }
+  for (int i = 0; i < 8; i++){
+    if (i >= uNumButtes) break;
+    vec4 b = uButtes[i];
+    vec2 d = p - b.xy;
+    d += 150.0*vec2(gnoise(p/450.0 + float(i)*3.1), gnoise(p/450.0 + 7.7 + float(i)));
+    E = smax(E, b.z - length(d)*b.w, 200.0);
+  }
+  return E;
+}
+// Gabor-like stripes whose crests run down the slope (along dir); each cell
+// jitters wavelength, strength and orientation so the fluting never repeats.
+float gully(vec2 p, vec2 dir, float lambda, float seed){
+  vec2 ci = floor(p/lambda);
+  float s = 0.0, ws = 0.0;
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++){
+    vec2 c = ci + vec2(float(i), float(j));
+    vec2 hA = hash22(c + seed), hB = hash22(c + seed + 3.7);
+    vec2 d = p - (c + hA)*lambda;
+    float w = exp(-dot(d, d)/(lambda*lambda*0.5));
+    float an = (hB.x - 0.5)*0.55;
+    vec2 cd = vec2(-dir.y, dir.x);
+    cd = vec2(cd.x*cos(an) - cd.y*sin(an), cd.x*sin(an) + cd.y*cos(an));
+    float lj = lambda*mix(0.6, 1.4, hB.y);
+    float amp = 0.35 + 1.3*hash12(c + seed + 11.0);
+    s += w*amp*cos(dot(d, cd)*(6.2831853/lj) + hash12(c + seed + 7.0)*6.2831853);
+    ws += w;
+  }
+  return s/max(ws, 1e-5);
+}
+#ifdef FIELD_STAGE1
+void main(){
+  vec2 uv = gl_FragCoord.xy/uFieldRes;
+  vec2 p = uWorld.xy + (uv - 0.5)*uWorld.z;
+  oCol = vec4(p, max(Ebase(p), 0.0), 1.0);
+}
+#else
+void main(){
+  vec2 uv = gl_FragCoord.xy/uFieldRes;
+  vec2 p = uWorld.xy + (uv - 0.5)*uWorld.z;
+  // E after the Lipschitz envelope: walls never rise faster than the designed profile
+  float E = seedE(p);
+  float h = uWorld.z/uFieldRes.x*0.75;
+  vec2 g = vec2(seedE(p + vec2(h, 0.0)) - seedE(p - vec2(h, 0.0)), seedE(p + vec2(0.0, h)) - seedE(p - vec2(0.0, h)));
+  float glen = length(g);
+  if (glen > 1e-4){
+    vec2 dir = g/glen;
+    // amplitude by zone: rugged inner gorge, mild platform, strong upper walls, none on the rim
+    float A = 34.0*smoothstep(70.0, 130.0, E)*(1.0 - smoothstep(300.0, 360.0, E))
+            + 40.0*smoothstep(330.0, 420.0, E)*(1.0 - smoothstep(900.0, 1000.0, E))
+            + 34.0*smoothstep(960.0, 1060.0, E)*(1.0 - smoothstep(${fl(RIM_E - 60)}, ${fl(RIM_E + 30)}, E));
+    A *= smoothstep(0.25, 0.7, glen/(2.0*h));
+    if (A > 0.0){
+      float g1 = gully(p, dir, 230.0, 1.3), g2 = gully(p*1.0 + 31.0, dir, 105.0, 5.7);
+      float v1 = 2.0*smoothstep(0.0, 0.85, abs(g1)) - 1.0;
+      float v2 = 2.0*smoothstep(0.0, 0.85, abs(g2)) - 1.0;
+      E += A*(0.7*v1 + 0.45*v2);
+    }
+  }
+  oCol = vec4(max(E, 0.0), 0.0, 0.0, 1.0);
+}
+#endif`;
+
+/* Pass B: sun shadow heights (for two sun-disc edges) + sky visibility */
+const FS_SHADOW = HDR + COMMON + `
+uniform vec3 uSunDir;
+uniform float uSunHalf;
+layout(location = 0) out vec4 oShadow;
+layout(location = 1) out vec4 oSky;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uFieldRes;
+  vec2 p = uWorld.xy + (uv - 0.5)*uWorld.z;
+  float texel = uWorld.z/uFieldRes.x;
+  float h0 = baseH(p);
+  vec2 dir = normalize(uSunDir.xz);
+  float el = asin(uSunDir.y);
+  float tLo = tan(el - uSunHalf), tHi = tan(el + uSunHalf);
+  float m1 = -1e6, m2 = -1e6;
+  float d = texel*0.7;
+  for (int i = 0; i < 260; i++){
+    float hq = baseH(p + dir*d);
+    m1 = max(m1, hq - d*tLo);
+    m2 = max(m2, hq - d*tHi);
+    d += max(texel*0.7, d*0.02);
+    if (d > 12000.0) break;
+  }
+  oShadow = vec4(m1, m2, 0.0, 1.0);
+  float vis = 0.0;
+  for (int k = 0; k < 12; k++){
+    float a = (float(k) + 0.5)/12.0*6.2831853;
+    vec2 dd = vec2(cos(a), sin(a));
+    float ms = 0.0, s = texel;
+    for (int j = 0; j < 20; j++){
+      ms = max(ms, (baseH(p + dd*s) - h0)/s);
+      s *= 1.42;
+    }
+    vis += 1.0/(1.0 + ms*ms);
+  }
+  oSky = vec4(vis/12.0, 0.0, 0.0, 1.0);
+}`;
+
+/* Sky LUT: single scattering (Rayleigh + Mie + ozone) for the fixed sun */
+const ATMO = `
+const float RG = 6360e3, RT = 6460e3;
+const vec3 BR = vec3(5.802e-6, 13.558e-6, 33.1e-6);
+const float BMS = 3.996e-6, BME = 4.44e-6;
+const vec3 BO = vec3(0.650e-6, 1.881e-6, 0.085e-6);
+const float HR = 8000.0, HM = 1200.0;
+const float ALT0 = 750.0;   // river altitude above sea level
+`;
+const FS_SKY = HDR + `
+uniform vec3 uSunDir; uniform float uHaze; uniform float uAlt;
+out vec4 oCol;
+` + ATMO + `
+vec2 raySphere(vec3 ro, vec3 rd, float r){ float b = dot(ro, rd), c = dot(ro, ro) - r*r, h = b*b - c; if (h < 0.0) return vec2(-1.0); h = sqrt(h); return vec2(-b - h, -b + h); }
+vec3 density(float h){ return vec3(exp(-h/HR), exp(-h/HM), max(0.0, 1.0 - abs(h - 25000.0)/15000.0)); }
+vec3 extinction(vec3 d){ return BR*d.x + BME*uHaze*d.y + BO*d.z; }
+vec3 sunTrans(vec3 p){
+  vec2 t = raySphere(p, uSunDir, RT);
+  float L = t.y; vec3 od = vec3(0.0);
+  for (int i = 0; i < 24; i++){ vec3 q = p + uSunDir*(L*(float(i) + 0.5)/24.0); od += density(length(q) - RG); }
+  return exp(-extinction(od*(L/24.0)));
+}
+void main(){
+  vec2 uv = gl_FragCoord.xy/vec2(256.0, 128.0);
+  float az = (uv.x - 0.5)*6.2831853;
+  float v = uv.y*2.0 - 1.0;
+  float el = sign(v)*v*v*1.5707963;
+  vec3 rd = vec3(cos(el)*cos(az), sin(el), cos(el)*sin(az));
+  vec3 ro = vec3(0.0, RG + uAlt, 0.0);
+  vec2 ta = raySphere(ro, rd, RT);
+  vec2 tg = raySphere(ro, rd, RG);
+  float L = ta.y;
+  if (tg.x > 0.0) L = tg.x;
+  float mu = dot(rd, uSunDir);
+  float phR = 0.0596831*(1.0 + mu*mu);
+  float g = 0.78, g2 = g*g;
+  float phM = 0.1193662*(1.0 - g2)*(1.0 + mu*mu)/((2.0 + g2)*pow(1.0 + g2 - 2.0*g*mu, 1.5));
+  vec3 od = vec3(0.0), sR = vec3(0.0), sM = vec3(0.0);
+  const int N = 48;
+  float tPrev = 0.0;
+  for (int i = 0; i < N; i++){
+    float f = (float(i) + 0.5)/float(N);
+    float t = L*f*f;
+    float dt = L*((float(i) + 1.0)*(float(i) + 1.0) - float(i)*float(i))/float(N*N);
+    vec3 p = ro + rd*t;
+    vec3 d = density(length(p) - RG);
+    od += d*dt;
+    vec3 T = exp(-extinction(od))*sunTrans(p);
+    sR += T*d.x*dt; sM += T*d.y*dt;
+  }
+  vec3 col = 20.0*(sR*BR*phR + sM*BMS*uHaze*phM);
+  // cheap multiple-scattering lift so the anti-solar sky is not too dark
+  col += 20.0*(sR*BR + sM*BMS*uHaze)*0.018;
+  oCol = vec4(col, 1.0);
+}`;
+
+/* Main scene: ray march terrain, shade, atmosphere */
+const FS_SCENE = HDR + COMMON + ATMO + `
+uniform vec3 uCamPos, uCamRight, uCamUp, uCamFwd;
+uniform float uTanHalf, uAspect, uPixAng, uTime, uFrame, uMaxH, uMaxHNear, uHaze, uCanyonHaze;
+uniform vec2 uRes, uJitter;
+uniform vec3 uSunDir, uSunCol, uSkyIrr, uSkyAmb;
+uniform sampler2D uShadow, uSkyVis, uSkyLUT, uStrata;
+uniform vec4 uFans[48];
+uniform int uNumFans;
+out vec4 oCol;
+
+const float STRATA_Y0 = -20.0, STRATA_INV = 1.0/1640.0;
+
+float ign(vec2 p){ p += uFrame*vec2(5.588238, 3.17); return fract(52.9829189*fract(0.06711056*p.x + 0.00583715*p.y)); }
+
+/* --- terrain ----------------------------------------------------------- */
+float ridge(float n){ n = 1.0 - abs(n); return n*sqrt(n) - 0.5; }
+float detailE(vec2 p, float fp, float E){
+  // calm near the water, rugged in the schist gorge, crisp on the upper cliffs
+  float base = mix(0.35, 1.0, smoothstep(50.0, 140.0, E));
+  float gorge = smoothstep(80.0, 130.0, E)*(1.0 - smoothstep(330.0, 360.0, E));
+  float upper = smoothstep(1000.0, 1060.0, E)*(1.0 - smoothstep(${fl(RIM_E - 40)}, ${fl(RIM_E + 40)}, E));
+  float a1 = base*(1.0 + 0.5*gorge + 0.4*upper), a2 = base*(1.0 + 1.0*gorge + 0.5*upper);
+  float d = 0.0;
+  float w2 = 1.0 - smoothstep(7.0, 18.0, fp);
+  if (w2 > 0.0){
+    d += w2*a1*13.0*(0.5 - abs(vnoise(p*(1.0/66.0) + vec2(3.7, 8.1))));
+    float w3 = 1.0 - smoothstep(3.0, 8.0, fp);
+    if (w3 > 0.0){
+      // domain-warped, rotated octaves so no grid or repeating facet shows
+      vec2 q = p + 10.0*vec2(vnoise(p*(1.0/47.0) + vec2(1.0, 5.0)), vnoise(p*(1.0/47.0) + vec2(6.0, 2.0)));
+      q = mat2(0.8, -0.6, 0.6, 0.8)*q;
+      d += w3*a2*6.5*vnoise(q*(1.0/29.0) + vec2(1.3, 4.4));
+      float w4 = 1.0 - smoothstep(1.2, 3.0, fp);
+      if (w4 > 0.0){
+        q = mat2(0.6, 0.8, -0.8, 0.6)*q;
+        d += w4*a2*2.6*ridge(vnoise(q*(1.0/11.0) + vec2(7.1, 0.3)));
+        float w5 = 1.0 - smoothstep(0.45, 1.1, fp);
+        if (w5 > 0.0){
+          q = mat2(0.8, 0.6, -0.6, 0.8)*q;
+          d += w5*a2*1.0*vnoise(q*(1.0/4.1) + vec2(2.9, 5.5));
+          float w6 = 1.0 - smoothstep(0.15, 0.45, fp);
+          if (w6 > 0.0) d += w6*a2*0.35*vnoise(q*(1.0/1.5) + vec2(0.7, 3.3));
+        }
+      }
+    }
+  }
+  return d;
+}
+float treeDensity(vec2 p, float E){
+  float edge = smoothstep(${fl(RIM_E + 25)}, ${fl(RIM_E + 110)}, E);
+  float d = 0.10 + 0.5*smoothstep(${fl(RIM_E + 150)}, ${fl(RIM_E + 1500)}, E) + 0.32*vnoise(p*(1.0/650.0) + vec2(4.1, 1.9))
+               + 0.14*vnoise(p*(1.0/150.0) + vec2(8.3, 2.7));
+  d *= smoothstep(-0.55, 0.35, vnoise(p*(1.0/55.0) + vec2(2.3, 6.1)) + 0.5*vnoise(p*(1.0/19.0)));   // clumps and clearings
+  return clamp(d, 0.0, 0.85)*edge;
+}
+float treeField(vec2 p, float E, float fp, out float mask){
+  mask = 0.0;
+  float dens = treeDensity(p, E);
+  if (dens <= 0.0) return 0.0;
+  float far = smoothstep(0.9, 2.2, fp);
+  float avgH = dens*1.8;
+  if (far >= 1.0){ mask = dens*0.5; return avgH; }
+  const float CS = 8.0;
+  vec2 g = p/CS, c = floor(g), f = g - c;
+  float h = 0.0, m = 0.0;
+  if (hash12(c + 17.31) < dens){
+    vec2 rr = hash22(c + 3.17);
+    float r = mix(0.17, 0.43, rr.x*rr.x);
+    vec2 ctr = vec2(r) + (1.0 - 2.0*r)*hash22(c + 9.71);
+    vec2 d = (f - ctr)/r;
+    float ang = atan(d.y, d.x + 1e-5);
+    float wob = 1.0 + 0.2*sin(ang*3.0 + rr.y*20.0) + 0.12*sin(ang*5.0 + rr.x*31.0);
+    float q = 1.0 - dot(d, d)/(wob*wob);
+    if (q > 0.0){
+      float H = mix(2.6, 7.0, rr.y);
+      h = H*pow(q, 0.7)*(0.72 + 0.28*vnoise(p*0.9 + rr*9.0)) + 0.45*vnoise(p*2.6);
+      m = smoothstep(0.0, 0.1, q);
+    }
+  }
+  mask = mix(m, dens*0.5, far);
+  return mix(h, avgH, far);
+}
+float plateauDetail(vec2 p, float fp){
+  float w = 1.0 - smoothstep(3.0, 9.0, fp);
+  if (w <= 0.0) return 0.0;
+  float r = 1.0 - abs(vnoise(p*(1.0/41.0) + vec2(2.2, 9.1)));
+  return w*(1.3*r*r + 0.45*vnoise(p*(1.0/9.0)) + 0.15*vnoise(p*(1.0/2.7)));
+}
+// hummocky relief on the broad benches (Tonto platform, Esplanade) in height space
+float benchRelief(vec2 p, float E, float fp){
+  float m = smoothstep(390.0, 480.0, E)*(1.0 - smoothstep(880.0, 985.0, E))
+          + 0.7*smoothstep(1630.0, 1690.0, E)*(1.0 - smoothstep(1780.0, 1840.0, E));
+  if (m <= 0.0) return 0.0;
+  float r = 0.0;
+  float w1 = 1.0 - smoothstep(25.0, 60.0, fp);
+  if (w1 > 0.0){
+    r += w1*(9.0*vnoise(p*(1.0/340.0) + vec2(4.0, 2.0)) + 4.5*(0.6 - abs(vnoise(p*(1.0/120.0) + vec2(1.0, 7.0)))*1.4));
+    float w2 = 1.0 - smoothstep(4.0, 12.0, fp);
+    if (w2 > 0.0) r += w2*(1.6*vnoise(p*(1.0/31.0) + vec2(3.0, 3.0)) + 0.6*vnoise(p*(1.0/9.0)));
+  }
+  return m*r;
+}
+vec3 voro(vec2 x){
+  vec2 n = floor(x), f = x - n;
+  float f1 = 8.0, f2 = 8.0, id = 0.0;
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++){
+    vec2 g = vec2(float(i), float(j));
+    vec2 r = g + hash22(n + g) - f;
+    float d = dot(r, r);
+    if (d < f1){ f2 = f1; f1 = d; id = hash12(n + g + 17.0); } else if (d < f2) f2 = d;
+  }
+  return vec3(sqrt(f1), sqrt(f2), id);
+}
+// jointed blocks and cracks on steep rock, only near the camera
+float rockBlocks(vec2 p, float fp, float steep, float E){
+  float w = (1.0 - smoothstep(1.2, 2.8, fp))*smoothstep(0.5, 1.4, steep)*smoothstep(60.0, 110.0, E);
+  if (w <= 0.0) return 0.0;
+  vec2 q = p + 4.0*vec2(vnoise(p*(1.0/23.0)), vnoise(p*(1.0/23.0) + 7.0));
+  vec3 v = voro(q*(1.0/13.0));
+  float crack = smoothstep(0.0, 0.16, v.y - v.x);
+  float d = (v.z - 0.5)*3.6 + (crack - 1.0)*2.4;
+  float w2 = 1.0 - smoothstep(0.35, 0.9, fp);
+  if (w2 > 0.0){
+    vec3 v2 = voro(q*(1.0/4.6) + 3.1);
+    d += w2*((v2.z - 0.5)*1.2 + (smoothstep(0.0, 0.2, v2.y - v2.x) - 1.0)*0.9);
+  }
+  return w*d;
+}
+// bedding ledges on the sedimentary cliffs (height-space terracing)
+float ledges(float h, float slope, float fp, float E){
+  float w = smoothstep(0.9, 2.2, slope)*(1.0 - smoothstep(0.8, 2.2, fp))*smoothstep(330.0, 380.0, E);
+  if (w <= 0.0) return h;
+  float band = floor(h*(1.0/19.0));
+  float T = 2.6 + 3.2*hash12(vec2(band, 3.7));
+  float u = h/T;
+  float ter = T*(floor(u) + smoothstep(0.0, 0.55, fract(u)));
+  return mix(h, ter, 0.55*w);
+}
+float terrainH(vec2 p, float fp, out float E){
+  E = fieldE(p, fp);
+  float ed = E + detailE(p, fp, E);
+  vec2 pd = profileYD(ed);
+  if (fp < 2.8) { ed += rockBlocks(p, fp, pd.y, E); pd = profileYD(ed); }
+  float h = ledges(pd.x, pd.y, fp, E) + benchRelief(p, E, fp);
+  if (E > ${fl(RIM_E - 20)}){
+    float m;
+    h += plateauH(p, E) + treeField(p, E, fp, m) + plateauDetail(p, fp)*smoothstep(${fl(RIM_E)}, ${fl(RIM_E + 60)}, E);
+  }
+  return h;
+}
+float terrainHQ(vec2 p, float fp, float t){
+  float E = fp < 0.6/uFieldLodK ? fieldEHQ(p) : fieldE(p, fp);
+  float ed = E + detailE(p, fp, E);
+  vec2 pd = profileYD(ed);
+  if (fp < 2.8) { ed += rockBlocks(p, fp, pd.y, E); pd = profileYD(ed); }
+  float h = ledges(pd.x, pd.y, fp, E) + benchRelief(p, E, fp);
+  if (E > ${fl(RIM_E - 20)}){
+    float m;
+    h += plateauH(p, E) + treeField(p, E, fp, m) + plateauDetail(p, fp)*smoothstep(${fl(RIM_E)}, ${fl(RIM_E + 60)}, E);
+  }
+  return h;
+}
+uniform int uFour;   // always 4; a uniform bound stops compilers from unrolling heavy loops
+vec3 terrainNormal(vec2 p, float t){
+  float fp = t*uPixAng;
+  float e = clamp(fp*0.7, 0.3, 25.0);
+  vec4 hh = vec4(0.0);
+  for (int i = 0; i < uFour; i++){
+    vec2 o = (i == 0) ? vec2(e, 0.0) : (i == 1) ? vec2(-e, 0.0) : (i == 2) ? vec2(0.0, e) : vec2(0.0, -e);
+    hh[i] = terrainHQ(p + o, fp, t);
+  }
+  return normalize(vec3(hh.y - hh.x, 2.0*e, hh.w - hh.z));
+}
+
+/* --- ray march (water surface at y = 0 is treated as solid) ---------- */
+float castRay(vec3 ro, vec3 rd, float tmax, float kStep, int maxSteps, out bool water, out float Ehit){
+  water = false; Ehit = 0.0;
+  float t = 0.3;
+  if (ro.y > uMaxH){ if (rd.y >= 0.0) return -1.0; t = max(t, (ro.y - uMaxH)/(-rd.y)); }
+  float tPrev = t, a = 0.0, b = 0.0, lastH = 0.0;
+  int refine = 0;
+  for (int i = 0; i < 340; i++){
+    if (refine == 0){ if (t > tmax) return -1.0; if (i >= maxSteps) break; }
+    vec3 p = ro + rd*t;
+    if (refine == 0 && rd.y >= 0.0 && p.y > (t < 12000.0 ? uMaxHNear : uMaxH)) return -1.0;
+    float E;
+    float hr = terrainH(p.xz, t*uPixAng, E);
+    Ehit = E; lastH = hr;
+    float d = p.y - max(hr, 0.0);
+    if (refine > 0){
+      if (d < 0.0) b = t; else a = t;
+      if (++refine > 7) break;
+      t = 0.5*(a + b);
+      continue;
+    }
+    if (d < 0.0){ refine = 1; a = tPrev; b = t; t = 0.5*(a + b); continue; }
+    if (d < 0.0004*t) break;
+    tPrev = t;
+    t += max(kStep*d, 0.0012*t + 0.05);
+  }
+  if (lastH < 0.0 && rd.y < 0.0 && ro.y > 0.0){ water = true; t = ro.y/(-rd.y); }
+  return t;
+}
+
+// low-detail terrain for reflections (smaller code, cheaper per step)
+float terrainLow(vec2 p, float fp, out float E){
+  E = fieldE(p, fp);
+  float h = profileY(E);
+  if (E > ${fl(RIM_E - 20)}) h += plateauH(p, E) + treeDensity(p, E)*1.8;
+  return h;
+}
+float castRayLow(vec3 ro, vec3 rd, float tmax, out float Ehit){
+  Ehit = 0.0;
+  float t = 0.5, tPrev = t, lastD = 1.0;
+  for (int i = 0; i < 110; i++){
+    if (t > tmax) return -1.0;
+    vec3 p = ro + rd*t;
+    if (rd.y >= 0.0 && p.y > uMaxHNear) return -1.0;
+    float E;
+    float d = p.y - max(terrainLow(p.xz, t*uPixAng*2.0, E), 0.0);
+    Ehit = E;
+    if (d < 0.0){ return mix(tPrev, t, lastD/max(lastD - d, 1e-4)); }
+    if (d < 0.001*t) return t;
+    tPrev = t; lastD = d;
+    t += max(0.6*d, 0.002*t + 0.1);
+  }
+  return t;
+}
+
+/* --- lighting helpers ------------------------------------------------- */
+bool inField(vec2 uv){ return all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0))); }
+float sunVis(vec3 p){
+  vec2 uv = worldToUV(p.xz);
+  if (!inField(uv)) return 1.0;
+  vec2 hs = texture(uShadow, uv).rg;
+  return smoothstep(hs.y - 0.5, hs.x + 0.5, p.y);
+}
+float skyVisAt(vec2 xz){
+  vec2 uv = worldToUV(xz);
+  return inField(uv) ? texture(uSkyVis, uv).r : 1.0;
+}
+float detailShadow(vec3 p, float t){
+  float fp = t*uPixAng;
+  float res = 1.0, s = 0.6 + fp, E;
+  for (int i = 0; i < 20; i++){
+    vec3 q = p + uSunDir*s;
+    if (q.y > uMaxHNear) break;
+    float d = q.y - terrainH(q.xz, fp + s*uPixAng*0.5, E);
+    res = min(res, 7.0*d/s);
+    if (res < 0.001) break;
+    s += clamp(0.6*d, 0.9 + fp*0.5 + s*0.06, 90.0);
+    if (s > 900.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+float calcAO(vec3 p, vec3 n, float t){
+  float fp = t*uPixAng, occ = 0.0, w = 1.0, E;
+  for (int i = 0; i < uFour + 1; i++){
+    float h = fp + 0.6 + 3.0*float(i) + 3.5*float(i*i);
+    vec3 q = p + n*h;
+    float d = q.y - terrainH(q.xz, fp, E);
+    occ += w*clamp((h - d)/h, 0.0, 1.0);
+    w *= 0.72;
+  }
+  return clamp(1.0 - 0.38*occ, 0.0, 1.0);
+}
+float bounceSrc(vec3 p){
+  vec2 dh = -normalize(uSunDir.xz);
+  float s = sunVis(vec3(p.xz + dh*250.0, p.y + 60.0));
+  s += sunVis(vec3(p.xz + dh*800.0, p.y + 220.0));
+  s += sunVis(vec3(p.xz + dh*1800.0, p.y + 500.0));
+  return s/3.0;
+}
+
+/* --- materials -------------------------------------------------------- */
+vec3 strataCol(float y, float row){ return texture(uStrata, vec2(clamp((y - STRATA_Y0)*STRATA_INV, 0.0, 1.0), row)).rgb; }
+
+vec3 terrainAlbedo(vec3 p, vec3 n, float t, float E){
+  float fp = t*uPixAng;
+  float ys = p.y + 5.5*vnoise(p.xz*(1.0/1400.0) + vec2(2.0, 7.0)) + 2.0*vnoise(p.xz*(1.0/330.0) + vec2(5.0, 1.0))
+           + 0.7*vnoise(p.xz*(1.0/41.0) + vec2(1.0, 3.0))*(1.0 - smoothstep(1.0, 4.0, fp));
+  float steep = 1.0 - n.y;
+  float cliff = smoothstep(0.26, 0.52, steep);
+  vec3 col = mix(strataCol(ys, 0.75), strataCol(ys, 0.25), cliff);
+  // granite and pegmatite veins in the schist of the inner gorge
+  if (ys < 375.0){
+    // foliated schist with irregular pinkish granite masses
+    float fo = vnoise3(p*vec3(1.0/26.0, 1.0/9.0, 1.0/26.0) + vec3(3.0, 1.0, 7.0));
+    col *= 1.0 + 0.12*fo;
+    float gm = smoothstep(0.35, 0.75, vnoise3(p*(1.0/95.0) + vec3(9.0, 2.0, 4.0)) + 0.35*vnoise3(p*(1.0/31.0)));
+    col = mix(col, vec3(0.13, 0.085, 0.07), gm*0.55*smoothstep(380.0, 345.0, ys)*smoothstep(4.0, 14.0, ys));
+  }
+  // blotches of darker and lighter rock (rockfall scars, varnish)
+  float bl = vnoise3(p*(1.0/48.0) + vec3(1.7, 3.1, 0.4))*0.6 + vnoise3(p*(1.0/14.0) + vec3(5.2, 0.8, 2.6))*0.4;
+  col *= 1.0 + 0.22*bl*(1.0 - smoothstep(4.0, 14.0, fp));
+  float pn = vnoise(p.xz*(1.0/600.0) + 1.3)*0.6 + vnoise(p.xz*(1.0/150.0) + 7.1)*0.4;
+  col *= 1.0 + 0.13*pn;
+  float sf = 1.0 - smoothstep(3.0, 10.0, fp);
+  if (cliff > 0.0 && sf > 0.0){
+    float s = vnoise3(vec3(p.x/9.0, p.y/85.0, p.z/9.0))*0.65 + vnoise3(vec3(p.x/3.0, p.y/30.0, p.z/3.0))*0.35;
+    col *= 1.0 - 0.32*cliff*smoothstep(0.0, 0.75, s)*sf;
+  }
+  if (fp < 1.6) col *= 1.0 + 0.10*vnoise(p.xz*0.9 + p.y*0.37)*(1.0 - smoothstep(0.5, 1.6, fp));
+  // sparse desert shrubs on benches and slopes
+  float flatness = smoothstep(0.34, 0.10, steep);
+  float veg = 0.42*smoothstep(440.0, 470.0, ys)*smoothstep(570.0, 530.0, ys)
+            + 0.10*smoothstep(780.0, 800.0, ys)*smoothstep(1160.0, 1110.0, ys)
+            + 0.07*smoothstep(1250.0, 1270.0, ys)*smoothstep(1400.0, 1380.0, ys);
+  veg *= flatness;
+  if (veg > 0.0){
+    float patchy = 0.75 + 0.25*vnoise(p.xz*(1.0/160.0) + vec2(3.0, 8.0)) + 0.12*vnoise(p.xz*(1.0/37.0));
+    float dots = smoothstep(0.5, 0.75, vnoise(p.xz*(1.0/1.7)) + 0.35*vnoise(p.xz*(1.0/6.0)) + 0.25*vnoise(p.xz*(1.0/23.0)));
+    float cov = mix(dots*patchy, 0.2*patchy, smoothstep(0.35, 1.4, fp));
+    col = mix(col, vec3(0.05, 0.055, 0.04), clamp(veg*cov*2.0, 0.0, 0.8));
+    // stony desert pavement and pale washes
+    col *= 1.0 + 0.16*vnoise(p.xz*(1.0/7.0) + vec2(1.0, 2.0))*(1.0 - smoothstep(1.0, 4.0, fp));
+  }
+  // beaches only in places; elsewhere the bank is dark boulders
+  float bank = smoothstep(-1.0, 1.0, p.y)*(1.0 - smoothstep(6.0, 10.0, p.y));
+  if (bank > 0.0){
+    float sandy = smoothstep(-0.15, 0.35, vnoise(p.xz*(1.0/380.0) + vec2(4.4, 2.2)) + 0.3*vnoise(p.xz*(1.0/70.0)));
+    vec3 boulders = vec3(0.06, 0.055, 0.05)*(1.0 + 0.6*vnoise(p.xz*(1.0/3.0)));
+    col = mix(col, boulders, bank*(1.0 - sandy)*0.85);
+  }
+  // riparian green along the banks
+  float rip = smoothstep(1.0, 2.5, p.y)*(1.0 - smoothstep(7.0, 13.0, p.y))*(1.0 - smoothstep(95.0, 140.0, E));
+  if (rip > 0.0){
+    float rv = smoothstep(0.05, 0.6, vnoise(p.xz*(1.0/9.0)) + 0.6*vnoise(p.xz*(1.0/70.0)) + 0.3*vnoise(p.xz*(1.0/3.0)));
+    col = mix(col, vec3(0.028, 0.038, 0.020)*(1.0 + 0.4*vnoise(p.xz*0.7)), rip*rv*0.8);
+  }
+  // plateau: soil, grass and pinyon-juniper woodland
+  if (E > ${fl(RIM_E - 20)}){
+    float pm = smoothstep(${fl(RIM_E - 5)}, ${fl(RIM_E + 40)}, E)*smoothstep(0.45, 0.15, steep);
+    float sv = vnoise(p.xz*(1.0/90.0));
+    vec3 soil = mix(vec3(0.27, 0.185, 0.125), vec3(0.24, 0.21, 0.15), 0.5 + 0.5*sv);
+    float rk = smoothstep(0.25, 0.75, vnoise(p.xz*(1.0/17.0) + 4.0) + 0.5*vnoise(p.xz*(1.0/5.0) + 1.0));
+    soil = mix(soil, vec3(0.37, 0.35, 0.31), rk*0.6);
+    float gr = smoothstep(-0.2, 0.6, vnoise(p.xz*(1.0/40.0) + 9.0));
+    soil = mix(soil, vec3(0.31, 0.27, 0.15), gr*0.35);
+    if (fp < 1.5) soil *= 1.0 + 0.18*vnoise(p.xz*1.7)*(1.0 - smoothstep(0.5, 1.5, fp));
+    float shrub = smoothstep(0.45, 0.75, vnoise(p.xz*(1.0/1.9) + 2.0) + 0.3*vnoise(p.xz*(1.0/7.0)));
+    shrub = mix(shrub, 0.34, smoothstep(0.35, 1.4, fp));
+    soil = mix(soil*0.9, vec3(0.06, 0.065, 0.045), shrub*0.8);
+    col = mix(col, soil, pm*0.85);
+    float tm;
+    treeField(p.xz, E, fp, tm);
+    vec3 tree = mix(vec3(0.016, 0.022, 0.016), vec3(0.026, 0.031, 0.020), 0.5 + 0.5*vnoise(p.xz*0.37));
+    float far = smoothstep(0.9, 2.2, fp);
+    float dens = treeDensity(p.xz, E);
+    col *= 1.0 - 0.85*far*(1.0 - exp(-dens*2.2));   // cast shadows of unresolved trees
+    col = mix(col, tree, tm);
+  }
+  return col;
+}
+
+/* --- sky and atmosphere ---------------------------------------------- */
+vec3 skyLUT(vec3 rd){
+  float az = atan(rd.z, rd.x);
+  float el = asin(clamp(rd.y, -1.0, 1.0));
+  float v = sign(el)*sqrt(abs(el)/1.5707963);
+  return texture(uSkyLUT, vec2(az/6.2831853 + 0.5, v*0.5 + 0.5)).rgb;
+}
+// distant mesas and a far volcanic massif on the horizon (elevation angle in radians)
+float horizonRidge(vec3 rd){
+  vec2 cdir = normalize(rd.xz);
+  float b = atan(cdir.x, cdir.y);
+  float h = 0.0022*(0.5 + 0.5*vnoise(cdir*5.0 + vec2(3.1, 7.3))) + 0.0012*(0.5 + 0.5*vnoise(cdir*13.0 + vec2(1.7, 4.2)))
+          + 0.0006*(0.5 + 0.5*vnoise(cdir*37.0 + vec2(5.5, 2.8)));
+  h = h - 0.0012;
+  float pk = b - 2.88;                       // massif far to the south-south-east
+  pk = atan(sin(pk), cos(pk));
+  h = max(h, 0.0185*exp(-pk*pk/0.0035)*(0.85 + 0.15*vnoise(cdir*60.0)) - 0.001);
+  return h;
+}
+float cloudDens(vec2 q){
+  vec2 w = q*(1.0/10000.0) + uTime*vec2(0.0011, 0.0005);
+  vec2 s = vec2(dot(w, vec2(0.83, 0.56)), dot(w, vec2(-0.56, 0.83))*2.6);
+  s += 0.11*vec2(vnoise(s*0.9 + 3.3), vnoise(s*0.9 + 8.1));          // gently curl the wisps
+  float n = 0.5*vnoise(s) + 0.25*vnoise(s*2.03 + 1.7) + 0.13*vnoise(s*4.1 + 4.4) + 0.07*vnoise(s*8.3 + 2.9);
+  float cov = 0.5 + 0.5*vnoise(w*0.45 + vec2(3.0, 1.0));
+  float base = smoothstep(0.24 - 0.36*cov, 0.80 - 0.36*cov, n);
+  vec2 f = vec2(s.x*9.0, s.y*1.25);                                     // fibrous striations
+  float fib = 0.5 + 0.42*vnoise(f + 6.1) + 0.24*vnoise(f*2.3 + 3.3) + 0.12*vnoise(f*5.1 + 1.7);
+  return base*clamp(fib, 0.0, 1.0);
+}
+vec3 skyColor(vec3 rd, bool withSun){
+  vec3 c = skyLUT(rd);
+  float el = asin(clamp(rd.y, -1.0, 1.0));
+  float hr = horizonRidge(rd);
+  float px = uPixAng*0.7;
+  float mtn = 1.0 - smoothstep(hr - px, hr + px, el);
+  vec3 sunC = uSunCol*vec3(1.0, 0.82, 0.70);
+  float mu = dot(rd, uSunDir);
+  if (withSun){
+    float a = acos(clamp(mu, -1.0, 1.0));
+    float r = a/0.00475;
+    if (r < 1.6){
+      float limb = 0.4 + 0.6*sqrt(max(0.0, 1.0 - min(r, 1.0)*min(r, 1.0)));
+      float edge = 1.0 - smoothstep(0.9, 1.0 + 0.5*uPixAng/0.00475, r);
+      c += uSunCol*900.0*limb*edge*(1.0 - mtn);
+    }
+  }
+  // high cirrus lit by the setting sun
+  if (rd.y > 0.002){
+    float t = (6500.0 - uCamPos.y)/rd.y;
+    vec2 q = uCamPos.xz + rd.xz*t;
+    float d = cloudDens(q);
+    if (d > 0.0){
+      float ds = cloudDens(q + normalize(uSunDir.xz)*900.0);
+      float hg = 0.0795775*(1.0 - 0.5184)/pow(1.0 + 0.5184 - 1.44*mu, 1.5);
+      vec3 cc = sunC*vec3(1.0, 0.9, 0.86)*(0.07 + 0.42*hg)*(1.0 - 0.3*ds) + uSkyIrr*0.2;
+      float fade = smoothstep(0.003, 0.07, rd.y)*exp(-t*(1.0/160000.0));
+      c = mix(c, cc, d*0.66*fade);
+    }
+  }
+  // far horizon silhouettes, lost in haze
+  if (mtn > 0.0){
+    vec3 hz = skyLUT(normalize(vec3(rd.x, 0.004, rd.z)));
+    c = mix(c, hz*vec3(0.80, 0.80, 0.86), mtn);
+  }
+  return c;
+}
+vec3 atmosphere(vec3 col, vec3 ro, vec3 rd, float tEnd){
+  float mu = dot(rd, uSunDir);
+  float phR = 0.0596831*(1.0 + mu*mu);
+  float g = 0.80, g2 = g*g;
+  float phM = 0.1193662*(1.0 - g2)*(1.0 + mu*mu)/((2.0 + g2)*pow(1.0 + g2 - 2.0*g*mu, 1.5));
+  float gc = 0.5, gc2 = gc*gc;
+  float phC = 0.1193662*(1.0 - gc2)*(1.0 + mu*mu)/((2.0 + gc2)*pow(1.0 + gc2 - 2.0*gc*mu, 1.5));
+  float jit = ign(gl_FragCoord.xy);
+  vec3 od = vec3(0.0), aS = vec3(0.0), aA = vec3(0.0);
+  const int N = 22;
+  float tPrev = 0.0;
+  for (int i = 0; i < N; i++){
+    float f = (float(i) + jit)/float(N);
+    float ti = tEnd*f*f;
+    float dt = ti - tPrev; tPrev = ti;
+    vec3 x = ro + rd*ti;
+    float alt = x.y + ALT0;
+    float dR = exp(-alt/HR);
+    float dM = exp(-alt/HM)*uHaze;
+    float dC = uCanyonHaze*exp(-max(x.y, 0.0)/420.0);
+    vec3 ext = BR*dR + (BME*dM + dC*1.1);
+    vec3 T = exp(-od - ext*dt*0.5);
+    od += ext*dt;
+    float vis = (x.y > uMaxHNear) ? 1.0 : sunVis(x);
+    vec3 sc = BR*dR*phR + BMS*dM*phM + dC*phC;
+    aS += T*sc*vis*dt;
+    float sva = mix(skyVisAt(x.xz), 1.0, clamp(x.y*(1.0/1400.0), 0.0, 1.0));
+    aA += T*(BR*dR + BMS*dM + dC)*dt*sva;
+  }
+  // remaining segment after the last sample
+  {
+    vec3 x = ro + rd*tEnd;
+    float alt = x.y + ALT0;
+    float dR = exp(-alt/HR), dM = exp(-alt/HM)*uHaze, dC = uCanyonHaze*exp(-max(x.y, 0.0)/420.0);
+    float dt = tEnd - tPrev;
+    vec3 ext = BR*dR + (BME*dM + dC*1.1);
+    vec3 T = exp(-od - ext*dt*0.5);
+    od += ext*dt;
+    float vis = (x.y > uMaxHNear) ? 1.0 : sunVis(x + vec3(0.0, 5.0, 0.0));
+    aS += T*(BR*dR*phR + BMS*dM*phM + dC*phC)*vis*dt;
+    float sva = mix(skyVisAt(x.xz), 1.0, clamp(x.y*(1.0/1400.0), 0.0, 1.0));
+    aA += T*(BR*dR + BMS*dM + dC)*dt*sva;
+  }
+  vec3 tr = exp(-od);
+  return col*tr + aS*uSunCol + aA*uSkyAmb*0.6;
+}
+
+/* --- shading --------------------------------------------------------- */
+vec3 shadeTerrain(vec3 p, vec3 rd, float t, float E){
+  vec3 n = terrainNormal(p.xz, t);
+  vec3 alb = terrainAlbedo(p, n, t, E);
+  float ndl = dot(n, uSunDir);
+  float sh = 0.0;
+  if (ndl > 0.0){
+    sh = sunVis(p + n*2.0 + vec3(0.0, 2.5, 0.0));
+    if (sh > 0.0 && t < 3500.0) sh *= mix(detailShadow(p + n*0.25, t), 1.0, smoothstep(2500.0, 3500.0, t));
+  }
+  float ao = calcAO(p, n, t);
+  float sv = skyVisAt(p.xz);
+  vec3 sky = uSkyIrr*(0.6 + 0.4*n.y)*mix(sv, 1.0, 0.12)*ao;
+  vec3 bdir = normalize(vec3(-uSunDir.x, 0.15, -uSunDir.z));
+  float bsrc = bounceSrc(p);
+  vec3 bounce = uSunCol*vec3(0.40, 0.27, 0.20)*0.23*(0.3 + 0.7*max(dot(n, bdir), 0.0))*(1.0 - 0.75*sv)*ao*bsrc;
+  vec3 sun = uSunCol*max(ndl, 0.0)*sh;
+  return alb*(1.0/PI)*(sun + sky + bounce);
+}
+vec3 shadeTerrainCheap(vec3 p, float t, float E){
+  float fp = t*uPixAng;
+  float e = clamp(fp*1.5, 2.0, 40.0), E2;
+  vec4 hh = vec4(0.0);
+  for (int i = 0; i < uFour; i++){
+    vec2 o = (i == 0) ? vec2(e, 0.0) : (i == 1) ? vec2(-e, 0.0) : (i == 2) ? vec2(0.0, e) : vec2(0.0, -e);
+    hh[i] = terrainLow(p.xz + o, fp, E2);
+  }
+  vec3 n = normalize(vec3(hh.y - hh.x, 2.0*e, hh.w - hh.z));
+  vec3 alb = terrainAlbedo(p, n, t, E);
+  float ndl = max(dot(n, uSunDir), 0.0);
+  float sh = ndl > 0.0 ? sunVis(p + n*2.0 + vec3(0.0, 2.5, 0.0)) : 0.0;
+  float sv = skyVisAt(p.xz);
+  vec3 bdir = normalize(vec3(-uSunDir.x, 0.15, -uSunDir.z));
+  vec3 bounce = uSunCol*vec3(0.42, 0.27, 0.19)*0.32*(0.3 + 0.7*max(dot(n, bdir), 0.0))*(1.0 - 0.75*sv)*bounceSrc(p);
+  return alb*(1.0/PI)*(uSunCol*ndl*sh + uSkyIrr*(0.6 + 0.4*n.y)*sv + bounce);
+}
+
+// how much white water: rapids form just downstream of the debris fans
+float rapidsAt(vec3 p){
+  float r = 0.0;
+  for (int i = 0; i < 48; i++){
+    if (i >= uNumFans) break;
+    vec4 f = uFans[i];
+    float s = p.z - f.y;
+    if (s < -100.0 || s > 360.0) continue;
+    float w = smoothstep(-70.0, 10.0, s)*(1.0 - smoothstep(110.0, 330.0, s));
+    w *= 1.0 - smoothstep(60.0, 140.0, abs(p.x - f.x));
+    r = max(r, w);
+  }
+  return r;
+}
+float waterH(vec2 q, float fp, float rap){
+  float tm = uTime, h = 0.0;
+  float streak = 0.45 + 0.9*smoothstep(-0.35, 0.55, vnoise(vec2(q.x/16.0, (q.y - tm*2.4)/150.0)) + 0.4*vnoise(vec2(q.x/5.0, (q.y - tm*2.4)/60.0)));
+  float amp = streak*(1.0 + 2.6*rap);
+  float a = 1.0 - smoothstep(3.0, 10.0, fp);
+  if (a > 0.0) h += a*0.30*amp*vnoise(vec2(q.x/13.0, (q.y - tm*2.6)/24.0));
+  float b = 1.0 - smoothstep(1.0, 4.0, fp);
+  if (b > 0.0) h += b*0.10*amp*vnoise(vec2(q.x/4.2, (q.y - tm*2.9)/6.5) + 3.1);
+  float c = 1.0 - smoothstep(0.35, 1.4, fp);
+  if (c > 0.0) h += c*0.035*amp*vnoise(vec2(q.x/1.3, (q.y - tm*3.1)/1.9) + 7.3);
+  if (rap > 0.0 && a > 0.0) h += a*rap*0.45*sin(q.y*0.42 - tm*0.6 + 2.0*vnoise(q*0.05))*(0.6 + 0.4*vnoise(q*0.2));
+  return h;
+}
+vec3 shadeWater(vec3 p, vec3 rd, float t){
+  float fp = t*uPixAng;
+  vec2 tg = normalize(vec2(riverXd(p.z), 1.0)), nm = vec2(tg.y, -tg.x);
+  vec2 q = vec2(dot(p.xz, nm), dot(p.xz, tg));
+  float rap = rapidsAt(p);
+  float e = max(0.12, fp*0.5);
+  float h0 = waterH(q, fp, rap), hx = waterH(q + vec2(e, 0.0), fp, rap), hy = waterH(q + vec2(0.0, e), fp, rap);
+  vec2 gq = vec2(hx - h0, hy - h0)/e;
+  vec2 gw = gq.x*nm + gq.y*tg;
+  vec3 n = normalize(vec3(-gw.x, 1.0, -gw.y));
+  float cosi = max(dot(n, -rd), 0.0);
+  float F = 0.02 + 0.98*pow(1.0 - cosi, 5.0);
+  vec3 rr = reflect(rd, n); rr.y = max(rr.y, 0.003);
+  rr = normalize(rr);
+  float E2;
+  float tr = castRayLow(p + vec3(0.0, 0.4, 0.0), rr, 30000.0, E2);
+  vec3 refl;
+  if (tr > 0.0){
+    vec3 hp = p + rr*tr;
+    refl = atmosphere(shadeTerrainCheap(hp, t + tr, E2), p, rr, tr);
+  } else refl = skyColor(rr, false);
+  float sh = sunVis(p + vec3(0.0, 1.5, 0.0));
+  float sv = skyVisAt(p.xz);
+  float E3; float depth = max(0.0, -terrainLow(p.xz, fp, E3));
+  vec3 bed = vec3(0.09, 0.085, 0.065);
+  vec3 deep = vec3(0.018, 0.050, 0.036);
+  vec3 bodyAlb = mix(bed, deep, 1.0 - exp(-depth*0.5));
+  vec3 lightIn = uSunCol*max(uSunDir.y, 0.0)*sh + uSkyIrr*mix(sv, 1.0, 0.2);
+  vec3 body = bodyAlb*lightIn*(1.0/PI);
+  vec3 hv = normalize(uSunDir - rd);
+  float rough = 0.06 + min(fp*0.02, 0.2) + rap*0.1;
+  float ndh = max(dot(n, hv), 0.0);
+  float a2 = rough*rough;
+  float dd = ndh*ndh*(a2 - 1.0) + 1.0;
+  float D = a2/(PI*dd*dd);
+  vec3 col = mix(body, refl, F) + uSunCol*D*F*0.25*sh;
+  // white water
+  if (rap > 0.0){
+    float fn = vnoise(vec2(q.x/5.5, (q.y - uTime*4.2)/12.0)) + 0.55*vnoise(vec2(q.x/2.2, (q.y - uTime*4.8)/4.5) + 3.0);
+    float foam = smoothstep(0.25, 0.95, fn*0.8 + 0.3)*rap;
+    foam = mix(foam, rap*0.55, smoothstep(0.6, 2.5, fp));
+    vec3 fc = vec3(0.62, 0.64, 0.62)*lightIn*(1.0/PI);
+    col = mix(col, fc, clamp(foam, 0.0, 0.92));
+  }
+  return col;
+}
+
+void main(){
+  vec2 frag = gl_FragCoord.xy + uJitter;
+  vec2 ndc = frag/uRes*2.0 - 1.0;
+  vec3 rd = normalize(uCamFwd + ndc.x*uAspect*uTanHalf*uCamRight + ndc.y*uTanHalf*uCamUp);
+  vec3 ro = uCamPos;
+  bool water; float E;
+  float t = castRay(ro, rd, 90000.0, 0.42, 320, water, E);
+  vec3 col; float depth;
+  if (t < 0.0){
+    col = skyColor(rd, true);
+    depth = 10000.0;
+  } else {
+    vec3 p = ro + rd*t;
+    col = water ? shadeWater(p, rd, t) : shadeTerrain(p, rd, t, E);
+    col = atmosphere(col, ro, rd, t);
+    // very distant terrain dissolves into the horizon sky
+    float farF = (1.0 - exp(-max(t - 7000.0, 0.0)*(1.0/42000.0)))*0.9;
+    col = mix(col, skyLUT(normalize(vec3(rd.x, max(rd.y, 0.0) + 0.002, rd.z))), farF);
+    depth = t*0.001;
+  }
+  oCol = vec4(max(col, vec3(0.0)), depth);
+}`;
+
+/* Temporal anti-aliasing with reprojection and neighbourhood clipping */
+const FS_TAA = HDR + `
+uniform sampler2D uCur, uHist;
+uniform vec3 uCamPos, uCamRight, uCamUp, uCamFwd, uPCamPos, uPCamRight, uPCamUp, uPCamFwd;
+uniform float uTanHalf, uAspect, uBlend, uClamp;
+uniform vec2 uRes;
+out vec4 oCol;
+vec3 toY(vec3 c){ return vec3(0.25*c.r + 0.5*c.g + 0.25*c.b, 0.5*c.r - 0.5*c.b, -0.25*c.r + 0.5*c.g - 0.25*c.b); }
+vec3 fromY(vec3 y){ return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+vec3 tm(vec3 c){ return c/(1.0 + max(c.r, max(c.g, c.b))); }
+vec3 itm(vec3 c){ return c/max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
+vec4 histCR(vec2 uv){
+  vec2 sp = uv*uRes, tc = floor(sp - 0.5) + 0.5, f = sp - tc;
+  vec2 w0 = f*(-0.5 + f*(1.0 - 0.5*f)), w1 = 1.0 + f*f*(-2.5 + 1.5*f), w2 = f*(0.5 + f*(2.0 - 1.5*f)), w3 = f*f*(-0.5 + 0.5*f);
+  vec2 w12 = w1 + w2, tc0 = (tc - 1.0)/uRes, tc3 = (tc + 2.0)/uRes, tc12 = (tc + w2/w12)/uRes;
+  vec4 r = texture(uHist, vec2(tc12.x, tc0.y))*(w12.x*w0.y) + texture(uHist, vec2(tc0.x, tc12.y))*(w0.x*w12.y)
+         + texture(uHist, tc12)*(w12.x*w12.y) + texture(uHist, vec2(tc3.x, tc12.y))*(w3.x*w12.y)
+         + texture(uHist, vec2(tc12.x, tc3.y))*(w12.x*w3.y);
+  return r/((w12.x*w0.y) + (w0.x*w12.y) + (w12.x*w12.y) + (w3.x*w12.y) + (w12.x*w3.y));
+}
+void main(){
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(uCur, ip, 0);
+  vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++){
+    vec3 s = toY(tm(texelFetch(uCur, clamp(ip + ivec2(x, y), ivec2(0), ivec2(uRes) - 1), 0).rgb));
+    m1 += s; m2 += s*s;
+  }
+  m1 /= 9.0; m2 /= 9.0;
+  vec3 sig = sqrt(max(m2 - m1*m1, 0.0));
+  vec3 mn = m1 - 1.25*sig, mx = m1 + 1.25*sig;
+  vec2 uv = gl_FragCoord.xy/uRes;
+  vec2 ndc = uv*2.0 - 1.0;
+  vec3 rd = normalize(uCamFwd + ndc.x*uAspect*uTanHalf*uCamRight + ndc.y*uTanHalf*uCamUp);
+  vec3 wp = uCamPos + rd*(c.a*1000.0);
+  vec3 v = wp - uPCamPos;
+  float z = dot(v, uPCamFwd);
+  vec2 pn = vec2(dot(v, uPCamRight)/(z*uAspect*uTanHalf), dot(v, uPCamUp)/(z*uTanHalf));
+  vec2 puv = pn*0.5 + 0.5;
+  float a = uBlend;
+  vec3 res;
+  if (z <= 0.0 || any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) res = c.rgb;
+  else {
+    vec3 h = max(histCR(puv).rgb, vec3(0.0));
+    vec3 hy = toY(tm(h));
+    if (uClamp > 0.5){
+      vec3 cy = toY(tm(c.rgb));
+      vec3 cl = clamp(hy, mn, mx);
+      h = itm(fromY(cl));
+    }
+    float vel = length((puv - uv)*uRes);
+    if (a < 0.3) a = min(a + 0.035*vel, 0.35);
+    res = mix(h, c.rgb, a);
+  }
+  oCol = vec4(res, c.a);
+}`;
+
+/* Bloom chain */
+const FS_DOWN = HDR + `
+uniform sampler2D uSrc; uniform vec2 uSrcTexel, uDstRes; uniform float uFirst;
+out vec4 oCol;
+vec3 s(vec2 uv){ vec3 c = texture(uSrc, uv).rgb; if (uFirst > 0.5){ float l = max(c.r, max(c.g, c.b)); c *= min(1.0, 600.0/max(l, 1e-6)); } return c; }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uDstRes, d = uSrcTexel;
+  vec3 a = s(uv + d*vec2(-2, 2)), b = s(uv + d*vec2(0, 2)), c = s(uv + d*vec2(2, 2));
+  vec3 e = s(uv + d*vec2(-2, 0)), f = s(uv), g = s(uv + d*vec2(2, 0));
+  vec3 h = s(uv + d*vec2(-2, -2)), i = s(uv + d*vec2(0, -2)), j = s(uv + d*vec2(2, -2));
+  vec3 k = s(uv + d*vec2(-1, 1)), l = s(uv + d*vec2(1, 1)), m = s(uv + d*vec2(-1, -1)), n = s(uv + d*vec2(1, -1));
+  oCol = vec4(f*0.125 + (a + c + h + j)*0.03125 + (b + e + g + i)*0.0625 + (k + l + m + n)*0.125, 1.0);
+}`;
+const FS_UP = HDR + `
+uniform sampler2D uSrc; uniform vec2 uSrcTexel, uDstRes; uniform float uWeight;
+out vec4 oCol;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uDstRes, d = uSrcTexel*1.0;
+  vec3 r = texture(uSrc, uv + d*vec2(-1, 1)).rgb + 2.0*texture(uSrc, uv + d*vec2(0, 1)).rgb + texture(uSrc, uv + d*vec2(1, 1)).rgb
+         + 2.0*texture(uSrc, uv + d*vec2(-1, 0)).rgb + 4.0*texture(uSrc, uv).rgb + 2.0*texture(uSrc, uv + d*vec2(1, 0)).rgb
+         + texture(uSrc, uv + d*vec2(-1, -1)).rgb + 2.0*texture(uSrc, uv + d*vec2(0, -1)).rgb + texture(uSrc, uv + d*vec2(1, -1)).rgb;
+  oCol = vec4(r*(uWeight/16.0), 1.0);
+}`;
+/* Exposure metering */
+const FS_METER = HDR + `
+uniform sampler2D uSrc, uPrev; uniform float uRate;
+out vec4 oCol;
+void main(){
+  float s = 0.0, ws = 0.0;
+  for (int y = 0; y < 12; y++) for (int x = 0; x < 20; x++){
+    vec2 uv = (vec2(float(x), float(y)) + 0.5)/vec2(20.0, 12.0);
+    vec3 c = texture(uSrc, uv).rgb;
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    vec2 dc = (uv - 0.5)*vec2(1.0, 1.6);
+    float w = exp(-dot(dc, dc)*3.0);
+    s += w*log(clamp(l, 1e-3, 50.0)); ws += w;
+  }
+  float cur = exp(s/ws);
+  float prev = texture(uPrev, vec2(0.5)).r;
+  oCol = vec4(prev > 0.0 ? mix(prev, cur, uRate) : cur, 0.0, 0.0, 1.0);
+}`;
+/* Final composite: upscale + sharpen, bloom, exposure, AgX tonemap, grade, grain */
+const FS_FINAL = HDR + `
+uniform sampler2D uImg, uBloom, uExpo;
+uniform vec2 uOutRes, uInRes;
+uniform float uTime, uFade, uBloomStr, uExpBase, uSharp, uGrain;
+out vec4 oCol;
+vec3 agxCurve(vec3 x){ vec3 x2 = x*x, x4 = x2*x2; return 15.5*x4*x2 - 40.14*x4*x + 31.96*x4 - 6.868*x2*x + 0.4298*x2 + 0.1191*x - 0.00232; }
+vec3 agx(vec3 v){
+  const mat3 M = mat3(0.842479062253094, 0.0423282422610123, 0.0423756549057051, 0.0784335999999992, 0.878468636469772, 0.0784336, 0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+  const float lo = -12.47393, hi = 4.026069;
+  v = M*v; v = clamp(log2(max(v, vec3(1e-10))), lo, hi); v = (v - lo)/(hi - lo);
+  return agxCurve(v);
+}
+vec3 agxOut(vec3 v){
+  const mat3 Mi = mat3(1.19687900512017, -0.0528968517574562, -0.0529716355144438, -0.0980208811401368, 1.15190312990417, -0.0980434501171241, -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+  return Mi*v;
+}
+float h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uOutRes;
+  vec2 px = 1.0/uInRes;
+  vec2 ca = (uv - 0.5)*0.0011;
+  vec3 c = vec3(texture(uImg, uv + ca).r, texture(uImg, uv).g, texture(uImg, uv - ca).b);
+  vec3 nb = texture(uImg, uv + vec2(px.x, 0.0)).rgb + texture(uImg, uv - vec2(px.x, 0.0)).rgb + texture(uImg, uv + vec2(0.0, px.y)).rgb + texture(uImg, uv - vec2(0.0, px.y)).rgb;
+  c = max(c + (c - nb*0.25)*uSharp, vec3(0.0));
+  vec3 b = texture(uBloom, uv).rgb;
+  c = mix(c, b, uBloomStr);
+  float avg = texture(uExpo, vec2(0.5)).r;
+  float ex = uExpBase*pow(0.22/max(avg, 1e-4), 0.7);
+  c *= ex;
+  vec3 t = agx(c);
+  // look: gentle contrast and saturation
+  float lum = dot(t, vec3(0.2126, 0.7152, 0.0722));
+  t = pow(max(t, vec3(0.0)), vec3(1.22));
+  lum = dot(t, vec3(0.2126, 0.7152, 0.0722));
+  t = lum + 1.25*(t - lum);
+  t = agxOut(t);
+  vec2 q = uv - 0.5; q.x *= uOutRes.x/uOutRes.y;
+  t *= mix(1.0, smoothstep(1.25, 0.25, length(q)), 0.38);
+  float gr = h12(gl_FragCoord.xy + fract(uTime*7.31)*vec2(311.7, 183.3)) + h12(gl_FragCoord.xy*1.37 + fract(uTime*3.17)*vec2(97.1, 51.9)) - 1.0;
+  t += gr*uGrain*(0.35 + 0.65*sqrt(max(lum, 0.0)));
+  t *= uFade;
+  t += (h12(gl_FragCoord.xy + 0.5) - 0.5)/255.0;
+  oCol = vec4(clamp(t, 0.0, 1.0), 1.0);
+}`;
+
+/* ------------------------------------------------------------- GL helpers */
+function compile(type, src, name) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const lines = src.split('\n').map((l, i) => (i + 1) + ': ' + l);
+    const m = /ERROR: \d+:(\d+)/.exec(log || '');
+    const ctx = m ? lines.slice(Math.max(0, +m[1] - 4), +m[1] + 2).join('\n') : '';
+    throw new Error((name || 'shader') + ' compile error:\n' + log + '\n' + ctx);
+  }
+  return s;
+}
+let VSO = null;
+function program(fsSrc, name, vsSrc) {
+  if (!VSO) VSO = compile(gl.VERTEX_SHADER, VS, 'vs');
+  const p = gl.createProgram();
+  gl.attachShader(p, vsSrc ? compile(gl.VERTEX_SHADER, vsSrc, name + '-vs') : VSO);
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc, name)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(name + ' link error: ' + gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    u[info.name.replace(/\[0\]$/, '')] = {loc: gl.getUniformLocation(p, info.name), type: info.type, size: info.size};
+  }
+  return {p, u, name};
+}
+function setUniforms(prog, U) {
+  let unit = 0;
+  for (const k in U) {
+    const e = prog.u[k]; if (!e) continue;
+    const v = U[k];
+    switch (e.type) {
+      case gl.FLOAT: e.size > 1 ? gl.uniform1fv(e.loc, v) : gl.uniform1f(e.loc, v); break;
+      case gl.FLOAT_VEC2: gl.uniform2fv(e.loc, v); break;
+      case gl.FLOAT_VEC3: gl.uniform3fv(e.loc, v); break;
+      case gl.FLOAT_VEC4: gl.uniform4fv(e.loc, v); break;
+      case gl.INT: case gl.BOOL: gl.uniform1i(e.loc, v); break;
+      case gl.SAMPLER_2D: gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, v); gl.uniform1i(e.loc, unit); unit++; break;
+    }
+  }
+}
+function draw(prog, target, U, rect) {
+  gl.useProgram(prog.p);
+  setUniforms(prog, U);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+  const w = target ? target.w : canvas.width, h = target ? target.h : canvas.height;
+  gl.viewport(0, 0, w, h);
+  if (rect) { gl.enable(gl.SCISSOR_TEST); gl.scissor(rect[0], rect[1], rect[2], rect[3]); }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  if (rect) gl.disable(gl.SCISSOR_TEST);
+}
+function makeTex(w, h, internal, filter, wrap, levels) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, levels || 1, internal, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, levels > 1 ? (filter === gl.LINEAR ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_NEAREST) : filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap || gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap || gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeTarget(w, h, specs) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const texs = specs.map((s, i) => {
+    const t = makeTex(w, h, s[0], s[1], null, s[2]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0);
+    return t;
+  });
+  gl.drawBuffers(specs.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error('framebuffer incomplete ' + st);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {fbo, tex: texs[0], texs, w, h};
+}
+function freeTarget(t) { if (!t) return; gl.deleteFramebuffer(t.fbo); t.texs.forEach(x => gl.deleteTexture(x)); }
+const FLT_FILTER = FLOAT_LINEAR ? gl.LINEAR : gl.NEAREST;
+
+/* ------------------------------------------------------------- vector math */
+const V = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: a => Math.hypot(a[0], a[1], a[2]),
+  norm: a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  lerp: (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t],
+};
+const SUN = [Math.cos(SUN_EL) * Math.sin(SUN_AZ), Math.sin(SUN_EL), Math.cos(SUN_EL) * Math.cos(SUN_AZ)];
+
+/* JS mirrors of a few GLSL functions (camera clearance) */
+function fract(x) { return x - Math.floor(x); }
+function hash12(px, py) {
+  let x = fract(px * 0.1031), y = fract(py * 0.1031), z = fract(px * 0.1031);
+  const d = x * (y + 33.33) + y * (z + 33.33) + z * (x + 33.33);
+  x += d; y += d; z += d;
+  return fract((x + y) * z);
+}
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10), uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const a = hash12(ix, iy), b = hash12(ix + 1, iy), c = hash12(ix, iy + 1), d = hash12(ix + 1, iy + 1);
+  return -1 + 2 * (a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy);
+}
+function plateauJS(x, z, E) {
+  const s = (E - (RIM_E + 30)) / 670, m = s <= 0 ? 0 : s >= 1 ? 1 : s * s * (3 - 2 * s);
+  if (m <= 0) return 0;
+  return m * (24 * vnoise(x / 2900 + 5.2, z / 2900 + 1.3) + 8 * vnoise(x / 760 + 2.1, z / 760 + 7.7));
+}
+let FIELD = null; // Float32Array of E
+function fieldEJS(x, z) {
+  const N = FIELD_N;
+  let sx = ((x - WORLD_C[0]) / WORLD_SIZE + 0.5) * N - 0.5, sz = ((z - WORLD_C[1]) / WORLD_SIZE + 0.5) * N - 0.5;
+  sx = Math.min(N - 1.001, Math.max(0, sx)); sz = Math.min(N - 1.001, Math.max(0, sz));
+  const ix = Math.floor(sx), iz = Math.floor(sz), fx = sx - ix, fz = sz - iz;
+  const i0 = iz * N + ix;
+  const a = FIELD[i0], b = FIELD[i0 + 1], c = FIELD[i0 + N], d = FIELD[i0 + N + 1];
+  return (a + (b - a) * fx) * (1 - fz) + (c + (d - c) * fx) * fz;
+}
+function groundJS(x, z) { const E = fieldEJS(x, z); return Math.max(0, profileJS(E) + plateauJS(x, z, E)); }
+
+/* ------------------------------------------------------- strata colour LUT */
+function buildStrata() {
+  const N = 2048, Y0 = -20, SPAN = 1640;
+  // [top of formation (m above river), sRGB colour, alternate colour, alternate probability, bed contrast]
+  const F = [
+    [0.6,  [104, 96, 82],  null, 0, 0.04],     // submerged gravel
+    [8,    [156, 138, 110], null, 0, 0.03],    // beaches, sand bars
+    [366,  [62, 59, 58],   null, 0, 0.008],   // Vishnu schist (no bedding)
+    [446,  [118, 86, 62],  [132, 98, 70], 0.4, 0.05],   // Tapeats sandstone
+    [531,  [122, 118, 96], [136, 128, 104], 0.4, 0.05], // Bright Angel shale
+    [606,  [146, 130, 112],[128, 112, 96], 0.35, 0.06], // Muav limestone
+    [781,  [170, 104, 76], [176, 114, 86], 0.25, 0.035], // Redwall limestone (iron stained)
+    [1056, [158, 84, 58],  [168, 100, 70], 0.3, 0.035], // Supai group
+    [1156, [144, 70, 48],  [150, 76, 52], 0.3, 0.03],   // Hermit shale
+    [1266, [218, 198, 162],[206, 184, 148], 0.3, 0.04], // Coconino sandstone
+    [1336, [184, 160, 126],[174, 150, 116], 0.4, 0.04], // Toroweap formation
+    [1429, [196, 184, 162],[178, 166, 144], 0.35, 0.05],// Kaibab limestone
+    [1700, [168, 156, 132], null, 0, 0.03],     // plateau surface
+  ];
+  const lin = c => Math.pow(c / 255, 2.2);
+  let seed = 1234567;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const rock = new Float32Array(N * 3);
+  let bedEnd = -1e9, bedF = 1, bedAlt = 0, bedHue = 0;
+  let prevF = -1;
+  for (let i = 0; i < N; i++) {
+    const y = Y0 + (i + 0.5) / N * SPAN;
+    let fi = F.findIndex(f => y < f[0]); if (fi < 0) fi = F.length - 1;
+    const f = F[fi];
+    if (y > bedEnd || fi !== prevF) {
+      bedEnd = y + 0.8 + rnd() * rnd() * 7;
+      bedF = 1 + (rnd() * 2 - 1) * f[4] * 2;
+      bedAlt = f[2] && rnd() < f[3] ? 1 : 0;
+      bedHue = (rnd() * 2 - 1) * 0.03;
+      prevF = fi;
+    }
+    const base = bedAlt ? f[2] : f[1];
+    // blend into the formation below over a few metres
+    const below = fi > 0 ? F[fi - 1] : f;
+    const tb = Math.min(1, (y - (fi > 0 ? F[fi - 1][0] : -1e9)) / 3.5);
+    const c = [0, 1, 2].map(k => lin(base[k]) * bedF * (1 + (k === 0 ? bedHue : k === 2 ? -bedHue : 0)));
+    const cb = [0, 1, 2].map(k => lin(below[1][k]));
+    for (let k = 0; k < 3; k++) rock[i * 3 + k] = cb[k] + (c[k] - cb[k]) * (tb < 0 ? 1 : tb);
+  }
+  // talus/debris colour: mix of local rock and the rock that falls from above
+  const deb = new Float32Array(N * 3);
+  const px = SPAN / N;
+  for (let i = 0; i < N; i++) {
+    const a = [0, 0, 0]; let w = 0;
+    for (let j = 0; j < 90; j += 3) {
+      const ii = Math.min(N - 1, i + Math.round(j / px));
+      const ww = Math.exp(-j / 45);
+      for (let k = 0; k < 3; k++) a[k] += rock[ii * 3 + k] * ww;
+      w += ww;
+    }
+    for (let k = 0; k < 3; k++) deb[i * 3 + k] = (0.55 * rock[i * 3 + k] + 0.45 * a[k] / w) * 0.94;
+  }
+  const data = new Uint8Array(N * 2 * 4);
+  const enc = v => Math.round(255 * Math.pow(Math.min(1, Math.max(0, v)), 1 / 2.2));
+  for (let i = 0; i < N; i++) {
+    for (let k = 0; k < 3; k++) { data[i * 4 + k] = enc(rock[i * 3 + k]); data[(N + i) * 4 + k] = enc(deb[i * 3 + k]); }
+    data[i * 4 + 3] = 255; data[(N + i) * 4 + 3] = 255;
+  }
+  const t = makeTex(N, 2, gl.SRGB8_ALPHA8, gl.LINEAR);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, 2, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  return t;
+}
+
+/* -------------------------------------------------------- drainage network */
+/* A dendritic channel network grown away from the river: long side canyons,
+   their branches and short wall gullies. Channel floors rise upstream, so the
+   resulting erosion field carves amphitheatres, promontories and buttes. */
+function mulberry(seed) {
+  let s = seed >>> 0;
+  return () => { s = (s + 0x6D2B79F5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function buildNetwork() {
+  const rnd = mulberry(91731);
+  const CELL = 120, grid = new Map(), chans = [];
+  const gkey = (cx, cz) => (cx + 4096) * 8192 + (cz + 4096);
+  const addPts = (pts, id) => {
+    for (const p of pts) {
+      const k = gkey(Math.floor(p[0] / CELL), Math.floor(p[1] / CELL));
+      let a = grid.get(k); if (!a) { a = []; grid.set(k, a); }
+      a.push(p[0], p[1], id);
+    }
+  };
+  const clearance = (x, z, r, self, parent) => {
+    const c0 = Math.floor((x - r) / CELL), c1 = Math.floor((x + r) / CELL), d0 = Math.floor((z - r) / CELL), d1 = Math.floor((z + r) / CELL);
+    let m = Infinity;
+    for (let cx = c0; cx <= c1; cx++) for (let cz = d0; cz <= d1; cz++) {
+      const a = grid.get(gkey(cx, cz)); if (!a) continue;
+      for (let i = 0; i < a.length; i += 3) {
+        const id = a[i + 2]; if (id === self || id === parent) continue;
+        const d = Math.hypot(a[i] - x, a[i + 1] - z); if (d < m) m = d;
+      }
+    }
+    return m;
+  };
+  const LIM = WORLD_SIZE / 2 - 300;
+  function grow(x, z, ang, floor0, o, parent, prefFn) {
+    const id = chans.length, pts = [[x, z, floor0]];
+    let a = ang, da = 0, len = 0;
+    while (len < o.len) {
+      da = da * 0.8 + (rnd() - 0.5) * o.wiggle;
+      a += da;
+      let diff = prefFn(x, z, len) - a; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+      a += diff * o.bias;
+      const nx = x + Math.cos(a) * o.step, nz = z + Math.sin(a) * o.step;
+      if (Math.abs(nx - WORLD_C[0]) > LIM || Math.abs(nz - WORLD_C[1]) > LIM) break;
+      if (clearance(nx, nz, o.clear, id, parent) < o.clear) break;
+      len += o.step;
+      const s = len / o.len;
+      const floor = floor0 + len * o.grad + o.head * s * s * s;
+      x = nx; z = nz;
+      pts.push([x, z, floor]);
+      if (floor > o.maxFloor) break;
+    }
+    if (pts.length < o.minPts) return -1;
+    chans.push({pts, order: o.order, parent}); addPts(pts, id);
+    return id;
+  }
+  const main = [];
+  for (let z = -WORLD_SIZE / 2 - 3000; z <= WORLD_SIZE / 2 + 3000; z += 40) main.push([riverX(z), z, 0]);
+  chans.push({pts: main, order: 0}); addPts(main, 0);
+  const riverNormal = (z, side) => { const d = riverXd(z), t = Math.hypot(d, 1); return [side / t, -side * d / t, d / t, 1 / t]; };
+  // primary side canyons
+  const prim = [];
+  for (const side of [-1, 1]) {
+    let z = -WORLD_SIZE / 2 + 300 + rnd() * 1200;
+    while (z < WORLD_SIZE / 2 - 300) {
+      const [nx, nz, tx, tz] = riverNormal(z, side);
+      const k = rnd() < 0.8 ? 0.2 + rnd() * 0.8 : -rnd() * 0.35;
+      const ang = Math.atan2(nz - tz * k, nx - tx * k);
+      const pref = (px, pz) => { const [mx, mz, ux, uz] = riverNormal(pz, side); return Math.atan2(mz - uz * k * 0.6, mx - ux * k * 0.6); };
+      const id = grow(riverX(z) + nx * 25, z + nz * 25, ang, 60,
+        {len: 4000 + rnd() * rnd() * 10000, step: 60, wiggle: 0.11, bias: 0.05, grad: 0.16 + rnd() * 0.16, head: 800,
+         maxFloor: RIM_E + 300, clear: 360, order: 1, minPts: 12}, 0, pref);
+      if (id >= 0) prim.push(id);
+      z += 1300 + rnd() * 1900;
+    }
+  }
+  // branches of side canyons, then their branches
+  function branches(parents, o) {
+    const out = [];
+    for (const pid of parents) {
+      const pts = chans[pid].pts;
+      let i = o.first + Math.floor(rnd() * o.first);
+      while (i < pts.length - 3) {
+        const [x, z, f] = pts[i];
+        const q = pts[Math.min(pts.length - 1, i + 2)];
+        const ul = Math.hypot(q[0] - x, q[1] - z) || 1, ux = (q[0] - x) / ul, uz = (q[1] - z) / ul;
+        const side = rnd() < 0.5 ? -1 : 1, px = -uz * side, pz = ux * side;
+        const th = (o.minAng + rnd() * (o.maxAng - o.minAng)) * Math.PI / 180;
+        const pa = Math.atan2(Math.cos(th) * uz + Math.sin(th) * pz, Math.cos(th) * ux + Math.sin(th) * px);
+        const id = grow(x, z, pa, f + 12, {len: o.lenMin + rnd() * o.lenVar, step: o.step, wiggle: o.wiggle, bias: 0.05,
+          grad: o.gradMin + rnd() * o.gradVar, head: o.head, maxFloor: RIM_E + 250, clear: o.clear, order: o.order, minPts: 5}, pid, () => pa);
+        if (id >= 0) out.push(id);
+        i += o.every + Math.floor(rnd() * o.every);
+      }
+    }
+    return out;
+  }
+  const sec = branches(prim, {first: 7, every: 9, minAng: 35, maxAng: 80, lenMin: 900, lenVar: 3000, step: 50, wiggle: 0.13,
+                              gradMin: 0.3, gradVar: 0.3, head: 450, clear: 250, order: 2});
+  branches(sec, {first: 5, every: 7, minAng: 40, maxAng: 85, lenMin: 300, lenVar: 1200, step: 40, wiggle: 0.15,
+                 gradMin: 0.55, gradVar: 0.4, head: 250, clear: 150, order: 3});
+  // short gullies straight off the river into the inner gorge and platform
+  for (const side of [-1, 1]) {
+    let z = -WORLD_SIZE / 2 + 200 + rnd() * 400;
+    while (z < WORLD_SIZE / 2 - 200) {
+      const [nx, nz, tx, tz] = riverNormal(z, side);
+      const k = (rnd() - 0.3) * 0.8;
+      const pa = Math.atan2(nz - tz * k, nx - tx * k);
+      grow(riverX(z) + nx * 25, z + nz * 25, pa, 70, {len: 700 + rnd() * 2200, step: 40, wiggle: 0.16, bias: 0.04,
+        grad: 0.36 + rnd() * 0.42, head: 300, maxFloor: RIM_E + 200, clear: 150, order: 3, minPts: 5}, 0, () => pa);
+      z += 260 + rnd() * 480;
+    }
+  }
+  let nseg = 0; for (const c of chans) nseg += c.pts.length - 1;
+  const v = new Float32Array(nseg * 6); let o = 0;
+  for (const c of chans) for (let i = 0; i + 1 < c.pts.length; i++) {
+    v[o++] = c.pts[i][0]; v[o++] = c.pts[i][1]; v[o++] = c.pts[i][2];
+    v[o++] = c.pts[i + 1][0]; v[o++] = c.pts[i + 1][1]; v[o++] = c.pts[i + 1][2];
+  }
+  window.__net = {channels: chans.length, segments: nseg};
+  window.__chans = chans;
+  return v;
+}
+
+/* Debris fans where the larger side canyons meet the river */
+function buildFans() {
+  const out = [];
+  for (const c of window.__chans) {
+    if (c.order !== 1 || c.parent !== 0) continue;
+    const a = c.pts[0], b = c.pts[Math.min(3, c.pts.length - 1)];
+    const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    const x = a[0] + (b[0] - a[0]) / l * 45, z = a[1] + (b[1] - a[1]) / l * 45;
+    const h = Math.abs(Math.sin(x * 12.9898 + z * 78.233) * 43758.5453) % 1;
+    out.push([x, z, 72 + 16 * h, 0]);
+  }
+  out.sort((p, q) => Math.abs(p[1]) - Math.abs(q[1]));
+  return out.slice(0, 48);
+}
+
+/* ---------------------------------------------------------------- programs */
+let P = {};
+const R = {}; // resources
+const S = {}; // scene constants (sun colour, sky irradiance ...)
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const setLoad = f => { $('loadbar').style.width = (f * 100).toFixed(0) + '%'; };
+
+async function init() {
+  const t0 = performance.now();
+  P.field1 = program(FS_FIELD.replace('#version 300 es', '#version 300 es\n#define FIELD_STAGE1'), 'field1');
+  P.field = program(FS_FIELD, 'field');
+  P.shadow = program(FS_SHADOW, 'shadow');
+  P.sky = program(FS_SKY, 'sky');
+  setLoad(0.1); await sleep(0);
+  const worldU = [WORLD_C[0], WORLD_C[1], WORLD_SIZE, 1 / WORLD_SIZE];
+  const fres = [FIELD_N, FIELD_N];
+  // Pass A1: rasterise the drainage network as seeds (lowest floor wins via depth test)
+  const net = buildNetwork();
+  P.seed = program(FS_SEED, 'seed', VS_SEED);
+  P.jfa = program(FS_JFA, 'jfa');
+  let sa = makeTarget(FIELD_N, FIELD_N, [[gl.RGBA32F, gl.NEAREST]]), sb = makeTarget(FIELD_N, FIELD_N, [[gl.RGBA32F, gl.NEAREST]]);
+  const depthRB = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depthRB);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, FIELD_N, FIELD_N);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sa.fbo);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB);
+  gl.viewport(0, 0, FIELD_N, FIELD_N);
+  gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]);
+  gl.clearBufferfv(gl.DEPTH, 0, [1]);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.bufferData(gl.ARRAY_BUFFER, net, gl.STATIC_DRAW);
+  const aLoc = gl.getAttribLocation(P.seed.p, 'aP');
+  gl.enableVertexAttribArray(aLoc); gl.vertexAttribPointer(aLoc, 3, gl.FLOAT, false, 0, 0);
+  gl.useProgram(P.seed.p); setUniforms(P.seed, {uWorld: worldU});
+  gl.drawArrays(gl.LINES, 0, net.length / 3);
+  gl.disable(gl.DEPTH_TEST);
+  gl.bindVertexArray(null); gl.deleteBuffer(vbo); gl.deleteVertexArray(vao);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, null);
+  gl.deleteRenderbuffer(depthRB);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // Pass A2: jump flooding for min(floor + distance)
+  for (let step = FIELD_N / 2; step >= 1; step >>= 1) {
+    draw(P.jfa, sb, {uSeed: sa.tex, uWorld: worldU, uFieldRes: fres, uStep: step});
+    [sa, sb] = [sb, sa];
+    gl.finish(); await sleep(0);
+  }
+  draw(P.jfa, sb, {uSeed: sa.tex, uWorld: worldU, uFieldRes: fres, uStep: 1}); [sa, sb] = [sb, sa];
+  setLoad(0.2); await sleep(0);
+  // Pass A3: erosion field with wall irregularity and buttes
+  const bu = new Float32Array(32);
+  BUTTES.forEach((b, i) => bu.set(b, i * 4));
+  const fans = buildFans(), fu = new Float32Array(48 * 4);
+  fans.forEach((f, i) => fu.set(f, i * 4));
+  S.fans = fu; S.numFans = fans.length; window.__fans = fans;
+  const strips = 8;
+  // A3: base erosion field (warp, noise, fans, buttes) written as one seed per texel
+  for (let s = 0; s < strips; s++) {
+    draw(P.field1, sb, {uWorld: worldU, uFieldRes: fres, uSeed: sa.tex, uButtes: bu, uNumButtes: BUTTES.length,
+      uFans: fu, uNumFans: fans.length}, [0, s * FIELD_N / strips, FIELD_N, FIELD_N / strips]);
+    gl.finish(); setLoad(0.2 + 0.05 * (s + 1) / strips); await sleep(0);
+  }
+  [sa, sb] = [sb, sa];
+  // A4: Lipschitz envelope min(E(q) + |p - q|) via jump flooding
+  for (let step = FIELD_N / 2; step >= 1; step >>= 1) {
+    draw(P.jfa, sb, {uSeed: sa.tex, uWorld: worldU, uFieldRes: fres, uStep: step});
+    [sa, sb] = [sb, sa];
+    gl.finish(); await sleep(0);
+  }
+  // A5: final field with slope-aligned gullies
+  R.field = makeTarget(FIELD_N, FIELD_N, [[gl.R32F, FLT_FILTER, FLOAT_LINEAR ? Math.log2(FIELD_N) + 1 : 1]]);
+  for (let s = 0; s < strips; s++) {
+    draw(P.field, R.field, {uWorld: worldU, uFieldRes: fres, uSeed: sa.tex}, [0, s * FIELD_N / strips, FIELD_N, FIELD_N / strips]);
+    gl.finish(); setLoad(0.25 + 0.05 * (s + 1) / strips); await sleep(0);
+  }
+  freeTarget(sa); freeTarget(sb);
+  if (FLOAT_LINEAR) { gl.bindTexture(gl.TEXTURE_2D, R.field.tex); gl.generateMipmap(gl.TEXTURE_2D); }
+  // read the field back for camera clearance
+  FIELD = new Float32Array(FIELD_N * FIELD_N);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, R.field.fbo);
+  const rows = 128, buf = new Float32Array(FIELD_N * rows * 4);
+  for (let y = 0; y < FIELD_N; y += rows) {
+    gl.readPixels(0, y, FIELD_N, rows, gl.RGBA, gl.FLOAT, buf);
+    for (let i = 0; i < FIELD_N * rows; i++) FIELD[y * FIELD_N + i] = buf[i * 4];
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  let maxE = 0; for (let i = 0; i < FIELD.length; i++) if (FIELD[i] > maxE) maxE = FIELD[i];
+  S.maxHNear = profileJS(maxE) + 33 + 100 + 11 + 3;     // plateau noise, far relief, trees
+  S.maxH = S.maxHNear + 262;                              // distant mesas (only beyond 12 km)
+  // Profile lookup table (E -> height)
+  {
+    const d = new Float32Array(PROF_N * 2), dE = PROF_EMAX / (PROF_N - 1);
+    for (let i = 0; i < PROF_N; i++) {
+      const E = i * dE;
+      d[i * 2] = profileJS(E);
+      d[i * 2 + 1] = (profileJS(E + 6) - profileJS(Math.max(0, E - 6))) / (E + 6 - Math.max(0, E - 6));
+    }
+    R.profile = makeTex(PROF_N, 1, gl.RG32F, FLT_FILTER);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PROF_N, 1, gl.RG, gl.FLOAT, d);
+  }
+  // Pass B: shadow heights + sky visibility
+  R.shadow = makeTarget(FIELD_N, FIELD_N, [[FLOAT_LINEAR ? gl.RG32F : gl.RG16F, gl.LINEAR], [gl.RGBA8, gl.LINEAR]]);
+  const sstrips = 16;
+  for (let s = 0; s < sstrips; s++) {
+    draw(P.shadow, R.shadow, {uWorld: worldU, uFieldRes: fres, uFieldLodK: FIELD_N / WORLD_SIZE, uField: R.field.tex, uProfile: R.profile, uSunDir: SUN, uSunHalf: 0.0075},
+      [0, s * FIELD_N / sstrips, FIELD_N, FIELD_N / sstrips]);
+    gl.finish(); setLoad(0.3 + 0.55 * (s + 1) / sstrips); await sleep(0);
+  }
+  // Sky LUT
+  R.sky = makeTarget(256, 128, [[FLOAT_LINEAR ? gl.RGBA32F : gl.RGBA16F, gl.LINEAR]]);
+  draw(P.sky, R.sky, {uSunDir: SUN, uHaze: SKY_HAZE, uAlt: ALT0_JS + 700});
+  computeSkyConstants();
+  R.strata = buildStrata();
+  setLoad(0.9); await sleep(0);
+  P.scene = program(FS_SCENE, 'scene');
+  P.taa = program(FS_TAA, 'taa');
+  P.down = program(FS_DOWN, 'down');
+  P.up = program(FS_UP, 'up');
+  P.meter = program(FS_METER, 'meter');
+  P.final = program(FS_FINAL, 'final');
+  R.expo = [makeTarget(1, 1, [[gl.R32F, gl.NEAREST]]), makeTarget(1, 1, [[gl.R32F, gl.NEAREST]])];
+  buildPath();
+  window.__initMs = performance.now() - t0;
+  setLoad(1);
+}
+const ALT0_JS = 750;
+
+/* Sun colour, sky irradiance and ambient from the sky LUT */
+function computeSkyConstants() {
+  // sun transmittance from canyon altitude (matches the sky shader's model)
+  const RG = 6360e3, RT = 6460e3, BR = [5.802e-6, 13.558e-6, 33.1e-6], BME = 4.44e-6, BO = [0.65e-6, 1.881e-6, 0.085e-6];
+  const ro = [0, RG + ALT0_JS + 700, 0];
+  const b = V.dot(ro, SUN), c = V.dot(ro, ro) - RT * RT, L = -b + Math.sqrt(b * b - c);
+  let odR = 0, odM = 0, odO = 0; const n = 400;
+  for (let i = 0; i < n; i++) {
+    const p = V.add(ro, V.mul(SUN, L * (i + 0.5) / n)); const h = V.len(p) - RG;
+    odR += Math.exp(-h / 8000); odM += Math.exp(-h / 1200); odO += Math.max(0, 1 - Math.abs(h - 25000) / 15000);
+  }
+  const ds = L / n;
+  S.sunCol = [0, 1, 2].map(k => 20 * Math.exp(-(BR[k] * odR + BME * SKY_HAZE * odM + BO[k] * odO) * ds));
+  // integrate sky LUT
+  const W = 256, H = 128, px = new Float32Array(W * H * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, R.sky.fbo);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, px);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  const irr = [0, 0, 0], avg = [0, 0, 0]; let wsum = 0;
+  for (let j = 0; j < H; j++) {
+    const v0 = j / H * 2 - 1, v1 = (j + 1) / H * 2 - 1, vm = (v0 + v1) / 2;
+    const el = Math.sign(vm) * vm * vm * Math.PI / 2;
+    if (el <= 0) continue;
+    const e0 = Math.sign(v0) * v0 * v0 * Math.PI / 2, e1 = Math.sign(v1) * v1 * v1 * Math.PI / 2;
+    const dOmega = (Math.sin(e1) - Math.sin(e0)) * 2 * Math.PI / W;
+    for (let i = 0; i < W; i++) {
+      for (let k = 0; k < 3; k++) { irr[k] += px[(j * W + i) * 4 + k] * Math.sin(el) * dOmega; avg[k] += px[(j * W + i) * 4 + k] * dOmega; }
+      wsum += dOmega;
+    }
+  }
+  S.skyIrr = irr;
+  const ground = S.sunCol.map((v, k) => v * Math.sin(SUN_EL) * [0.32, 0.22, 0.16][k] / Math.PI);
+  S.skyAmb = avg.map((v, k) => 0.5 * v / wsum + 0.5 * ground[k] * 0.6);
+  window.__sky = {sunCol: S.sunCol, skyIrr: S.skyIrr, skyAmb: S.skyAmb};
+}
+
+/* -------------------------------------------------------------- flight path */
+/* Keyframes are [time, x, y, z] for the camera and for a look-at target. */
+let PATH = null;
+function defaultKeys() {
+  // [time, x, y, z]: west rim reveal, descent past temples, dive into the inner gorge, river, climb to a northward vista
+  const Pk = [
+    [0,   -4350, 1565, -2250], [8,   -3700, 1535, -2130], [17,  -2950, 1310, -1750], [26,  -2300, 1060, -1100],
+    [34,  -1900,  840,  -480], [41,  -1450,  870,    30], [49,   -650,  740,   160], [56,    150,  630,   250],
+    [62,    790,  320,   430], [70,    990,  165,   960], [76,   1110,  135,  1550],
+    [82,   1110,  150,  2100], [88,   1030,  120,  2600], [94,    925,  125,  3150], [100,   950,  160,  3700],
+    [106,  1250,  380,  4200], [112,  1650,  800,  4550], [119,  2050, 1250,  4800], [126,  2350, 1600,  5000],
+  ];
+  const Tk = [
+    [0,   -1500, 1050, -1950], [8,   -1300,  760, -1600], [17,  -1200,  500,  -400], [26,  -1300,  450,   300],
+    [34,  -1250,  600,   500], [41,   -300,  650,   300], [49,   1200,  620,   600], [55,   1500,  380,   900],
+    [58,   1150,   80,   950], [62,    980,   55,  1000], [70,   1100,   70,  1600], [76,   1150,   80,  2200],
+    [82,   1050,   80,  2900], [88,    950,   90,  3400], [94,    950,  110,  3900], [100,  1150,  250,  4500],
+    [106,  1500,  700,  5400], [112,  1400,  900,  6600], [119,   300,  900,  8200], [126, -1500,  800,  9000],
+  ];
+  return {Pk, Tk};
+}
+function hermite(keys, t) {
+  const n = keys.length;
+  if (t <= keys[0][0]) return keys[0].slice(1);
+  if (t >= keys[n - 1][0]) return keys[n - 1].slice(1);
+  let i = 0; while (i < n - 2 && keys[i + 1][0] < t) i++;
+  const k0 = keys[Math.max(0, i - 1)], k1 = keys[i], k2 = keys[i + 1], k3 = keys[Math.min(n - 1, i + 2)];
+  const dt = k2[0] - k1[0], s = (t - k1[0]) / dt;
+  const s2 = s * s, s3 = s2 * s;
+  const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
+  const out = [];
+  for (let c = 1; c < 4; c++) {
+    const m1 = (k2[c] - k0[c]) / Math.max(1e-6, k2[0] - k0[0]) * dt;
+    const m2 = (k3[c] - k1[c]) / Math.max(1e-6, k3[0] - k1[0]) * dt;
+    out.push(h00 * k1[c] + h10 * m1 + h01 * k2[c] + h11 * m2);
+  }
+  return out;
+}
+function buildPath() {
+  const {Pk, Tk} = window.__keys || defaultKeys();
+  const HZ = 30, n = Math.ceil(DURATION * HZ) + 1;
+  const pos = [], tgt = [];
+  for (let i = 0; i < n; i++) { const t = i / HZ; pos.push(hermite(Pk, t)); tgt.push(hermite(Tk, t)); }
+  // terrain clearance: lift the camera smoothly wherever it would come too close
+  const need = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const [x, y, z] = pos[i];
+    let g = groundJS(x, z);
+    for (let k = 0; k < 8; k++) { const a = k / 8 * Math.PI * 2; g = Math.max(g, groundJS(x + 45 * Math.cos(a), z + 45 * Math.sin(a)) - 8); }
+    need[i] = Math.max(0, g + 32 - y);
+  }
+  const win = Math.round(1.4 * HZ), mx = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let m = 0; for (let j = Math.max(0, i - win); j <= Math.min(n - 1, i + win); j++) m = Math.max(m, need[j]); mx[i] = m; }
+  const sig = 0.6 * HZ, lift = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0, w = 0;
+    for (let j = Math.max(0, i - 3 * sig); j <= Math.min(n - 1, i + 3 * sig); j++) { const ww = Math.exp(-((j - i) ** 2) / (2 * sig * sig)); s += mx[Math.round(j)] * ww; w += ww; }
+    lift[i] = s / w;
+  }
+  for (let i = 0; i < n; i++) pos[i][1] += lift[i];
+  PATH = {pos, tgt, HZ, n, lift};
+  window.__path = PATH;
+}
+function samplePath(arr, t) {
+  const f = Math.min(PATH.n - 1.0001, Math.max(0, t * PATH.HZ));
+  const i = Math.floor(f), s = f - i;
+  const a = arr[Math.max(0, i - 1)], b = arr[i], c = arr[Math.min(PATH.n - 1, i + 1)], d = arr[Math.min(PATH.n - 1, i + 2)];
+  const out = [];
+  for (let k = 0; k < 3; k++) {
+    const p0 = a[k], p1 = b[k], p2 = c[k], p3 = d[k];
+    out.push(0.5 * ((2 * p1) + (-p0 + p2) * s + (2 * p0 - 5 * p1 + 4 * p2 - p3) * s * s + (-p0 + 3 * p1 - 3 * p2 + p3) * s * s * s));
+  }
+  return out;
+}
+const look = {yaw: 0, pitch: 0, tyaw: 0, tpitch: 0};
+function cameraAt(t, aspect) {
+  const pos = samplePath(PATH.pos, t);
+  const tgt = samplePath(PATH.tgt, t);
+  let fwd = V.norm(V.sub(tgt, pos));
+  // banking from lateral acceleration (gentle, gimbal-like)
+  const dt = 0.5;
+  const pa = samplePath(PATH.pos, Math.max(0, t - dt)), pb = samplePath(PATH.pos, Math.min(DURATION, t + dt));
+  const va = V.sub(pos, pa), vb = V.sub(pb, pos);
+  const turn = Math.atan2(va[0] * vb[2] - va[2] * vb[0], va[0] * vb[0] + va[2] * vb[2]);
+  const speed = V.len(V.sub(pb, pa)) / (2 * dt);
+  let roll = Math.max(-0.12, Math.min(0.12, -turn * speed * 0.012));
+  // user look offset
+  const yaw = look.yaw, pitch = look.pitch;
+  if (yaw || pitch) {
+    const right0 = V.norm(V.cross(fwd, [0, 1, 0]));
+    const up0 = V.cross(right0, fwd);
+    fwd = V.norm(V.add(V.add(V.mul(fwd, Math.cos(yaw) * Math.cos(pitch)), V.mul(right0, Math.sin(yaw) * Math.cos(pitch))), V.mul(up0, Math.sin(pitch))));
+  }
+  let right = V.norm(V.cross(fwd, [0, 1, 0]));
+  let up = V.cross(right, fwd);
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const r2 = V.add(V.mul(right, cr), V.mul(up, sr)), u2 = V.sub(V.mul(up, cr), V.mul(right, sr));
+  const hfov = 72 * Math.PI / 180;
+  const tanHalf = Math.tan(hfov / 2) / aspect;
+  return {pos, fwd, right: r2, up: u2, tanHalf, speed};
+}
+
+/* ----------------------------------------------------------- render targets */
+let RT = null;
+function allocTargets(w, h) {
+  if (RT) { freeTarget(RT.scene); RT.hist.forEach(freeTarget); RT.bloom.forEach(freeTarget); }
+  RT = {w, h};
+  RT.scene = makeTarget(w, h, [[gl.RGBA16F, gl.NEAREST]]);
+  RT.hist = [makeTarget(w, h, [[gl.RGBA16F, gl.LINEAR]]), makeTarget(w, h, [[gl.RGBA16F, gl.LINEAR]])];
+  RT.bloom = [];
+  let bw = w, bh = h;
+  for (let i = 0; i < 6; i++) { bw = Math.max(1, bw >> 1); bh = Math.max(1, bh >> 1); RT.bloom.push(makeTarget(bw, bh, [[gl.RGBA16F, gl.LINEAR]])); }
+  RT.histIdx = 0; RT.valid = false;
+}
+
+const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+let frameNo = 0, prevCam = null, expoIdx = 0;
+
+function renderFrame(time, cam, opts) {
+  const w = RT.w, h = RT.h;
+  const jit = opts.jitter || [halton(frameNo % 16 + 1, 2) - 0.5, halton(frameNo % 16 + 1, 3) - 0.5];
+  const pixAng = 2 * cam.tanHalf / h;
+  draw(P.scene, RT.scene, {
+    uWorld: [WORLD_C[0], WORLD_C[1], WORLD_SIZE, 1 / WORLD_SIZE], uFieldRes: [FIELD_N, FIELD_N], uFieldLodK: FIELD_N / WORLD_SIZE, uField: R.field.tex, uProfile: R.profile,
+    uCamPos: cam.pos, uCamRight: cam.right, uCamUp: cam.up, uCamFwd: cam.fwd, uTanHalf: cam.tanHalf, uAspect: w / h,
+    uPixAng: pixAng, uTime: time, uFrame: frameNo % 64, uMaxH: S.maxH, uMaxHNear: S.maxHNear, uHaze: HAZE, uCanyonHaze: CANYON_HAZE,
+    uRes: [w, h], uJitter: jit, uSunDir: SUN, uSunCol: S.sunCol, uSkyIrr: S.skyIrr, uSkyAmb: S.skyAmb,
+    uShadow: R.shadow.texs[0], uSkyVis: R.shadow.texs[1], uSkyLUT: R.sky.tex, uStrata: R.strata,
+    uFans: S.fans, uNumFans: S.numFans, uFour: 4,
+  }, opts.rect);
+  if (opts.rect && !opts.lastTile) return;
+  const src = RT.hist[RT.histIdx], dst = RT.hist[1 - RT.histIdx];
+  const pc = prevCam || cam;
+  draw(P.taa, dst, {
+    uCur: RT.scene.tex, uHist: src.tex, uCamPos: cam.pos, uCamRight: cam.right, uCamUp: cam.up, uCamFwd: cam.fwd,
+    uPCamPos: pc.pos, uPCamRight: pc.right, uPCamUp: pc.up, uPCamFwd: pc.fwd, uTanHalf: cam.tanHalf, uAspect: w / h,
+    uBlend: RT.valid ? (opts.blend != null ? opts.blend : 0.1) : 1.0, uClamp: opts.noClamp ? 0 : 1, uRes: [w, h],
+  });
+  RT.histIdx = 1 - RT.histIdx; RT.valid = true; prevCam = cam; frameNo++;
+}
+function post(time, opts) {
+  const img = RT.hist[RT.histIdx];
+  let src = img;
+  for (let i = 0; i < RT.bloom.length; i++) {
+    const d = RT.bloom[i];
+    draw(P.down, d, {uSrc: src.tex, uSrcTexel: [1 / src.w, 1 / src.h], uDstRes: [d.w, d.h], uFirst: i === 0 ? 1 : 0});
+    src = d;
+  }
+  // exposure metering on the 1/16 level
+  const ePrev = R.expo[expoIdx], eNext = R.expo[1 - expoIdx];
+  draw(P.meter, eNext, {uSrc: RT.bloom[3].tex, uPrev: ePrev.tex, uRate: opts.meterRate != null ? opts.meterRate : 0.03});
+  expoIdx = 1 - expoIdx;
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for (let i = RT.bloom.length - 1; i > 0; i--) {
+    const s = RT.bloom[i], d = RT.bloom[i - 1];
+    draw(P.up, d, {uSrc: s.tex, uSrcTexel: [1 / s.w, 1 / s.h], uDstRes: [d.w, d.h], uWeight: 1.0});
+  }
+  gl.disable(gl.BLEND);
+  draw(P.final, null, {
+    uImg: img.tex, uBloom: RT.bloom[0].tex, uExpo: R.expo[expoIdx].tex, uOutRes: [canvas.width, canvas.height], uInRes: [RT.w, RT.h],
+    uTime: time, uFade: opts.fade != null ? opts.fade : 1, uBloomStr: 0.045, uExpBase: 1.0, uSharp: RT.w < canvas.width ? 0.35 : 0.18, uGrain: 0.022,
+  });
+}
+
+/* --------------------------------------------------------------- layout */
+let letterbox = true;
+const LB_ASPECT = 2.39;
+function layout() {
+  const W = window.innerWidth, H = window.innerHeight;
+  let w = W, h = H;
+  if (letterbox && W / H < LB_ASPECT + 0.01) h = Math.round(W / LB_ASPECT);
+  else if (letterbox) w = Math.round(H * LB_ASPECT);
+  stage.style.width = w + 'px'; stage.style.height = h + 'px';
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let cw = Math.round(w * dpr), ch = Math.round(h * dpr);
+  const maxPx = 3.2e6;
+  if (cw * ch > maxPx) { const s = Math.sqrt(maxPx / (cw * ch)); cw = Math.round(cw * s); ch = Math.round(ch * s); }
+  canvas.width = cw; canvas.height = ch;
+}
+
+/* --------------------------------------------------------------- still API */
+async function renderStill(t, w, h, spp, opts = {}) {
+  canvas.width = w; canvas.height = h;
+  stage.style.width = w + 'px'; stage.style.height = h + 'px';
+  if (!RT || RT.w !== w || RT.h !== h) allocTargets(w, h);
+  RT.valid = false; prevCam = null;
+  if (opts.yaw != null) look.yaw = opts.yaw; if (opts.pitch != null) look.pitch = opts.pitch;
+  const cam = opts.cam || cameraAt(t, w / h);
+  const tiles = opts.tiles || 4;
+  for (let i = 0; i < spp; i++) {
+    const jit = spp === 1 ? [0, 0] : [halton(i + 1, 2) - 0.5, halton(i + 1, 3) - 0.5];
+    for (let k = 0; k < tiles; k++) {
+      const y0 = Math.floor(k * h / tiles), y1 = Math.floor((k + 1) * h / tiles);
+      renderFrame(t, cam, {jitter: jit, rect: [0, y0, w, y1 - y0], lastTile: k === tiles - 1, blend: 1 / (i + 1), noClamp: true});
+      gl.finish();
+      await sleep(0);
+    }
+  }
+  post(t, {meterRate: 1});
+  gl.finish();
+  return canvas.toDataURL('image/png');
+}
+window.renderStill = renderStill;
+// sequence rendering through the real-time TAA path (used for motion checks)
+window.__seqInit = (w, h) => {
+  canvas.width = w; canvas.height = h; stage.style.width = w + 'px'; stage.style.height = h + 'px';
+  allocTargets(w, h); RT.valid = false; prevCam = null; frameNo = 0;
+};
+window.__seqFrame = async (t, tiles) => {
+  const cam = cameraAt(t, RT.w / RT.h);
+  const n = tiles || 1;
+  for (let k = 0; k < n; k++) {
+    const y0 = Math.floor(k * RT.h / n), y1 = Math.floor((k + 1) * RT.h / n);
+    renderFrame(t, cam, {rect: [0, y0, RT.w, y1 - y0], lastTile: k === n - 1});
+    gl.finish(); await sleep(0);
+  }
+  post(t, {});
+  gl.finish();
+  return canvas.toDataURL('image/png');
+};
+window.__cameraAt = (t) => cameraAt(t, LB_ASPECT);
+window.__groundJS = groundJS;
+window.__profileJS = profileJS;
+window.__riverX = riverX;
+window.__setKeys = (k) => { window.__keys = k; buildPath(); };
+window.__getField = (step) => { const N = FIELD_N, s = step || 4, M = N / s, out = new Float32Array(M * M); for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) out[j * M + i] = FIELD[(j * s) * N + i * s]; let b = ''; const u8 = new Uint8Array(out.buffer); for (let i = 0; i < u8.length; i += 32768) b += String.fromCharCode.apply(null, u8.subarray(i, i + 32768)); return btoa(b); };
+
+/* ------------------------------------------------------------- wind sound */
+/* Procedural wind: looping brown noise through a low rumble and an airy band,
+   modulated by flight speed and slow gusts. Off until the viewer presses S. */
+let audio = null;
+function toggleSound() {
+  if (!audio) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC(), sr = ctx.sampleRate, len = Math.floor(sr * 6), fade = Math.floor(sr * 0.5);
+    const buf = ctx.createBuffer(2, len, sr);
+    for (let c = 0; c < 2; c++) {
+      const tmp = new Float32Array(len + fade);
+      let last = 0;
+      for (let i = 0; i < tmp.length; i++) { last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; tmp[i] = last * 3.5; }
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < len; i++) d[i] = tmp[i];
+      for (let i = 0; i < fade; i++) { const w = i / fade; d[i] = d[i] * w + tmp[len + i] * (1 - w); }   // seamless loop
+    }
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const low = ctx.createBiquadFilter(); low.type = 'lowpass'; low.frequency.value = 360;
+    const band = ctx.createBiquadFilter(); band.type = 'bandpass'; band.frequency.value = 900; band.Q.value = 0.55;
+    const gLow = ctx.createGain(), gBand = ctx.createGain(), master = ctx.createGain();
+    gLow.gain.value = 0.5; gBand.gain.value = 0.1; master.gain.value = 0;
+    src.connect(low); low.connect(gLow); gLow.connect(master);
+    src.connect(band); band.connect(gBand); gBand.connect(master);
+    master.connect(ctx.destination);
+    src.start();
+    audio = {ctx, band, gLow, gBand, master, on: false};
+  }
+  audio.on = !audio.on;
+  if (audio.ctx.state === 'suspended') audio.ctx.resume();
+  audio.master.gain.setTargetAtTime(audio.on ? 0.6 : 0, audio.ctx.currentTime, 0.5);
+}
+function updateSound(cam, t, fade) {
+  if (!audio || !audio.on) return;
+  const ct = audio.ctx.currentTime;
+  const gust = 0.65 + 0.35 * Math.sin(t * 0.37) * Math.sin(t * 0.23 + 1.3);
+  const sp = Math.min(1.4, cam.speed / 95);
+  audio.gLow.gain.setTargetAtTime((0.45 + 0.3 * gust) * fade, ct, 0.3);
+  audio.gBand.gain.setTargetAtTime((0.06 + 0.2 * sp * gust) * fade, ct, 0.3);
+  audio.band.frequency.setTargetAtTime(550 + 650 * sp, ct, 0.6);
+}
+
+/* ------------------------------------------------------------ interactive */
+let playing = true, animT = 0, lastNow = 0, uiHidden = false, perfAcc = 0, perfN = 0, scale = 1, lastScaleChange = 0, loops = 0, idleFrames = 0;
+function chooseInternal() {
+  perfAcc = 0; perfN = 0; idleFrames = 0;
+  const cw = canvas.width, ch = canvas.height;
+  const budget = 1.15e6;
+  scale = Math.min(scale, 1, Math.sqrt(budget / (cw * ch)));
+  const w = Math.max(320, Math.round(cw * scale)), h = Math.max(140, Math.round(ch * scale));
+  if (!RT || RT.w !== w || RT.h !== h) allocTargets(w, h);
+}
+function showUI(on) {
+  $('hint').style.opacity = on && !uiHidden ? 1 : 0;
+  $('bar').style.opacity = on && !uiHidden ? 1 : 0;
+}
+let uiTimer = 0;
+function poke() { showUI(true); clearTimeout(uiTimer); uiTimer = setTimeout(() => showUI(false), 2600); }
+const stats = window.__stats = {frames: 0, lastDt: 0, scale: 1, w: 0, h: 0};
+function frame(now) {
+  requestAnimationFrame(frame);
+  const rawDt = Math.min(1, (now - lastNow) / 1000 || 0.016);
+  const dt = Math.min(0.1, rawDt); lastNow = now;
+  stats.frames++; stats.lastDt = dt; stats.scale = scale; stats.w = RT ? RT.w : 0; stats.h = RT ? RT.h : 0; stats.t = animT;
+  if (playing) animT += dt;
+  if (animT >= DURATION) { animT -= DURATION; RT.valid = false; prevCam = null; loops++; }
+  if (animT < 0) animT += DURATION;
+  // performance governor: proportional internal-resolution control (time based)
+  perfAcc += rawDt; perfN++;
+  if (perfAcc > 0.8 && perfN >= 4) {
+    const avg = perfAcc / perfN; perfAcc = 0; perfN = 0;
+    const target = 1 / 40;
+    if (avg > target * 1.25 && scale > 0.3) {
+      scale = Math.max(0.3, scale * Math.max(0.7, Math.sqrt(target / avg)));
+      lastScaleChange = now; chooseInternal();
+    } else if (avg < target * 0.72 && scale < 1 && now - lastScaleChange > 3000) {
+      scale = Math.min(1, scale * 1.08); lastScaleChange = now; chooseInternal();
+    }
+  }
+  look.yaw += (look.tyaw - look.yaw) * Math.min(1, dt * 6);
+  look.pitch += (look.tpitch - look.pitch) * Math.min(1, dt * 6);
+  if (!dragging) { look.tyaw *= Math.exp(-dt * 0.9); look.tpitch *= Math.exp(-dt * 0.9); }
+  // when paused and still, stop rendering once the image has converged
+  const still = !playing && !dragging && Math.abs(look.tyaw - look.yaw) + Math.abs(look.tpitch - look.pitch) + Math.abs(look.yaw) + Math.abs(look.pitch) < 1e-3;
+  idleFrames = still ? idleFrames + 1 : 0;
+  if (idleFrames > 48) { perfAcc = 0; perfN = 0; return; }
+  const cam = cameraAt(animT, canvas.width / canvas.height);
+  renderFrame(animT, cam, {});
+  const fade = Math.min(1, animT / 1.6, (DURATION - animT) / 1.6);
+  post(animT, {fade: Math.max(0, fade)});
+  updateSound(cam, animT, Math.max(0.15, fade));
+  const tt = $('title');
+  tt.style.opacity = (loops === 0 && animT > 1.2 && animT < 7.5 && !uiHidden) ? 1 : 0;
+  $('bar').style.width = (animT / DURATION * 100) + '%';
+}
+let dragging = false, dx0 = 0, dy0 = 0, y0 = 0, p0 = 0;
+canvas.addEventListener('pointerdown', e => { poke(); dragging = true; dx0 = e.clientX; dy0 = e.clientY; y0 = look.tyaw; p0 = look.tpitch; canvas.classList.add('drag'); canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', e => {
+  poke();
+  if (!dragging) return;
+  const s = 2.2 / canvas.clientWidth;
+  look.tyaw = Math.max(-1.6, Math.min(1.6, y0 + (e.clientX - dx0) * s));
+  look.tpitch = Math.max(-0.7, Math.min(0.6, p0 - (e.clientY - dy0) * s));
+});
+const endDrag = () => { dragging = false; canvas.classList.remove('drag'); };
+canvas.addEventListener('pointerup', endDrag); canvas.addEventListener('pointercancel', endDrag);
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { playing = !playing; e.preventDefault(); }
+  else if (e.code === 'ArrowRight') { animT = Math.min(DURATION - 0.01, animT + 5); RT.valid = false; }
+  else if (e.code === 'ArrowLeft') { animT = Math.max(0, animT - 5); RT.valid = false; }
+  else if (e.code === 'KeyF') { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.(); else document.exitFullscreen?.(); }
+  else if (e.code === 'KeyH') { uiHidden = !uiHidden; showUI(!uiHidden); }
+  else if (e.code === 'KeyL') { letterbox = !letterbox; layout(); chooseInternal(); }
+  else if (e.code === 'KeyS') { toggleSound(); }
+  idleFrames = 0;
+  poke();
+});
+window.addEventListener('resize', () => { if (!STILL) { layout(); chooseInternal(); } });
+canvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault();
+  fail('The graphics driver reset the WebGL context. Reload the page to restart the flight.');
+});
+
+/* ----------------------------------------------------------------- start */
+(async () => {
+  try {
+    if (!STILL) layout(); else { canvas.width = 640; canvas.height = 268; }
+    await init();
+    $('load').style.opacity = 0;
+    window.__ready = true;
+    if (!STILL) {
+      chooseInternal();
+      poke();
+      requestAnimationFrame(t => { lastNow = t; frame(t); });
+    }
+  } catch (err) {
+    console.error(err);
+    fail('Something went wrong while starting the renderer: ' + (err && err.message ? err.message : err));
+  }
+})();
+})();
+</script>
+</body>
+</html>

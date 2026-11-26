@@ -1,0 +1,4174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>Formula 1 Aerodynamic Wind Tunnel — Prototype X-01</title>
+<style>
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #05070a;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    touch-action: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas:active {
+    cursor: grabbing;
+  }
+  #hud {
+    position: fixed;
+    left: 24px;
+    bottom: 22px;
+    right: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    pointer-events: none;
+    z-index: 10;
+    transition: opacity 0.8s ease;
+  }
+  .telemetry-card {
+    background: rgba(8, 12, 18, 0.58);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(180, 210, 240, 0.12);
+    border-radius: 8px;
+    padding: 9px 14px;
+    color: rgba(226, 236, 248, 0.82);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    line-height: 1.55;
+  }
+  .telemetry-title {
+    color: rgba(255, 255, 255, 0.94);
+    font-weight: 600;
+    letter-spacing: 0.13em;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #38d996;
+    box-shadow: 0 0 8px #38d996;
+    display: inline-block;
+  }
+  .telemetry-row {
+    display: flex;
+    gap: 16px;
+    margin-top: 3px;
+    color: rgba(168, 188, 212, 0.76);
+    font-variant-numeric: tabular-nums;
+  }
+  .telemetry-row span b {
+    color: rgba(232, 242, 255, 0.92);
+    font-weight: 500;
+  }
+  .controls-hint {
+    background: rgba(8, 12, 18, 0.52);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(180, 210, 240, 0.11);
+    border-radius: 999px;
+    padding: 7px 15px;
+    color: rgba(205, 220, 238, 0.74);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    transition: opacity 0.6s ease;
+  }
+  #loading {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(circle at 50% 45%, #0d131c 0%, #040609 100%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #dbe7f5;
+    z-index: 30;
+    transition: opacity 0.65s ease;
+  }
+  #loading.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .loader-bar-wrap {
+    width: 220px;
+    height: 2px;
+    background: rgba(255, 255, 255, 0.1);
+    margin-top: 14px;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .loader-bar {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, #569cd6, #c8e6ff);
+    transform-origin: left;
+    animation: pulseLoad 1.1s ease-in-out infinite;
+  }
+  @keyframes pulseLoad {
+    0% { transform: scaleX(0.15); }
+    50% { transform: scaleX(0.85); }
+    100% { transform: scaleX(1.0); }
+  }
+  @media (max-width: 680px) {
+    #hud { left: 12px; right: 12px; bottom: 12px; flex-direction: column; align-items: flex-start; gap: 8px; }
+    .telemetry-row { gap: 10px; font-size: 10px; }
+    .controls-hint { font-size: 10px; padding: 6px 12px; }
+  }
+</style>
+</head>
+<body>
+<div id="loading">
+  <div style="font-size: 12px; letter-spacing: 0.2em; text-transform: uppercase; opacity: 0.88;">Initializing Aero Tunnel &amp; Potential Flow Solver</div>
+  <div class="loader-bar-wrap"><div class="loader-bar"></div></div>
+</div>
+
+<canvas id="glcanvas"></canvas>
+
+<div id="hud">
+  <div class="telemetry-card">
+    <div class="telemetry-title"><span class="status-dot"></span>Rolling-Road Aero Test &middot; Prototype X-01</div>
+    <div class="telemetry-row">
+      <span>Airspeed <b>50.0 m/s (180 km/h)</b></span>
+      <span>Belt Sync <b>100.0%</b></span>
+      <span>Ride Hgt <b>26 / 54 mm</b></span>
+    </div>
+  </div>
+  <div class="controls-hint" id="camHint">Drag / Touch to Orbit 360&deg; &middot; Scroll / Pinch to Zoom</div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ============================================================================
+  // 1. MATH & VECTOR UTILITIES
+  // ============================================================================
+  const TAU = Math.PI * 2.0;
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smoothstep = (e0, e1, x) => {
+    const t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+  };
+
+  function vec3(x = 0, y = 0, z = 0) { return [x, y, z]; }
+  function vAdd(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+  function vSub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function vScale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
+  function vDot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function vCross(a, b) {
+    return [
+      a[1] * b[2] - a[2] * b[1],
+      a[2] * b[0] - a[0] * b[2],
+      a[0] * b[1] - a[1] * b[0]
+    ];
+  }
+  function vLen(a) { return Math.hypot(a[0], a[1], a[2]); }
+  function vNorm(a) {
+    const l = Math.hypot(a[0], a[1], a[2]);
+    return l > 1e-8 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 1, 0];
+  }
+  function vLerp(a, b, t) {
+    return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+  }
+
+  function mat4Identity() {
+    const m = new Float32Array(16);
+    m[0] = m[5] = m[10] = m[15] = 1;
+    return m;
+  }
+  function mat4Multiply(out, a, b) {
+    const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
+    const a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+    const a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+    const a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+    let b0, b1, b2, b3;
+    b0 = b[0]; b1 = b[1]; b2 = b[2]; b3 = b[3];
+    out[0] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+    out[1] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+    out[2] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+    out[3] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+    b0 = b[4]; b1 = b[5]; b2 = b[6]; b3 = b[7];
+    out[4] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+    out[5] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+    out[6] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+    out[7] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+    b0 = b[8]; b1 = b[9]; b2 = b[10]; b3 = b[11];
+    out[8]  = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+    out[9]  = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+    out[10] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+    out[11] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+    b0 = b[12]; b1 = b[13]; b2 = b[14]; b3 = b[15];
+    out[12] = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+    out[13] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+    out[14] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+    out[15] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+    return out;
+  }
+  function mat4Perspective(out, fovy, aspect, near, far) {
+    const f = 1.0 / Math.tan(fovy * 0.5);
+    out.fill(0);
+    out[0] = f / aspect;
+    out[5] = f;
+    out[10] = (far + near) / (near - far);
+    out[11] = -1;
+    out[14] = (2 * far * near) / (near - far);
+    return out;
+  }
+  function mat4Ortho(out, left, right, bottom, top, near, far) {
+    out.fill(0);
+    const lr = 1 / (left - right);
+    const bt = 1 / (bottom - top);
+    const nf = 1 / (near - far);
+    out[0] = -2 * lr;
+    out[5] = -2 * bt;
+    out[10] = 2 * nf;
+    out[12] = (left + right) * lr;
+    out[13] = (top + bottom) * bt;
+    out[14] = (far + near) * nf;
+    out[15] = 1;
+    return out;
+  }
+  function mat4LookAt(out, eye, center, up) {
+    const z = vNorm(vSub(eye, center));
+    const x = vNorm(vCross(up, z));
+    const y = vCross(z, x);
+    out[0] = x[0]; out[1] = y[0]; out[2]  = z[0]; out[3]  = 0;
+    out[4] = x[1]; out[5] = y[1]; out[6]  = z[1]; out[7]  = 0;
+    out[8] = x[2]; out[9] = y[2]; out[10] = z[2]; out[11] = 0;
+    out[12] = -vDot(x, eye);
+    out[13] = -vDot(y, eye);
+    out[14] = -vDot(z, eye);
+    out[15] = 1;
+    return out;
+  }
+
+  // ============================================================================
+  // 2. MATERIAL CONSTANTS & SCENE PARAMETERS
+  // ============================================================================
+  const MAT_CARBON_GLOSS  = 0.0; // Clearcoated 2x2 twill carbon bodywork & wings
+  const MAT_CARBON_SATIN  = 1.0; // Satin structural carbon (floor, diffuser, suspension, rims)
+  const MAT_ACCENT_AERO   = 2.0; // Subtle satin prototype silver-ice metallic aero trim
+  const MAT_METAL_CNC     = 3.0; // Brushed titanium / CNC steel / exhaust
+  const MAT_TIRE_RUBBER   = 4.0; // F1 dry slick compound + detailed molded sidewall
+  const MAT_ROLLING_ROAD  = 5.0; // Moving ground belt synchronized with wheels
+  const MAT_TUNNEL_WALL   = 6.0; // Acoustic dark slate anodized tunnel panels
+  const MAT_TUNNEL_FLOOR  = 7.0; // Precision machined steel floor & turntable
+  const MAT_EMISSIVE      = 8.0; // LED strips, ruby FIA rear rain light, cockpit telemetry
+  const MAT_VISOR_GLOSS   = 9.0; // Dark chrome iridescent helmet visor & gloss shell
+  const MAT_DARK_CAVITY   = 10.0; // Recessed intakes, radiator mesh, honeycomb
+
+  const WIND_SPEED = 14.5;      // Visual flow speed (scaled for crisp cinema streamline tracking; represents 50 m/s)
+  const TIRE_RADIUS = 0.360;    // 18-inch regulation 720mm outer tire diameter
+  const FRONT_AXLE_X = -1.74;
+  const REAR_AXLE_X  = +1.80;
+  const FRONT_TRACK_Z = 0.820;
+  const REAR_TRACK_Z  = 0.790;
+
+  // ============================================================================
+  // 3. PROCEDURAL PARAMETRIC MESH BUILDER (WITH SMOOTH NORMALS & TANGENTS)
+  // ============================================================================
+  class MeshBuilder {
+    constructor() {
+      this.pos = [];
+      this.norm = [];
+      this.uv = [];
+      this.mat = []; // [matId, auxParam]
+      this.idx = [];
+    }
+
+    get vertCount() { return this.pos.length / 3; }
+
+    addVertex(px, py, pz, nx, ny, nz, u, v, matId, aux = 0.0) {
+      const i = this.pos.length / 3;
+      this.pos.push(px, py, pz);
+      this.norm.push(nx, ny, nz);
+      this.uv.push(u, v);
+      this.mat.push(matId, aux);
+      return i;
+    }
+
+    addTri(a, b, c) {
+      this.idx.push(a, b, c);
+    }
+
+    addQuad(a, b, c, d) {
+      this.idx.push(a, b, c, a, c, d);
+    }
+
+    // Loft a grid of 3D points: rings[r][s] = [x,y,z], uCoords[r][s], vCoords[r][s]
+    // Automatically computes smooth analytical finite-difference vertex normals!
+    addLoft(rings, matId, aux = 0.0, closedS = false, uvScaleU = 1.0, uvScaleV = 1.0, customUV = null, flipWinding = false) {
+      const R = rings.length;
+      const S = rings[0].length;
+      const base = this.vertCount;
+
+      // Arc-length accumulation for uniform metric UVs (crucial for uniform 3mm carbon weave!)
+      const uDist = new Array(R).fill(0);
+      for (let r = 1; r < R; r++) {
+        const p0 = rings[r - 1][Math.floor(S * 0.5)];
+        const p1 = rings[r][Math.floor(S * 0.5)];
+        uDist[r] = uDist[r - 1] + vLen(vSub(p1, p0));
+      }
+
+      for (let r = 0; r < R; r++) {
+        let vAccum = 0;
+        for (let s = 0; s < S; s++) {
+          if (s > 0) vAccum += vLen(vSub(rings[r][s], rings[r][s - 1]));
+          const p = rings[r][s];
+          const prPrev = rings[Math.max(0, r - 1)][s];
+          const prNext = rings[Math.min(R - 1, r + 1)][s];
+          let psPrev, psNext;
+          if (closedS) {
+            // Note: when closedS is true, last point may duplicate first point
+            const sPrev = s === 0 ? S - 2 : s - 1;
+            const sNext = s === S - 1 ? 1 : s + 1;
+            psPrev = rings[r][sPrev];
+            psNext = rings[r][sNext];
+          } else {
+            psPrev = rings[r][Math.max(0, s - 1)];
+            psNext = rings[r][Math.min(S - 1, s + 1)];
+          }
+          const dR = vSub(prNext, prPrev);
+          const dS = vSub(psNext, psPrev);
+          let n = flipWinding ? vCross(dR, dS) : vCross(dS, dR);
+          if (vLen(n) < 1e-8) n = [0, 1, 0];
+          else n = vNorm(n);
+
+          let u = uDist[r] * uvScaleU;
+          let v = vAccum * uvScaleV;
+          if (customUV) {
+            const cuv = customUV(r, s, r / (R - 1), s / (S - 1), p);
+            u = cuv[0]; v = cuv[1];
+          }
+          this.addVertex(p[0], p[1], p[2], n[0], n[1], n[2], u, v, matId, aux);
+        }
+      }
+
+      for (let r = 0; r < R - 1; r++) {
+        for (let s = 0; s < S - 1; s++) {
+          const i00 = base + r * S + s;
+          const i10 = base + (r + 1) * S + s;
+          const i11 = base + (r + 1) * S + (s + 1);
+          const i01 = base + r * S + (s + 1);
+          if (flipWinding) this.addQuad(i00, i10, i11, i01);
+          else this.addQuad(i00, i01, i11, i10);
+        }
+      }
+    }
+
+    // Cap a closed ring of points
+    addCap(ring, normal, matId, aux = 0.0, flip = false, uvScale = 1.0) {
+      let cx = 0, cy = 0, cz = 0;
+      const nPts = ring.length;
+      for (let i = 0; i < nPts; i++) {
+        cx += ring[i][0]; cy += ring[i][1]; cz += ring[i][2];
+      }
+      cx /= nPts; cy /= nPts; cz /= nPts;
+      const n = vNorm(normal);
+      const refUp = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+      const tU = vNorm(vCross(refUp, n));
+      const tV = vCross(n, tU);
+
+      const cIdx = this.addVertex(cx, cy, cz, n[0], n[1], n[2], 0, 0, matId, aux);
+      const ringStart = this.vertCount;
+      for (let i = 0; i < nPts; i++) {
+        const d = [ring[i][0] - cx, ring[i][1] - cy, ring[i][2] - cz];
+        this.addVertex(
+          ring[i][0], ring[i][1], ring[i][2],
+          n[0], n[1], n[2],
+          vDot(d, tU) * uvScale, vDot(d, tV) * uvScale,
+          matId, aux
+        );
+      }
+      for (let i = 0; i < nPts - 1; i++) {
+        if (flip) this.addTri(cIdx, ringStart + i + 1, ringStart + i);
+        else this.addTri(cIdx, ringStart + i, ringStart + i + 1);
+      }
+    }
+
+    // Build an airfoil-section strut (for wishbones, pushrods, aero pylons, sting)
+    addAirfoilStrut(p0, p1, chord, thickness, matId, aux = 0.0, chordDirHint = [1, 0, 0], segsL = 6, segsS = 16) {
+      const axis = vNorm(vSub(p1, p0));
+      let cDir = vSub(chordDirHint, vScale(axis, vDot(chordDirHint, axis)));
+      if (vLen(cDir) < 1e-4) cDir = vCross(axis, [0, 1, 0]);
+      cDir = vNorm(cDir);
+      const tDir = vNorm(vCross(axis, cDir));
+
+      const rings = [];
+      for (let r = 0; r <= segsL; r++) {
+        const f = r / segsL;
+        const center = vLerp(p0, p1, f);
+        const ring = [];
+        for (let s = 0; s <= segsS; s++) {
+          const ang = (s / segsS) * TAU;
+          // NACA symmetric teardrop profile mapped from circle angle
+          const u = 0.5 * (1.0 - Math.cos(ang)); // 0 at leading edge (-cDir), 1 at trailing edge (+cDir)
+          const sign = Math.sin(ang) >= 0 ? 1 : -1;
+          const yt = 5.0 * (0.2969 * Math.sqrt(Math.max(u, 1e-5)) - 0.1260 * u - 0.3516 * u * u + 0.2843 * u * u * u - 0.1015 * u * u * u * u);
+          const localC = (u - 0.42) * chord;
+          const localT = sign * yt * thickness;
+          ring.push([
+            center[0] + cDir[0] * localC + tDir[0] * localT,
+            center[1] + cDir[1] * localC + tDir[1] * localT,
+            center[2] + cDir[2] * localC + tDir[2] * localT
+          ]);
+        }
+        rings.push(ring);
+      }
+      this.addLoft(rings, matId, aux, true, 1.0, 1.0, null, false);
+    }
+
+    // Swept tube along a 3D polyline
+    addTube(points, radii, matId, aux = 0.0, segsS = 18, aspectY = 1.0) {
+      const rings = [];
+      let prevUp = [0, 1, 0];
+      for (let i = 0; i < points.length; i++) {
+        const pPrev = points[Math.max(0, i - 1)];
+        const pNext = points[Math.min(points.length - 1, i + 1)];
+        const tang = vNorm(vSub(pNext, pPrev));
+        let side = vCross(tang, prevUp);
+        if (vLen(side) < 1e-4) side = vCross(tang, [1, 0, 0]);
+        side = vNorm(side);
+        const up = vNorm(vCross(side, tang));
+        prevUp = up;
+        const rad = Array.isArray(radii) ? radii[i] : radii;
+        const rx = Array.isArray(rad) ? rad[0] : rad;
+        const ry = Array.isArray(rad) ? rad[1] : rad * aspectY;
+        const ring = [];
+        for (let s = 0; s <= segsS; s++) {
+          const a = (s / segsS) * TAU;
+          const ca = Math.cos(a) * rx;
+          const sa = Math.sin(a) * ry;
+          ring.push([
+            points[i][0] + side[0] * ca + up[0] * sa,
+            points[i][1] + side[1] * ca + up[1] * sa,
+            points[i][2] + side[2] * ca + up[2] * sa
+          ]);
+        }
+        rings.push(ring);
+      }
+      this.addLoft(rings, matId, aux, true, 1.0, 1.0, null, true);
+    }
+
+    // Oriented box helper
+    addBox(cx, cy, cz, sx, sy, sz, matId, aux = 0.0, uvScale = 1.0) {
+      const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+      const faces = [
+        { n: [ 1, 0, 0], u: [0, 0,-1], v: [0, 1, 0], h: [hz, hy, hx] },
+        { n: [-1, 0, 0], u: [0, 0, 1], v: [0, 1, 0], h: [hz, hy, hx] },
+        { n: [ 0, 1, 0], u: [1, 0, 0], v: [0, 0,-1], h: [hx, hz, hy] },
+        { n: [ 0,-1, 0], u: [1, 0, 0], v: [0, 0, 1], h: [hx, hz, hy] },
+        { n: [ 0, 0, 1], u: [1, 0, 0], v: [0, 1, 0], h: [hx, hy, hz] },
+        { n: [ 0, 0,-1], u: [-1,0, 0], v: [0, 1, 0], h: [hx, hy, hz] }
+      ];
+      for (const f of faces) {
+        const b = this.vertCount;
+        const corners = [[-1,-1], [1,-1], [1,1], [-1,1]];
+        for (const [cu, cv] of corners) {
+          const px = cx + f.n[0]*f.h[2] + f.u[0]*cu*f.h[0] + f.v[0]*cv*f.h[1];
+          const py = cy + f.n[1]*f.h[2] + f.u[1]*cu*f.h[0] + f.v[1]*cv*f.h[1];
+          const pz = cz + f.n[2]*f.h[2] + f.u[2]*cu*f.h[0] + f.v[2]*cv*f.h[1];
+          this.addVertex(px, py, pz, f.n[0], f.n[1], f.n[2], cu*f.h[0]*uvScale, cv*f.h[1]*uvScale, matId, aux);
+        }
+        this.addQuad(b, b+1, b+2, b+3);
+      }
+    }
+
+    // Compute per-vertex tangent + handedness (Lengyel's method) for anisotropic carbon weave & normal mapping
+    compile(gl) {
+      const nVerts = this.vertCount;
+      const tan1 = new Float32Array(nVerts * 3);
+      const tan2 = new Float32Array(nVerts * 3);
+
+      for (let i = 0; i < this.idx.length; i += 3) {
+        const i1 = this.idx[i], i2 = this.idx[i + 1], i3 = this.idx[i + 2];
+        const x1 = this.pos[i2*3] - this.pos[i1*3];
+        const y1 = this.pos[i2*3+1] - this.pos[i1*3+1];
+        const z1 = this.pos[i2*3+2] - this.pos[i1*3+2];
+        const x2 = this.pos[i3*3] - this.pos[i1*3];
+        const y2 = this.pos[i3*3+1] - this.pos[i1*3+1];
+        const z2 = this.pos[i3*3+2] - this.pos[i1*3+2];
+
+        const s1 = this.uv[i2*2] - this.uv[i1*2];
+        const t1 = this.uv[i2*2+1] - this.uv[i1*2+1];
+        const s2 = this.uv[i3*2] - this.uv[i1*2];
+        const t2 = this.uv[i3*2+1] - this.uv[i1*2+1];
+
+        const denom = s1 * t2 - s2 * t1;
+        if (Math.abs(denom) > 1e-10) {
+          const r = 1.0 / denom;
+          const sx = (t2 * x1 - t1 * x2) * r;
+          const sy = (t2 * y1 - t1 * y2) * r;
+          const sz = (t2 * z1 - t1 * z2) * r;
+          const tx = (s1 * x2 - s2 * x1) * r;
+          const ty = (s1 * y2 - s2 * y1) * r;
+          const tz = (s1 * z2 - s2 * z1) * r;
+          for (const iv of [i1, i2, i3]) {
+            tan1[iv*3] += sx; tan1[iv*3+1] += sy; tan1[iv*3+2] += sz;
+            tan2[iv*3] += tx; tan2[iv*3+1] += ty; tan2[iv*3+2] += tz;
+          }
+        }
+      }
+
+      const tangents = new Float32Array(nVerts * 4);
+      for (let i = 0; i < nVerts; i++) {
+        const nx = this.norm[i*3], ny = this.norm[i*3+1], nz = this.norm[i*3+2];
+        let tx = tan1[i*3], ty = tan1[i*3+1], tz = tan1[i*3+2];
+        const ndott = nx * tx + ny * ty + nz * tz;
+        tx -= nx * ndott; ty -= ny * ndott; tz -= nz * ndott;
+        let tl = Math.hypot(tx, ty, tz);
+        let handed = 1.0;
+        if (tl < 1e-6) {
+          // Safe fallback tangent orthogonal to normal
+          const ref = Math.abs(ny) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+          const fb = vNorm(vCross(ref, [nx, ny, nz]));
+          tx = fb[0]; ty = fb[1]; tz = fb[2];
+        } else {
+          tx /= tl; ty /= tl; tz /= tl;
+          const cx = ny * tz - nz * ty;
+          const cy = nz * tx - nx * tz;
+          const cz = nx * ty - ny * tx;
+          handed = (cx * tan2[i*3] + cy * tan2[i*3+1] + cz * tan2[i*3+2]) < 0.0 ? -1.0 : 1.0;
+        }
+        tangents[i*4] = tx;
+        tangents[i*4+1] = ty;
+        tangents[i*4+2] = tz;
+        tangents[i*4+3] = handed;
+      }
+
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+
+      const mkBuf = (loc, data, size) => {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+        return b;
+      };
+
+      mkBuf(0, new Float32Array(this.pos), 3);
+      mkBuf(1, new Float32Array(this.norm), 3);
+      mkBuf(2, tangents, 4);
+      mkBuf(3, new Float32Array(this.uv), 2);
+      mkBuf(4, new Float32Array(this.mat), 2);
+
+      const ib = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+      const use32 = nVerts > 65535;
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, use32 ? new Uint32Array(this.idx) : new Uint16Array(this.idx), gl.STATIC_DRAW);
+
+      gl.bindVertexArray(null);
+      return { vao, count: this.idx.length, type: use32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT };
+    }
+  }
+
+  // ============================================================================
+  // 4. PROCEDURAL FORMULA 1 PROTOTYPE CAR ("PROTOTYPE X-01" GROUND-EFFECT SPEC)
+  // ============================================================================
+  function superellipseRing(x, yBot, yTop, halfW, expP = 2.6, segs = 32, topNarrow = 0.88, bottomPinch = 1.0) {
+    const yMid = 0.5 * (yBot + yTop);
+    const hY = Math.max(0.004, 0.5 * (yTop - yBot));
+    const ring = [];
+    for (let s = 0; s <= segs; s++) {
+      const a = (s / segs) * TAU;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const sgnC = ca >= 0 ? 1 : -1;
+      const sgnS = sa >= 0 ? 1 : -1;
+      const u = sgnC * Math.pow(Math.abs(ca), 2.0 / expP);
+      const v = sgnS * Math.pow(Math.abs(sa), 2.0 / expP);
+      const widthMod = v >= 0 ? lerp(1.0, topNarrow, v) : lerp(1.0, bottomPinch, -v);
+      ring.push([x, yMid + v * hY, u * halfW * widthMod]);
+    }
+    return ring;
+  }
+
+  // Helper to evaluate cambered airfoil section (chord runs along X, camber along Y)
+  function airfoilRingAtSpan(z, xLead, yLead, chord, pitchRad, camber, thickRatio, segs = 28) {
+    const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
+    const ring = [];
+    for (let s = 0; s <= segs; s++) {
+      const a = (s / segs) * TAU;
+      const u = 0.5 * (1.0 - Math.cos(a)); // 0 at leading edge, 1 at trailing edge
+      const upper = Math.sin(a) >= 0 ? 1 : -1;
+      // Parabolic camber line (inverted for downforce when camber < 0!)
+      const yc = camber * 4.0 * u * (1.0 - u);
+      const dyc = camber * 4.0 * (1.0 - 2.0 * u);
+      const yt = 5.0 * thickRatio * (0.2969 * Math.sqrt(Math.max(u, 1e-5)) - 0.126 * u - 0.3516 * u * u + 0.2843 * u * u * u - 0.1015 * u * u * u * u);
+      const normL = Math.hypot(1.0, dyc);
+      const lx = (u - upper * yt * dyc / normL) * chord;
+      const ly = (yc + upper * yt / normL) * chord;
+      const wx = xLead + lx * cp - ly * sp;
+      const wy = yLead + lx * sp + ly * cp;
+      ring.push([wx, wy, z]);
+    }
+    return ring;
+  }
+
+  function buildF1CarStatic(mb) {
+    // ------------------------------------------------------------------------
+    // A. SCULPTED NOSE CONE, MONOCOQUE, ENGINE COVER & COKE-BOTTLE SPINE
+    // ------------------------------------------------------------------------
+    const monoStations = [
+      // [x, yBot, yTop, halfW, expP, topNarrow, bottomPinch]
+      [-2.86, 0.162, 0.192, 0.048, 2.2, 0.92, 0.95],
+      [-2.74, 0.166, 0.232, 0.088, 2.4, 0.90, 0.95],
+      [-2.48, 0.174, 0.292, 0.128, 2.6, 0.88, 0.94],
+      [-2.15, 0.188, 0.382, 0.175, 2.9, 0.86, 0.92],
+      [-1.75, 0.195, 0.515, 0.225, 3.2, 0.86, 0.90], // Front axle bulkhead
+      [-1.35, 0.155, 0.585, 0.255, 3.3, 0.88, 0.84],
+      [-0.95, 0.085, 0.625, 0.278, 3.4, 0.90, 0.80],
+      [-0.62, 0.055, 0.635, 0.292, 3.2, 0.90, 0.82], // Cockpit front cowl
+      [-0.35, 0.052, 0.605, 0.305, 3.0, 0.84, 0.88], // Cockpit mid (headrest wraps above)
+      [-0.02, 0.052, 0.635, 0.298, 3.0, 0.82, 0.90],
+      [+0.18, 0.055, 0.720, 0.275, 2.7, 0.68, 0.92], // Behind cockpit -> rising to roll hoop
+      [+0.36, 0.060, 0.945, 0.250, 2.4, 0.44, 0.94], // Airbox peak
+      [+0.68, 0.062, 0.865, 0.235, 2.4, 0.42, 0.92],
+      [+1.08, 0.068, 0.745, 0.215, 2.4, 0.40, 0.88],
+      [+1.48, 0.085, 0.615, 0.185, 2.3, 0.42, 0.82],
+      [+1.82, 0.185, 0.510, 0.145, 2.3, 0.55, 0.78], // Rear axle coke-bottle spine
+      [+2.14, 0.265, 0.465, 0.095, 2.2, 0.72, 0.80],
+      [+2.30, 0.290, 0.435, 0.068, 2.1, 0.82, 0.85]
+    ];
+
+    // Smooth Catmull-Rom upsampling along X so bodywork curves are liquid smooth!
+    const monoRings = [];
+    const monoSub = 4;
+    for (let i = 0; i < monoStations.length - 1; i++) {
+      const s0 = monoStations[Math.max(0, i - 1)];
+      const s1 = monoStations[i];
+      const s2 = monoStations[i + 1];
+      const s3 = monoStations[Math.min(monoStations.length - 1, i + 2)];
+      const steps = i === monoStations.length - 2 ? monoSub + 1 : monoSub;
+      for (let k = 0; k < steps; k++) {
+        const t = k / monoSub;
+        const t2 = t * t, t3 = t2 * t;
+        const cr = (idx) => 0.5 * (
+          (2 * s1[idx]) +
+          (-s0[idx] + s2[idx]) * t +
+          (2*s0[idx] - 5*s1[idx] + 4*s2[idx] - s3[idx]) * t2 +
+          (-s0[idx] + 3*s1[idx] - 3*s2[idx] + s3[idx]) * t3
+        );
+        monoRings.push(superellipseRing(cr(0), cr(1), cr(2), cr(3), cr(4), 36, cr(5), cr(6)));
+      }
+    }
+    mb.addLoft(monoRings, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, true);
+    mb.addCap(monoRings[0], [-1, 0, 0], MAT_CARBON_GLOSS, 0.0, true);
+    mb.addCap(monoRings[monoRings.length - 1], [1, 0, 0], MAT_DARK_CAVITY, 0.0, false);
+
+    // Subtle prototype metallic-ice pinstripe spear along nose & chassis shoulder (original prototype trim, zero logos)
+    for (const side of [-1, 1]) {
+      const trimPts = [];
+      for (let i = 0; i <= 26; i++) {
+        const f = i / 26;
+        const x = lerp(-2.72, -0.55, f);
+        const y = lerp(0.198, 0.618, Math.pow(f, 0.82));
+        const z = side * lerp(0.052, 0.258, Math.pow(f, 0.72));
+        trimPts.push([x, y, z]);
+      }
+      mb.addTube(trimPts, 0.0085, MAT_ACCENT_AERO, 0.0, 10, 0.45);
+    }
+
+    // Nose tip driver-cooling slot aperture + Twin Nose Aero/Optical Camera Pods + Aero Wing Mirrors!
+    mb.addBox(-2.862, 0.177, 0.0, 0.012, 0.012, 0.058, MAT_DARK_CAVITY);
+    for (const side of [-1, 1]) {
+      // Nose-mounted F1 aero sensor / optical pod
+      mb.addAirfoilStrut([-2.28, 0.305, side * 0.135], [-2.28, 0.315, side * 0.235], 0.085, 0.016, MAT_CARBON_SATIN, 0.0, [1, 0, 0]);
+      const podR = [
+        superellipseRing(-2.34, 0.302, 0.328, 0.014, 2.2, 12).map(p => [p[0], p[1], side * 0.242 + p[2]]),
+        superellipseRing(-2.21, 0.304, 0.326, 0.012, 2.2, 12).map(p => [p[0], p[1], side * 0.242 + p[2]])
+      ];
+      mb.addLoft(podR, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, true);
+
+      // Sculpted Aero Wing Mirror Housing + Twin Carbon Stalks flanking Cockpit
+      mb.addAirfoilStrut([-0.54, 0.605, side * 0.275], [-0.46, 0.665, side * 0.455], 0.052, 0.008, MAT_CARBON_SATIN, 0.0, [1, 0, 0]);
+      mb.addAirfoilStrut([-0.44, 0.575, side * 0.485], [-0.45, 0.660, side * 0.475], 0.042, 0.007, MAT_CARBON_SATIN, 0.0, [1, 0, 0]);
+      const mirR = [
+        superellipseRing(-0.52, 0.648, 0.692, 0.052, 2.6, 16).map(p => [p[0], p[1], side * 0.475 + p[2]]),
+        superellipseRing(-0.41, 0.645, 0.695, 0.058, 2.8, 16).map(p => [p[0], p[1], side * 0.475 + p[2]])
+      ];
+      mb.addLoft(mirR, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, true);
+      mb.addCap(mirR[0], [-1, 0, 0], MAT_CARBON_GLOSS, 0.0, true);
+      mb.addCap(mirR[1], [1, 0, 0], MAT_VISOR_GLOSS, 0.0, false); // Reflective mirror glass facing aft!
+    }
+
+    // ------------------------------------------------------------------------
+    // B. COCKPIT COLLAR, DARK TUB INTERIOR, STEERING WHEEL & DRIVER HELMET
+    // ------------------------------------------------------------------------
+    // Recessed dark cockpit tub bowl at top of monocoque (x: -0.56 .. +0.10)
+    const cockRings = [];
+    for (let r = 0; r <= 12; r++) {
+      const f = r / 12;
+      const x = lerp(-0.56, +0.10, f);
+      const w = 0.215 * Math.sin(Math.pow(f, 0.75) * Math.PI * 0.92 + 0.12);
+      const ring = [];
+      for (let s = 0; s <= 18; s++) {
+        const u = (s / 18) * 2.0 - 1.0;
+        const yRim = 0.635 - 0.02 * Math.cos(f * Math.PI);
+        const y = yRim + 0.032 * (u * u);
+        ring.push([x, y, u * w]);
+      }
+      cockRings.push(ring);
+    }
+    mb.addLoft(cockRings, MAT_DARK_CAVITY, 0.0, false, 1.0, 1.0, null, true);
+
+    // Sculpted carbon cockpit padding / headrest collar around cockpit rim
+    for (const side of [-1, 1]) {
+      const padPts = [];
+      for (let i = 0; i <= 16; i++) {
+        const f = i / 16;
+        const x = lerp(-0.54, +0.12, f);
+        const z = side * (0.218 * Math.sin(f * Math.PI * 0.86 + 0.2));
+        const y = lerp(0.635, 0.695, smoothstep(0.25, 0.95, f));
+        padPts.push([x, y, z]);
+      }
+      mb.addTube(padPts, [0.028, 0.022], MAT_CARBON_SATIN, 0.0, 14);
+    }
+
+    // Driver Aero-Test Helmet (essential in F1 wind tunnel models for accurate airbox/halo flow!)
+    const helmRings = [];
+    const hx0 = -0.11, hy0 = 0.705;
+    for (let r = 0; r <= 18; r++) {
+      const phi = (r / 18) * Math.PI;
+      const sp = Math.sin(phi), cp = Math.cos(phi);
+      const ring = [];
+      for (let s = 0; s <= 24; s++) {
+        const th = (s / 24) * TAU;
+        // Elongated aero helmet shell with rear spoiler lip
+        let lx = -cp * 0.155;
+        let ly = Math.sin(th) * sp * 0.132;
+        let lz = Math.cos(th) * sp * 0.122;
+        if (lx > 0.02 && ly > 0) lx += 0.035 * (ly / 0.132); // Rear aero spoiler duckbill
+        ring.push([hx0 + lx, hy0 + ly, lz]);
+      }
+      helmRings.push(ring);
+    }
+    mb.addLoft(helmRings, MAT_CARBON_GLOSS, 1.0, true, 1.0, 1.0, null, false);
+
+    // Dark chrome helmet visor band facing forward (-X)
+    const visorRings = [];
+    for (let r = 0; r <= 6; r++) {
+      const v = (r / 6) - 0.5;
+      const ring = [];
+      for (let s = 0; s <= 16; s++) {
+        const a = lerp(-1.12, 1.12, s / 16);
+        const rad = 0.126 - 0.012 * v * v;
+        ring.push([
+          hx0 - Math.cos(a) * 0.156,
+          hy0 + 0.022 + v * 0.068,
+          Math.sin(a) * rad
+        ]);
+      }
+      visorRings.push(ring);
+    }
+    mb.addLoft(visorRings, MAT_VISOR_GLOSS, 0.0, false, 1.0, 1.0, null, true);
+
+    // Steering wheel with telemetry shift LEDs
+    mb.addBox(-0.39, 0.635, 0.0, 0.022, 0.085, 0.145, MAT_CARBON_SATIN);
+    mb.addBox(-0.376, 0.672, 0.0, 0.006, 0.008, 0.075, MAT_EMISSIVE, 2.0); // cyan-green shift LEDs
+
+    // ------------------------------------------------------------------------
+    // C. OVERHEAD ROLL-HOOP AIRBOX INTAKE & AERO SHARK FIN
+    // ------------------------------------------------------------------------
+    // Sculpted roll-hoop airbox scoop sitting above helmet (x: +0.08 .. +0.48) with hollow recessed carbon duct!
+    const airboxOuter = [
+      [+0.09, 0.805, 0.975, 0.112],
+      [+0.15, 0.795, 0.992, 0.132],
+      [+0.28, 0.780, 0.978, 0.135],
+      [+0.48, 0.750, 0.935, 0.118]
+    ].map(([ax, yb, yt, hw]) => superellipseRing(ax, yb, yt, hw, 2.3, 28, 0.74, 0.85));
+    mb.addLoft(airboxOuter, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, true);
+    // Hollow inward-curving carbon lip bezel -> recessed dark airbox throat!
+    const airboxInner = [
+      airboxOuter[0],
+      superellipseRing(+0.082, 0.815, 0.966, 0.100, 2.3, 28, 0.74, 0.85),
+      superellipseRing(+0.115, 0.822, 0.958, 0.088, 2.3, 28, 0.74, 0.85),
+      superellipseRing(+0.220, 0.828, 0.948, 0.075, 2.3, 28, 0.74, 0.85)
+    ];
+    mb.addLoft(airboxInner, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, false);
+    mb.addCap(airboxInner[3], [-1, 0, 0], MAT_DARK_CAVITY, 2.0, true); // Deep recessed splitter/filter mesh!
+    // Overhead T-cam aero transponder winglet atop roll hoop (iconic F1 silhouette detail!)
+    mb.addAirfoilStrut([+0.14, 0.988, 0.0], [+0.17, 1.055, 0.0], 0.055, 0.012, MAT_CARBON_SATIN, 0.0, [1, 0, 0]);
+    mb.addBox(+0.165, 1.060, 0.0, 0.085, 0.014, 0.185, MAT_CARBON_GLOSS);
+
+    // Razor-sharp Engine Cover Aero Shark Fin (x: +0.34 .. +1.72)
+    const finRings = [];
+    for (let r = 0; r <= 14; r++) {
+      const f = r / 14;
+      const x = lerp(0.34, 1.72, f);
+      const yBot = lerp(0.90, 0.54, f);
+      const yTop = lerp(0.985, 0.755, Math.pow(f, 0.85));
+      const ring = [
+        [x, yBot, -0.007],
+        [x, yTop, -0.004],
+        [x, yTop + 0.003, 0.0],
+        [x, yTop, +0.004],
+        [x, yBot, +0.007]
+      ];
+      finRings.push(ring);
+    }
+    mb.addLoft(finRings, MAT_CARBON_GLOSS, 0.0, false, 1.0, 1.0, null, true);
+
+    // ------------------------------------------------------------------------
+    // D. SCULPTED HALO TITANIUM/CARBON COCKPIT PROTECTION STRUCTURE
+    // ------------------------------------------------------------------------
+    // Central front Halo pylon with aero teardrop fairing
+    mb.addAirfoilStrut([-0.50, 0.625, 0.0], [-0.39, 0.835, 0.0], 0.072, 0.026, MAT_CARBON_SATIN, 0.0, [1, 0, 0], 8, 16);
+    // Sweeping Halo side arches
+    for (const side of [-1, 1]) {
+      const haloPts = [];
+      const haloRads = [];
+      for (let i = 0; i <= 20; i++) {
+        const f = i / 20;
+        const x = lerp(-0.40, +0.16, f);
+        const z = side * (0.238 * Math.sin(Math.pow(f, 0.62) * Math.PI * 0.76));
+        const y = lerp(0.836, 0.742, Math.pow(f, 1.35)) + 0.012 * Math.sin(f * Math.PI);
+        haloPts.push([x, y, z]);
+        haloRads.push([0.024, 0.028]);
+      }
+      mb.addTube(haloPts, haloRads, MAT_CARBON_SATIN, 0.0, 16);
+    }
+
+    // ------------------------------------------------------------------------
+    // E. DOWNWASHING GROUND-EFFECT SIDEPODS WITH DEEP FRONT UNDERCUT
+    // ------------------------------------------------------------------------
+    for (const side of [-1, 1]) {
+      const spRings = [];
+      const nX = 28, nS = 28;
+      for (let r = 0; r <= nX; r++) {
+        const f = r / nX;
+        const x = lerp(-0.58, +1.72, f);
+        // Coke-bottle outer width profile: wide shoulder ahead, sweeping tightly inward aft
+        const shoulderEnv = Math.sin(Math.pow(clamp(f * 1.15 + 0.12, 0, 1), 0.65) * Math.PI * 0.88);
+        const zInner = 0.16;
+        const zOuter = lerp(0.68, 0.18, Math.pow(f, 1.25)) * (0.85 + 0.18 * shoulderEnv);
+        // Deep front undercut! At f=0 (inlet at x=-0.58), bottom of inlet sits high at y=0.35,
+        // then drops smoothly toward floor further back while top slopes down ("waterslide" ramp)
+        const yTopOuter = lerp(0.585, 0.215, Math.pow(f, 0.92));
+        const yTopInner = lerp(0.605, 0.455, Math.pow(f, 1.05));
+        const undercutFactor = Math.exp(-f * 4.2); // Strong undercut near front of sidepod
+        const yBotBase = lerp(0.065, 0.095, f) + 0.265 * undercutFactor;
+
+        const ring = [];
+        for (let s = 0; s <= nS; s++) {
+          const a = (s / nS) * TAU;
+          const ca = Math.cos(a), sa = Math.sin(a);
+          // Map angle around cross-section
+          const u = 0.5 + 0.5 * Math.sign(ca) * Math.pow(Math.abs(ca), 0.72); // 0 inner, 1 outer
+          const v = 0.5 + 0.5 * Math.sign(sa) * Math.pow(Math.abs(sa), 0.72); // 0 bottom, 1 top
+          let zMag = lerp(zInner, zOuter, u);
+          // Carve deep undercut inward on lower-outer face near front!
+          if (sa < 0) {
+            zMag -= undercutFactor * 0.22 * (-sa) * Math.pow(u, 0.8);
+          }
+          // Waterslide gully depression along mid-top of sidepod aft of x = -0.1
+          const gully = Math.sin(u * Math.PI) * smoothstep(0.15, 0.75, f) * (1.0 - 0.35 * f) * 0.055;
+          const yTop = lerp(yTopInner, yTopOuter, Math.pow(u, 0.85)) - gully;
+          const y = lerp(yBotBase, yTop, v);
+          ring.push([x, y, side * zMag]);
+        }
+        spRings.push(ring);
+      }
+      mb.addLoft(spRings, MAT_CARBON_GLOSS, 2.0, true, 1.0, 1.0, null, side > 0);
+      // Hollow inward-curving carbon sidepod mouth + deep recessed angled radiator core mesh!
+      const mouthOuter = spRings[0];
+      const mouthMid = mouthOuter.map(p => [
+        p[0] - 0.012,
+        lerp(0.475, p[1], 0.86),
+        lerp(side * 0.42, p[2], 0.88)
+      ]);
+      const mouthDeep = mouthOuter.map(p => [
+        p[0] + 0.16,
+        lerp(0.465, p[1], 0.76),
+        lerp(side * 0.40, p[2], 0.78)
+      ]);
+      mb.addLoft([mouthOuter, mouthMid, mouthDeep], MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, side < 0);
+      mb.addCap(mouthDeep, [-1, 0.15, 0], MAT_DARK_CAVITY, 2.0, side > 0); // Angled aluminum radiator louvers deep inside duct!
+
+      // Sidepod overbite carbon upper lip accent
+      const lipPts = [];
+      for (let i = 0; i <= 12; i++) {
+        const u = i / 12;
+        lipPts.push([-0.602 + 0.022 * u * u, lerp(0.594, 0.578, u), side * lerp(0.25, 0.66, u)]);
+      }
+      mb.addTube(lipPts, [0.011, 0.006], MAT_ACCENT_AERO, 0.0, 12);
+    }
+
+    // ------------------------------------------------------------------------
+    // F. VENTURI FLOOR, T-TRAY SPLITTER, FLOOR EDGE WINGS & REAR DIFFUSER
+    // ------------------------------------------------------------------------
+    // Front T-tray / bib splitter (x: -1.36 .. -0.75, y: 0.028)
+    const bibRings = [
+      superellipseRing(-1.36, 0.026, 0.040, 0.13, 3.5, 20),
+      superellipseRing(-1.15, 0.027, 0.046, 0.24, 3.8, 20),
+      superellipseRing(-0.75, 0.029, 0.055, 0.32, 3.8, 20)
+    ];
+    mb.addLoft(bibRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, true);
+    // Splitter metal stay rod
+    mb.addTube([[-1.24, 0.04, 0.0], [-1.20, 0.19, 0.0]], 0.005, MAT_METAL_CNC, 0.0, 8);
+
+    // Main Sculpted Ground-Effect Floor & Upswept Rear Diffuser (x: -0.86 .. +2.28)
+    for (const side of [-1, 1]) {
+      const flRings = [];
+      const nF = 26;
+      for (let r = 0; r <= nF; r++) {
+        const f = r / nF;
+        const x = lerp(-0.86, +2.28, f);
+        // Floor outer width tapers ahead of rear tire (x > 1.32)
+        let wOuter = 0.79;
+        if (x > 1.25) wOuter = lerp(0.79, 0.52, smoothstep(1.25, 1.62, x));
+        // Diffuser kick starts at x = 1.48 and sweeps steeply up to y = 0.31 at x = 2.28!
+        const diffT = smoothstep(1.45, 2.28, x);
+        const yTunnelRoof = 0.032 + 0.024 * Math.sin(clamp((x + 0.86) / 2.3, 0, 1) * Math.PI) + 0.275 * Math.pow(diffT, 1.45);
+        const yEdge = x < 1.48 ? 0.030 : lerp(0.030, 0.145, diffT);
+
+        const ring = [];
+        const segsW = 14;
+        for (let s = 0; s <= segsW; s++) {
+          const u = s / segsW; // 0 = centerline, 1 = outer floor edge
+          const z = side * u * wOuter;
+          // Venturi tunnel arch in mid-span (u around 0.45) + curled outer scroll lip
+          const arch = Math.sin(u * Math.PI) * (x < 1.48 ? 0.028 : 0.055);
+          const scrollCurl = Math.pow(Math.max(0, (u - 0.84) / 0.16), 2.0) * (x < 1.42 ? 0.036 : 0.01);
+          const yBot = lerp(0.030 + 0.22 * Math.pow(diffT, 1.6), yEdge, Math.pow(u, 1.6)) + arch + scrollCurl;
+          ring.push([x, yBot, z]);
+        }
+        // Return along top thickness of floor slab so both top and underside render cleanly
+        for (let s = segsW; s >= 0; s--) {
+          const p = ring[s];
+          ring.push([p[0], p[1] + 0.014, p[2]]);
+        }
+        flRings.push(ring);
+      }
+      mb.addLoft(flRings, MAT_CARBON_SATIN, 0.0, false, 1.0, 1.0, null, side > 0);
+
+      // Floor entrance Venturi fences (3 curved vertical strakes under front of floor)
+      for (const zFence of [0.34, 0.52, 0.69]) {
+        const fRings = [];
+        for (let r = 0; r <= 6; r++) {
+          const f = r / 6;
+          const x = lerp(-0.85, -0.38, f);
+          const z = side * (zFence + 0.045 * f * f);
+          fRings.push([
+            [x, 0.028, z - 0.004],
+            [x, 0.095, z - 0.004],
+            [x, 0.095, z + 0.004],
+            [x, 0.028, z + 0.004]
+          ]);
+        }
+        mb.addLoft(fRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, true);
+      }
+
+      // Rear Diffuser vertical strakes & outer diffuser wall (visible from rear!)
+      for (const zStrake of [0.18, 0.35, 0.51]) {
+        const dRings = [];
+        for (let r = 0; r <= 8; r++) {
+          const f = r / 8;
+          const x = lerp(1.56, 2.27, f);
+          const yTop = 0.05 + 0.255 * Math.pow(f, 1.4);
+          const yBot = lerp(0.032, 0.135, Math.pow(f, 1.2));
+          const z = side * zStrake;
+          dRings.push([
+            [x, yBot, z - 0.0045],
+            [x, yTop, z - 0.0045],
+            [x, yTop, z + 0.0045],
+            [x, yBot, z + 0.0045]
+          ]);
+        }
+        mb.addLoft(dRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, true);
+      }
+
+      // Longitudinal Floor Edge Wing + metallic slot brackets
+      const ewRings = [];
+      for (let r = 0; r <= 10; r++) {
+        const f = r / 10;
+        const x = lerp(-0.35, 1.18, f);
+        ewRings.push(airfoilRingAtSpan(side * 0.815, x, 0.052, 0.055, -0.18, -0.05, 0.14, 14).map(p => [x, p[1], side * (0.805 + (p[0] - x) * 0.45)]));
+      }
+      // Clean scrolled edge wing blade along z = ±0.815
+      const bladePts = [];
+      for (let i = 0; i <= 14; i++) {
+        const f = i / 14;
+        bladePts.push([lerp(-0.38, 1.20, f), 0.052 + 0.01 * Math.sin(f * Math.PI), side * 0.818]);
+      }
+      mb.addTube(bladePts, [0.022, 0.006], MAT_CARBON_GLOSS, 0.0, 12);
+    }
+
+    // ------------------------------------------------------------------------
+    // G. MULTI-ELEMENT FRONT WING (4 SLOTTED CAMBERED ELEMENTS + CURVED ENDPLATES)
+    // ------------------------------------------------------------------------
+    const fwElements = [
+      // [xOffset, yOffset, chordCenter, chordTip, pitchCenter, pitchTip, camber]
+      [-2.82, 0.088, 0.205, 0.175, -0.05, -0.11, -0.055], // Mainplane
+      [-2.62, 0.106, 0.155, 0.145, -0.16, -0.24, -0.065], // Flap 1
+      [-2.47, 0.138, 0.135, 0.130, -0.28, -0.38, -0.070], // Flap 2
+      [-2.35, 0.182, 0.118, 0.115, -0.40, -0.50, -0.075]  // Upper Slotted Flap 3
+    ];
+
+    const fwSpanSegs = 44;
+    for (let e = 0; e < fwElements.length; e++) {
+      const [x0, y0, cCen, cTip, pCen, pTip, cam] = fwElements[e];
+      const rings = [];
+      for (let i = 0; i <= fwSpanSegs; i++) {
+        const u = (i / fwSpanSegs) * 2.0 - 1.0; // -1 .. +1
+        const z = u * 0.955;
+        const az = Math.abs(u);
+        // Authentic F1 spoon central dip + mid-span arch + swept back tips
+        const sweepX = 0.16 * Math.pow(az, 1.55);
+        const spoonY = -0.024 * Math.exp(-az * az * 14.0) + 0.032 * Math.sin(az * Math.PI) - 0.018 * Math.pow(az, 3.0);
+        // Central FIA neutral section on upper flap tapers smoothly near |z| < 0.12
+        const centerNeutral = e >= 2 ? smoothstep(0.06, 0.22, az) : 1.0;
+        const chord = lerp(cCen * (0.72 + 0.28 * centerNeutral), cTip, az);
+        const pitch = lerp(pCen * (0.5 + 0.5 * centerNeutral), pTip, az);
+        rings.push(airfoilRingAtSpan(z, x0 + sweepX, y0 + spoonY, chord, pitch, cam, 0.115, 24));
+      }
+      const mat = e === 3 ? MAT_ACCENT_AERO : MAT_CARBON_GLOSS;
+      mb.addLoft(rings, mat, 0.0, true, 1.0, 1.0, null, false);
+    }
+
+    // Front Wing Curved Ground-Effect Endplates + Diveplane Canards + Nose Pylons
+    for (const side of [-1, 1]) {
+      // Twin Nose-to-Mainplane Aero Pylons
+      mb.addAirfoilStrut(
+        [-2.58, 0.19, side * 0.088],
+        [-2.62, 0.085, side * 0.095],
+        0.16, 0.016, MAT_CARBON_SATIN, 0.0, [1, 0, 0]
+      );
+
+      // Curved integrated endplate rolling smoothly upward at z = ±0.958
+      const epRings = [];
+      for (let r = 0; r <= 16; r++) {
+        const f = r / 16; // 0 bottom wing join -> 1 top tip
+        const y = lerp(0.082, 0.375, f);
+        const xLead = lerp(-2.66, -2.42, Math.pow(f, 0.85));
+        const chord = lerp(0.56, 0.26, Math.pow(f, 0.75));
+        const zCurve = side * (0.952 + 0.022 * Math.sin(f * Math.PI * 0.85) - 0.018 * f * f);
+        const ring = airfoilRingAtSpan(zCurve, xLead, y, chord, 0.0, side * 0.015, 0.055, 20);
+        // Rotate airfoil thickness axis from Y to Z so it's a vertical endplate!
+        const vRing = ring.map(p => [p[0], y, zCurve + (p[1] - y)]);
+        epRings.push(vRing);
+      }
+      mb.addLoft(epRings, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, side < 0);
+      mb.addCap(epRings[epRings.length - 1], [0, 1, 0], MAT_ACCENT_AERO, 0.0, side > 0);
+
+      // Outboard S-curved diveplane canard on outer face of front wing endplate
+      const dpPts = [];
+      for (let i = 0; i <= 10; i++) {
+        const f = i / 10;
+        dpPts.push([lerp(-2.52, -2.18, f), lerp(0.175, 0.248, Math.pow(f, 0.75)), side * (0.985 + 0.012 * Math.sin(f * Math.PI))]);
+      }
+      mb.addTube(dpPts, [0.026, 0.005], MAT_CARBON_SATIN, 0.0, 10);
+
+      // Slot-gap separator tabs across front wing flaps
+      for (const zSep of [0.32, 0.68]) {
+        mb.addBox(-2.46, 0.155, side * zSep, 0.22, 0.045, 0.005, MAT_METAL_CNC);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // H. REAR WING (SPOON MAINPLANE, DRS FLAP, SWAN-NECK PYLONS, ENDPLATES & BEAM WING)
+    // ------------------------------------------------------------------------
+    // Dual Beam Wing above diffuser exit (z: -0.49 .. +0.49)
+    const bwSpecs = [
+      [+2.08, 0.345, 0.145, -0.22, -0.075],
+      [+2.21, 0.398, 0.125, -0.38, -0.085]
+    ];
+    for (const [bx, by, bc, bp, bcam] of bwSpecs) {
+      const bwRings = [];
+      for (let i = 0; i <= 26; i++) {
+        const u = (i / 26) * 2.0 - 1.0;
+        const z = u * 0.495;
+        const arch = 0.018 * Math.cos(u * Math.PI * 0.5);
+        bwRings.push(airfoilRingAtSpan(z, bx + 0.025 * u * u, by + arch, bc, bp, bcam, 0.12, 22));
+      }
+      mb.addLoft(bwRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, false);
+    }
+
+    // Main Rear Wing Spoon Mainplane + High-Camber Slotted DRS Upper Flap (z: -0.51 .. +0.51)
+    const rwMainRings = [], rwFlapRings = [];
+    for (let i = 0; i <= 32; i++) {
+      const u = (i / 32) * 2.0 - 1.0;
+      const z = u * 0.512;
+      const az = Math.abs(u);
+      const spoonDrop = -0.032 * Math.cos(az * Math.PI * 0.5); // Spoon lower center, higher tips
+      const sweep = 0.035 * az * az;
+      rwMainRings.push(airfoilRingAtSpan(z, 2.22 + sweep, 0.775 + spoonDrop, 0.265, -0.19, -0.075, 0.125, 24));
+      rwFlapRings.push(airfoilRingAtSpan(z, 2.465 + sweep, 0.845 + spoonDrop * 0.5, 0.165, -0.52, -0.085, 0.115, 24));
+    }
+    mb.addLoft(rwMainRings, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, false);
+    mb.addLoft(rwFlapRings, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, false);
+
+    // DRS Central Actuator Pod on Rear Wing
+    const drsRings = [
+      superellipseRing(2.34, 0.785, 0.825, 0.016, 2.2, 16),
+      superellipseRing(2.43, 0.790, 0.885, 0.024, 2.4, 16),
+      superellipseRing(2.55, 0.855, 0.925, 0.018, 2.2, 16)
+    ];
+    mb.addLoft(drsRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, true);
+
+    // Twin Swan-Neck Rear Wing Pylons (arching over top suction side of mainplane!)
+    for (const side of [-1, 1]) {
+      const snPts = [
+        [1.92, 0.48, side * 0.052],
+        [2.05, 0.62, side * 0.056],
+        [2.16, 0.79, side * 0.058],
+        [2.24, 0.835, side * 0.058],
+        [2.33, 0.775, side * 0.058]
+      ];
+      mb.addTube(snPts, [[0.008, 0.042], [0.008, 0.038], [0.007, 0.034], [0.007, 0.030], [0.007, 0.026]], MAT_CARBON_SATIN, 0.0, 14);
+
+      // Rear Wing Endplates extending from beam wing height (y=0.38) to upper tip (y=0.95)
+      const rweRings = [];
+      for (let r = 0; r <= 18; r++) {
+        const f = r / 18;
+        const y = lerp(0.365, 0.945, f);
+        // Characteristic rear lower cutout step above beam wing
+        const xLead = lerp(2.08, 2.21, smoothstep(0.15, 0.65, f));
+        const chord = lerp(0.30, 0.455, smoothstep(0.25, 0.70, f)) * (1.0 - 0.12 * Math.pow(f, 4.0));
+        const zPos = side * (0.502 + 0.014 * smoothstep(0.3, 0.75, f) - 0.008 * Math.pow(f, 3.0));
+        const baseR = airfoilRingAtSpan(zPos, xLead, y, chord, 0.0, 0.0, 0.042, 20);
+        rweRings.push(baseR.map(p => [p[0], y, zPos + (p[1] - y)]));
+      }
+      mb.addLoft(rweRings, MAT_CARBON_GLOSS, 0.0, true, 1.0, 1.0, null, side < 0);
+    }
+
+    // Rear Crash Structure / Attenuator + Glowing Ruby FIA Rain Light + Titanium Exhaust
+    const crashRings = [
+      superellipseRing(2.12, 0.23, 0.365, 0.068, 2.6, 18),
+      superellipseRing(2.38, 0.245, 0.355, 0.052, 2.8, 18),
+      superellipseRing(2.53, 0.255, 0.345, 0.038, 3.0, 18)
+    ];
+    mb.addLoft(crashRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, true);
+    mb.addCap(crashRings[2], [1, 0, 0], MAT_CARBON_SATIN, 0.0, false);
+    // Bright ruby FIA rear rain/test LED cluster
+    mb.addBox(2.536, 0.300, 0.0, 0.012, 0.072, 0.046, MAT_EMISSIVE, 1.0);
+
+    // Central Titanium Exhaust Tailpipe + Wastegate Pipe
+    const exRings = [];
+    for (let r = 0; r <= 8; r++) {
+      const x = lerp(2.14, 2.41, r / 8);
+      const y = 0.435 + 0.012 * (r / 8);
+      exRings.push(superellipseRing(x, y - 0.052, y + 0.052, 0.052, 2.0, 22));
+    }
+    mb.addLoft(exRings, MAT_METAL_CNC, 1.0, true, 1.0, 1.0, null, true); // aux=1.0 -> heat-blued titanium!
+    // Dark inner exhaust bore
+    const exInRings = [
+      superellipseRing(2.30, 0.435 - 0.045, 0.435 + 0.045, 0.045, 2.0, 18),
+      superellipseRing(2.412, 0.447 - 0.046, 0.447 + 0.046, 0.046, 2.0, 18)
+    ];
+    mb.addLoft(exInRings, MAT_DARK_CAVITY, 0.0, true, 1.0, 1.0, null, false);
+    mb.addCap(exInRings[0], [1, 0, 0], MAT_DARK_CAVITY, 0.0, false);
+
+    // ------------------------------------------------------------------------
+    // I. DOUBLE-WISHBONE CARBON SUSPENSION, PUSHRODS, BRAKE DUCTS & WHEEL WINGLETS
+    // ------------------------------------------------------------------------
+    for (const side of [-1, 1]) {
+      // --- FRONT SUSPENSION (Axle at x = -1.74, z = ±0.820, hub y = 0.360) ---
+      const fHubU = [FRONT_AXLE_X, 0.485, side * 0.645];
+      const fHubL = [FRONT_AXLE_X, 0.225, side * 0.655];
+      // Upper Wishbone (front & rear airfoil legs)
+      mb.addAirfoilStrut([-1.96, 0.475, side * 0.215], fHubU, 0.068, 0.014, MAT_CARBON_SATIN);
+      mb.addAirfoilStrut([-1.50, 0.495, side * 0.230], fHubU, 0.072, 0.014, MAT_CARBON_SATIN);
+      // Lower Wishbone
+      mb.addAirfoilStrut([-1.98, 0.215, side * 0.195], fHubL, 0.075, 0.015, MAT_CARBON_SATIN);
+      mb.addAirfoilStrut([-1.46, 0.205, side * 0.225], fHubL, 0.078, 0.015, MAT_CARBON_SATIN);
+      // Steering Track Rod
+      mb.addAirfoilStrut([-1.84, 0.365, side * 0.215], [FRONT_AXLE_X - 0.07, 0.365, side * 0.640], 0.052, 0.012, MAT_CARBON_SATIN);
+      // Pushrod (diagonal from lower hub up to top chassis rocker)
+      mb.addAirfoilStrut(fHubL, [-1.66, 0.515, side * 0.210], 0.045, 0.013, MAT_CARBON_SATIN);
+
+      // Front Stationary Carbon Brake Drum + Cooling Scoop + Over-Wheel Eyebrow Winglet!
+      const fDrumRings = [
+        superellipseRing(FRONT_AXLE_X, 0.360 - 0.195, 0.360 + 0.195, 0.195, 2.0, 24).map(p => [FRONT_AXLE_X + p[2], p[1], side * 0.642]),
+        superellipseRing(FRONT_AXLE_X, 0.360 - 0.202, 0.360 + 0.202, 0.202, 2.0, 24).map(p => [FRONT_AXLE_X + p[2], p[1], side * 0.688])
+      ];
+      mb.addLoft(fDrumRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, side > 0);
+      mb.addCap(fDrumRings[0], [0, 0, -side], MAT_CARBON_SATIN, 0.0, side > 0);
+      // Front brake cooling intake scoop
+      mb.addBox(FRONT_AXLE_X - 0.14, 0.39, side * 0.625, 0.12, 0.14, 0.055, MAT_CARBON_SATIN);
+      mb.addBox(FRONT_AXLE_X - 0.201, 0.39, side * 0.625, 0.01, 0.11, 0.042, MAT_DARK_CAVITY);
+
+      // Signature Modern F1 Curved Over-Wheel Deflector Winglet (controls front tire wake!)
+      const owPts = [];
+      for (let i = 0; i <= 14; i++) {
+        const f = i / 14;
+        const ang = lerp(2.15, 0.72, f); // wraps from front-top over top-rear of inner tire shoulder
+        const r = 0.405;
+        owPts.push([
+          FRONT_AXLE_X - Math.cos(ang) * r * 0.92,
+          0.360 + Math.sin(ang) * r,
+          side * lerp(0.635, 0.775, Math.sin(f * Math.PI * 0.85))
+        ]);
+      }
+      mb.addTube(owPts, [0.048, 0.007], MAT_CARBON_GLOSS, 0.0, 12);
+
+      // --- REAR SUSPENSION (Axle at x = +1.80, z = ±0.790, hub y = 0.360) ---
+      const rHubU = [REAR_AXLE_X, 0.485, side * 0.565];
+      const rHubL = [REAR_AXLE_X, 0.225, side * 0.575];
+      // Swept Rear Upper Wishbone
+      mb.addAirfoilStrut([+1.46, 0.495, side * 0.165], rHubU, 0.072, 0.015, MAT_CARBON_SATIN);
+      mb.addAirfoilStrut([+1.98, 0.465, side * 0.125], rHubU, 0.076, 0.015, MAT_CARBON_SATIN);
+      // Swept Rear Lower Wishbone + Driveshaft Fairing
+      mb.addAirfoilStrut([+1.48, 0.225, side * 0.165], rHubL, 0.078, 0.016, MAT_CARBON_SATIN);
+      mb.addAirfoilStrut([+2.04, 0.245, side * 0.105], rHubL, 0.085, 0.016, MAT_CARBON_SATIN);
+      mb.addAirfoilStrut([+1.79, 0.355, side * 0.145], [REAR_AXLE_X, 0.358, side * 0.570], 0.092, 0.024, MAT_CARBON_SATIN); // Driveshaft shroud
+      // Rear Pullrod
+      mb.addAirfoilStrut([REAR_AXLE_X - 0.04, 0.475, side * 0.555], [+1.55, 0.235, side * 0.155], 0.044, 0.013, MAT_CARBON_SATIN);
+
+      // Rear Brake Drum + Multi-Winglets
+      const rDrumRings = [
+        superellipseRing(REAR_AXLE_X, 0.360 - 0.198, 0.360 + 0.198, 0.198, 2.0, 24).map(p => [REAR_AXLE_X + p[2], p[1], side * 0.562]),
+        superellipseRing(REAR_AXLE_X, 0.360 - 0.205, 0.360 + 0.205, 0.205, 2.0, 24).map(p => [REAR_AXLE_X + p[2], p[1], side * 0.605])
+      ];
+      mb.addLoft(rDrumRings, MAT_CARBON_SATIN, 0.0, true, 1.0, 1.0, null, side > 0);
+      mb.addCap(rDrumRings[0], [0, 0, -side], MAT_CARBON_SATIN, 0.0, side > 0);
+      for (let w = 0; w < 3; w++) {
+        mb.addBox(REAR_AXLE_X + 0.16, 0.23 + w * 0.045, side * 0.545, 0.14, 0.006, 0.065, MAT_CARBON_SATIN);
+      }
+    }
+  }
+
+  // Build a single high-detail 18-inch F1 Wheel + Slick Tire + Aero Wheel Cover centered at (0,0,0)
+  // Rendered 4 times (with per-wheel model/axle transform + live spin + world-space contact patch!)
+  function buildSingleWheelMesh(gl, width, isOuterPositiveZ = true) {
+    const mb = new MeshBuilder();
+    const halfW = width * 0.5;
+    const R_outer = TIRE_RADIUS;  // 0.360 m
+    const R_rim   = 0.229;        // 18-inch rim (0.2286 m radius)
+    const segsTheta = 72;
+
+    // Cross-section profile of tire from inner rim bead (s = -1) -> inner shoulder -> flat crown -> outer shoulder -> outer rim bead (s = +1)
+    const profilePts = [];
+    const nProf = 34;
+    for (let p = 0; p <= nProf; p++) {
+      const s = (p / nProf) * 2.0 - 1.0; // -1 .. +1
+      const as = Math.abs(s);
+      let r, z;
+      if (as <= 0.56) {
+        // Tread contact crown with subtle authentic F1 shoulder camber roll-off
+        const u = as / 0.56;
+        z = Math.sign(s) * u * (halfW * 0.89);
+        r = R_outer - 0.008 * Math.pow(u, 3.2);
+      } else {
+        // Sculpted sidewall bulge + rim-protector lip near R_rim
+        const u = (as - 0.56) / 0.44; // 0 at shoulder -> 1 at rim lip
+        const shoulderZ = halfW * 0.89;
+        const rimZ = halfW * 0.82;
+        const bulge = Math.sin(u * Math.PI) * (halfW * 0.115);
+        const rimLip = Math.exp(-Math.pow((u - 0.92) * 14.0, 2.0)) * 0.007;
+        z = Math.sign(s) * (lerp(shoulderZ, rimZ, Math.pow(u, 1.35)) + bulge + rimLip);
+        r = lerp(R_outer - 0.008, R_rim, Math.pow(u, 0.82));
+      }
+      profilePts.push([r, z, s]);
+    }
+
+    const tireRings = [];
+    for (let t = 0; t <= segsTheta; t++) {
+      const ang = (t / segsTheta) * TAU;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      const ring = [];
+      for (let p = 0; p <= nProf; p++) {
+        const [r, z] = profilePts[p];
+        ring.push([ca * r, sa * r, z]);
+      }
+      tireRings.push(ring);
+    }
+
+    // Pass [theta/(2*PI), meridianS (-1..+1)] in UV so fragment shader renders exact tread wear & sidewall ribs!
+    mb.addLoft(
+      tireRings, MAT_TIRE_RUBBER, 1.0, false, 1.0, 1.0,
+      (r, s) => [r / segsTheta, profilePts[s][2]],
+      true
+    );
+
+    // Outer & Inner Metallic Rim Lip Rings + Recessed Aero Carbon Wheel Cover + Center Locknut
+    for (const side of [-1, 1]) {
+      const rimZ = side * (halfW * 0.82);
+      const dishZ = side * (halfW * 0.72);
+      const hubZ  = side * (halfW * 0.77);
+
+      const coverProfile = [
+        [R_rim + 0.005, rimZ, MAT_ACCENT_AERO],
+        [R_rim - 0.012, rimZ + side * 0.006, MAT_ACCENT_AERO],
+        [R_rim - 0.022, dishZ, MAT_CARBON_SATIN],
+        [0.145, dishZ - side * 0.018, MAT_CARBON_SATIN],
+        [0.072, hubZ, MAT_CARBON_SATIN],
+        [0.055, hubZ + side * 0.016, MAT_METAL_CNC],
+        [0.032, hubZ + side * 0.022, MAT_METAL_CNC],
+        [0.026, dishZ - side * 0.012, MAT_DARK_CAVITY],
+        [0.001, dishZ - side * 0.012, MAT_DARK_CAVITY]
+      ];
+
+      for (let seg = 0; seg < coverProfile.length - 1; seg++) {
+        const [r0, z0, m0] = coverProfile[seg];
+        const [r1, z1] = coverProfile[seg + 1];
+        const cRings = [];
+        for (let t = 0; t <= 56; t++) {
+          const a = (t / 56) * TAU;
+          const ca = Math.cos(a), sa = Math.sin(a);
+          cRings.push([
+            [ca * r0, sa * r0, z0],
+            [ca * r1, sa * r1, z1]
+          ]);
+        }
+        mb.addLoft(
+          cRings, m0, 1.0, false, 1.0, 1.0,
+          (tIdx, sIdx) => [tIdx / 56, sIdx === 0 ? r0 : r1],
+          side > 0
+        );
+      }
+
+      // Sculpted rotational aero vanes on outer wheel cover + internal carbon brake rotor & caliper glimpse!
+      if (side === (isOuterPositiveZ ? 1 : -1)) {
+        // Internal drilled carbon-ceramic brake disc & metallic caliper visible inside rim depth
+        const rotorZ = dishZ - side * 0.032;
+        const rDisc = [
+          [0.188, rotorZ, MAT_METAL_CNC],
+          [0.105, rotorZ, MAT_METAL_CNC]
+        ];
+        const discRings = [];
+        for (let t = 0; t <= 40; t++) {
+          const a = (t / 40) * TAU;
+          discRings.push([
+            [Math.cos(a) * rDisc[0][0], Math.sin(a) * rDisc[0][0], rotorZ],
+            [Math.cos(a) * rDisc[1][0], Math.sin(a) * rDisc[1][0], rotorZ]
+          ]);
+        }
+        mb.addLoft(discRings, MAT_METAL_CNC, 0.0, false, 1.0, 1.0, null, side > 0);
+
+        const nVanes = 10;
+        for (let v = 0; v < nVanes; v++) {
+          const baseA = (v / nVanes) * TAU;
+          const pIn = [Math.cos(baseA) * 0.078, Math.sin(baseA) * 0.078, dishZ + side * 0.004];
+          const pOut = [Math.cos(baseA + 0.34) * 0.212, Math.sin(baseA + 0.34) * 0.212, rimZ - side * 0.002];
+          mb.addAirfoilStrut(pIn, pOut, 0.028, 0.009, MAT_CARBON_SATIN, 1.0, [0, 0, side], 3, 10);
+        }
+      }
+    }
+
+    return mb.compile(gl);
+  }
+
+  // ============================================================================
+  // 5. WIND TUNNEL ARCHITECTURE, ROLLING ROAD, TURNTABLE, SMOKE RAKE & TURBINE
+  // ============================================================================
+  function buildWindTunnelStatic(mb) {
+    // Tunnel cross-section: octagonal-filleted aero test chamber!
+    // Test section x: -7.5 .. +8.5, Upstream contraction nozzle x: -13.5 .. -7.5, Downstream collector x: +8.5 .. +14.0
+    const tunnelStations = [
+      // [x, halfW, height]
+      [-13.5, 6.20, 5.40],
+      [-11.5, 5.65, 5.05],
+      [-9.5,  4.85, 4.55],
+      [-7.6,  4.35, 4.22],
+      [-4.0,  4.32, 4.20],
+      [+0.0,  4.32, 4.20],
+      [+4.5,  4.34, 4.20],
+      [+8.5,  4.42, 4.25],
+      [+11.2, 4.95, 4.65],
+      [+14.2, 5.60, 5.10]
+    ];
+
+    // Arch profile from left floor corner (-halfW, 0) -> left wall -> chamfer -> ceiling -> right chamfer -> right wall -> (+halfW, 0)
+    const wallRings = [];
+    for (let i = 0; i < tunnelStations.length; i++) {
+      const [x, hw, h] = tunnelStations[i];
+      const chamferW = hw * 0.30;
+      const chamferH = h * 0.28;
+      // Smoothly fillet the octagonal arch
+      const rawPts = [
+        [x, 0.0, -hw],
+        [x, h - chamferH, -hw],
+        [x, h, -(hw - chamferW)],
+        [x, h, +(hw - chamferW)],
+        [x, h - chamferH, +hw],
+        [x, 0.0, +hw]
+      ];
+      // Subdivide arch segments with corner rounding
+      const ring = [];
+      for (let k = 0; k < rawPts.length - 1; k++) {
+        const a = rawPts[k], b = rawPts[k + 1];
+        const steps = 6;
+        for (let s = 0; s < steps; s++) {
+          ring.push(vLerp(a, b, s / steps));
+        }
+      }
+      ring.push(rawPts[rawPts.length - 1]);
+      wallRings.push(ring);
+    }
+    // Flip winding so normals point INWARD into the tunnel!
+    mb.addLoft(wallRings, MAT_TUNNEL_WALL, 0.0, false, 0.25, 0.25, null, true);
+
+    // Structural external-style rib frames inside tunnel seams every 2.2m for architectural depth
+    for (let rx = -7.2; rx <= 8.2; rx += 2.2) {
+      const hw = 4.30, h = 4.18, cw = hw * 0.30, ch = h * 0.28;
+      const ribPts = [
+        [rx, 0.02, -hw],
+        [rx, h - ch, -hw],
+        [rx, h, -(hw - cw)],
+        [rx, h, +(hw - cw)],
+        [rx, h - ch, +hw],
+        [rx, 0.02, +hw]
+      ];
+      mb.addTube(ribPts, [0.045, 0.065], MAT_TUNNEL_WALL, 1.0, 10);
+    }
+
+    // Control Room Tinted Observation Window recessed into far wall (z = -4.29, x: -3.2 .. +3.2, y: 0.9 .. 2.5)
+    mb.addBox(0.0, 1.72, -4.30, 6.4, 1.55, 0.06, MAT_METAL_CNC);
+    mb.addBox(0.0, 1.72, -4.275, 6.2, 1.38, 0.03, MAT_EMISSIVE, 3.0); // subtle warm-blue control room console glow
+    // Vertical window mullions
+    for (const wx of [-2.05, 0.0, +2.05]) {
+      mb.addBox(wx, 1.72, -4.25, 0.055, 1.42, 0.05, MAT_METAL_CNC);
+    }
+
+    // ------------------------------------------------------------------------
+    // LONG CONTINUOUS OVERHEAD LED LIGHT STRIP HOUSINGS & EMISSIVE DIFFUSERS
+    // ------------------------------------------------------------------------
+    // 1. Chamfer architectural LED strips (x: -9.0 .. +9.5, y: 3.62, z: ±3.42)
+    for (const side of [-1, 1]) {
+      mb.addBox(0.25, 3.66, side * 3.45, 18.6, 0.11, 0.22, MAT_METAL_CNC);
+      mb.addBox(0.25, 3.61, side * 3.41, 18.4, 0.05, 0.14, MAT_EMISSIVE, 0.0);
+    }
+    // 2. Twin Precision Overhead Car-Inspection LED Light Bars (x: -4.2 .. +4.4, y: 4.16, z: ±0.58)
+    for (const side of [-1, 1]) {
+      mb.addBox(0.10, 4.18, side * 0.58, 8.7, 0.06, 0.19, MAT_METAL_CNC);
+      mb.addBox(0.10, 4.145, side * 0.58, 8.6, 0.025, 0.13, MAT_EMISSIVE, 0.0);
+      // 3. Lower-Wall Horizontal Aero-Inspection Grazing LED Strips (sculpting tire sidewalls, rims & Venturi floor edge!)
+      mb.addBox(0.00, 0.48, side * 4.28, 11.2, 0.07, 0.06, MAT_METAL_CNC);
+      mb.addBox(0.00, 0.48, side * 4.245, 11.0, 0.032, 0.02, MAT_EMISSIVE, 0.0);
+    }
+
+    // ------------------------------------------------------------------------
+    // OVERHEAD STREAMLINED WIND-TUNNEL MODEL SUPPORT STING (SLENDER SWEPT AERO BLADE)
+    // ------------------------------------------------------------------------
+    // Ceiling pitch/yaw carriage track
+    mb.addBox(1.10, 4.16, 0.0, 2.1, 0.08, 0.28, MAT_METAL_CNC);
+    // Razor-thin swept airfoil carbon/titanium blade descending cleanly into spine behind airbox!
+    mb.addAirfoilStrut([1.42, 4.14, 0.0], [0.96, 0.78, 0.0], 0.095, 0.014, MAT_CARBON_SATIN, 0.0, [1, 0, 0], 14, 20);
+    // Machined sting collar cuff at engine cover spine entry
+    const cuffRings = [
+      superellipseRing(0.89, 0.76, 0.82, 0.018, 2.2, 16),
+      superellipseRing(1.04, 0.73, 0.79, 0.016, 2.2, 16)
+    ];
+    mb.addLoft(cuffRings, MAT_METAL_CNC, 0.0, true, 1.0, 1.0, null, true);
+
+    // ------------------------------------------------------------------------
+    // UPSTREAM PRECISION AIRFOIL SMOKE RAKE BOOM (AT x = -4.55m)
+    // ------------------------------------------------------------------------
+    // Vertical airfoil rake mast on centerline + horizontal streamlined cross-wing for lateral smoke nozzles!
+    mb.addAirfoilStrut([-4.55, 0.0, 0.0], [-4.55, 1.65, 0.0], 0.11, 0.018, MAT_METAL_CNC, 0.0, [1, 0, 0], 10, 16);
+    mb.addAirfoilStrut([-4.55, 1.65, 0.0], [-4.40, 4.18, 0.0], 0.09, 0.016, MAT_CARBON_SATIN, 0.0, [1, 0, 0], 8, 14);
+    // Horizontal aero rake wing bars at key heights (y = 0.14m & y = 0.44m & y = 0.78m)
+    mb.addAirfoilStrut([-4.55, 0.14, -1.02], [-4.55, 0.14, +1.02], 0.065, 0.010, MAT_METAL_CNC, 0.0, [1, 0, 0], 8, 12);
+    mb.addAirfoilStrut([-4.55, 0.42, -0.76], [-4.55, 0.42, +0.76], 0.060, 0.010, MAT_METAL_CNC, 0.0, [1, 0, 0], 8, 12);
+    mb.addAirfoilStrut([-4.55, 0.78, -0.58], [-4.55, 0.78, +0.58], 0.055, 0.009, MAT_METAL_CNC, 0.0, [1, 0, 0], 8, 12);
+
+    // ------------------------------------------------------------------------
+    // UPSTREAM HONEYCOMB FLOW STRAIGHTENER WALL (AT x = -13.4m)
+    // ------------------------------------------------------------------------
+    mb.addBox(-13.45, 2.70, 0.0, 0.12, 5.50, 12.50, MAT_DARK_CAVITY, 1.0); // aux=1 -> backlit honeycomb screen!
+
+    // ------------------------------------------------------------------------
+    // TUNNEL FLOOR, YAW TURNTABLE & CENTRAL MOVING ROLLING-ROAD BELT
+    // ------------------------------------------------------------------------
+    // Rolling-road belt region: x in [-3.35, +3.15], z in [-1.12, +1.12] at y = 0.0
+    const rx0 = -3.35, rx1 = +3.15, rz = 1.12;
+    const bBase = mb.vertCount;
+    mb.addVertex(rx0, 0.001, -rz, 0, 1, 0, rx0, -rz, MAT_ROLLING_ROAD, 0.0);
+    mb.addVertex(rx0, 0.001, +rz, 0, 1, 0, rx0, +rz, MAT_ROLLING_ROAD, 0.0);
+    mb.addVertex(rx1, 0.001, +rz, 0, 1, 0, rx1, +rz, MAT_ROLLING_ROAD, 0.0);
+    mb.addVertex(rx1, 0.001, -rz, 0, 1, 0, rx1, -rz, MAT_ROLLING_ROAD, 0.0);
+    mb.addQuad(bBase, bBase + 1, bBase + 2, bBase + 3);
+
+    // Precision stainless steel belt border trim & upstream boundary-layer suction grate!
+    mb.addBox(-3.46, 0.002, 0.0, 0.20, 0.004, 2.48, MAT_METAL_CNC, 2.0); // Upstream suction grate
+    mb.addBox(+3.26, 0.002, 0.0, 0.20, 0.004, 2.48, MAT_METAL_CNC, 2.0); // Downstream collector plate
+    mb.addBox(-0.10, 0.002, -1.16, 6.72, 0.004, 0.08, MAT_METAL_CNC, 0.0);
+    mb.addBox(-0.10, 0.002, +1.16, 6.72, 0.004, 0.08, MAT_METAL_CNC, 0.0);
+
+    // Surrounding Tunnel Floor Plane (y = 0.0) covering entire chamber
+    const fx0 = -13.6, fx1 = +14.3, fz = 6.3;
+    const fBase = mb.vertCount;
+    mb.addVertex(fx0, -0.001, -fz, 0, 1, 0, fx0, -fz, MAT_TUNNEL_FLOOR, 0.0);
+    mb.addVertex(fx0, -0.001, +fz, 0, 1, 0, fx0, +fz, MAT_TUNNEL_FLOOR, 0.0);
+    mb.addVertex(fx1, -0.001, +fz, 0, 1, 0, fx1, +fz, MAT_TUNNEL_FLOOR, 0.0);
+    mb.addVertex(fx1, -0.001, -fz, 0, 1, 0, fx1, -fz, MAT_TUNNEL_FLOOR, 0.0);
+    mb.addQuad(fBase, fBase + 1, fBase + 2, fBase + 3);
+
+    // Downstream Wind-Tunnel Collector Nacelle Hub & Stator Struts (at x = +12.8m, y = 2.25m, z = 0)
+    const hubRings = [];
+    for (let r = 0; r <= 12; r++) {
+      const f = r / 12;
+      const x = lerp(11.6, 14.2, f);
+      const rad = 0.92 * Math.sin(Math.pow(f, 0.55) * Math.PI * 0.86 + 0.05);
+      hubRings.push(superellipseRing(x, 2.25 - rad, 2.25 + rad, rad, 2.0, 28));
+    }
+    mb.addLoft(hubRings, MAT_METAL_CNC, 0.0, true, 1.0, 1.0, null, true);
+    // Stator support struts holding the central fan hub
+    for (let k = 0; k < 6; k++) {
+      const a = (k / 6) * TAU + 0.25;
+      mb.addAirfoilStrut(
+        [13.3, 2.25 + Math.sin(a) * 0.85, Math.cos(a) * 0.85],
+        [13.5, 2.25 + Math.sin(a) * 4.80, Math.cos(a) * 4.80],
+        0.42, 0.065, MAT_CARBON_SATIN, 0.0, [1, 0, 0]
+      );
+    }
+    // Backlit atmospheric diffuser glow disk behind the giant turbine fan
+    const dRing = superellipseRing(14.25, 2.25 - 5.2, 2.25 + 5.2, 5.2, 2.0, 36);
+    mb.addCap(dRing, [-1, 0, 0], MAT_EMISSIVE, 4.0, false);
+  }
+
+  // Build the Giant Downstream 12-Blade Axial Wind Tunnel Fan (rotates around X axis at x=12.4, y=2.25, z=0)
+  function buildTunnelFanMesh(gl) {
+    const mb = new MeshBuilder();
+    const nBlades = 12;
+    for (let b = 0; b < nBlades; b++) {
+      const a0 = (b / nBlades) * TAU;
+      const ca = Math.cos(a0), sa = Math.sin(a0);
+      // Twisted aero fan blade from r=0.88m to r=4.65m
+      const bRings = [];
+      for (let r = 0; r <= 8; r++) {
+        const f = r / 8;
+        const rad = lerp(0.86, 4.65, f);
+        const chord = lerp(0.58, 0.34, f);
+        const twist = lerp(0.65, 0.28, f);
+        const localRing = airfoilRingAtSpan(rad, -0.18, 0.0, chord, twist, 0.04, 0.09, 16);
+        // Map (x, tangential, radial) around X axis!
+        bRings.push(localRing.map(p => {
+          const tang = p[1];
+          const py = sa * rad + ca * tang;
+          const pz = ca * rad - sa * tang;
+          return [p[0], py, pz];
+        }));
+      }
+      mb.addLoft(bRings, MAT_CARBON_SATIN, 0.0, true, 0.5, 0.5, null, false);
+    }
+    return mb.compile(gl);
+  }
+
+  // Add tiny brass/steel smoke emission nozzles on the upstream rake at exact streamline seed positions
+  function addSmokeNozzlesToTunnel(mb, seeds) {
+    for (const s of seeds) {
+      if (!s.primary) continue;
+      mb.addTube([[s.x - 0.10, s.y, s.z], [s.x + 0.02, s.y, s.z]], 0.0055, MAT_METAL_CNC, 0.0, 8);
+    }
+  }
+
+  // ============================================================================
+  // 6. 3D AERODYNAMIC POTENTIAL FLOW + BOUND VORTEX + WAKE TURBULENCE SOLVER
+  // ============================================================================
+  function smin(a, b, k) {
+    const h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return lerp(b, a, h) - k * h * (1.0 - h);
+  }
+  function sdBox(px, py, pz, cx, cy, cz, hx, hy, hz, rad = 0.02) {
+    const dx = Math.abs(px - cx) - hx;
+    const dy = Math.abs(py - cy) - hy;
+    const dz = Math.abs(pz - cz) - hz;
+    const ox = Math.max(dx, 0), oy = Math.max(dy, 0), oz = Math.max(dz, 0);
+    return Math.hypot(ox, oy, oz) + Math.min(Math.max(dx, Math.max(dy, dz)), 0.0) - rad;
+  }
+  function sdCapsuleX(px, py, pz, x0, y0, z0, x1, y1, z1, r0, r1) {
+    const bax = x1 - x0, bay = y1 - y0, baz = z1 - z0;
+    const pax = px - x0, pay = py - y0, paz = pz - z0;
+    const h = clamp((pax*bax + pay*bay + paz*baz) / (bax*bax + bay*bay + baz*baz), 0.0, 1.0);
+    const r = lerp(r0, r1, h);
+    return Math.hypot(pax - bax*h, pay - bay*h, paz - baz*h) - r;
+  }
+  function sdWheelZ(px, py, pz, wx, wy, wz, radius, halfW) {
+    const dRad = Math.hypot(px - wx, py - wy) - radius;
+    const dZ = Math.abs(pz - wz) - halfW;
+    return Math.hypot(Math.max(dRad, 0), Math.max(dZ, 0)) + Math.min(Math.max(dRad, dZ), 0) - 0.015;
+  }
+
+  // Composite Signed Distance Field of the F1 Car (symmetric in |z|) for exact streamline bending & collision-free flow!
+  function carSDF(x, y, zInput) {
+    const z = Math.abs(zInput);
+    // Quick broadphase AABB check
+    if (x < -3.05 || x > 2.85 || y > 1.25 || z > 1.18) {
+      return Math.max(
+        Math.max(-3.00 - x, x - 2.80),
+        Math.max(y - 1.15, z - 1.10)
+      );
+    }
+
+    // 1. Nose + Monocoque + Roll Hoop + Engine Cover Spine
+    let d = sdCapsuleX(x, y, z, -2.85, 0.180, 0.0, -1.75, 0.355, 0.0, 0.062, 0.215);
+    d = smin(d, sdCapsuleX(x, y, z, -1.75, 0.355, 0.0, -0.25, 0.365, 0.0, 0.215, 0.285), 0.09);
+    // Helmet + Halo + Airbox dome
+    d = smin(d, sdCapsuleX(x, y, z, -0.35, 0.68, 0.0, +0.28, 0.86, 0.0, 0.145, 0.155), 0.10);
+    // Tapering Engine Cover Spine
+    d = smin(d, sdCapsuleX(x, y, z, +0.28, 0.56, 0.0, +2.05, 0.36, 0.0, 0.24, 0.10), 0.10);
+
+    // 2. Sculpted Sidepod (preserving deep front undercut below y=0.33 near x=-0.55!)
+    if (x > -0.72 && x < 1.85) {
+      const f = clamp((x + 0.58) / 2.25, 0.0, 1.0);
+      const zOut = lerp(0.66, 0.19, Math.pow(f, 1.2));
+      const yTop = lerp(0.57, 0.23, Math.pow(f, 0.9));
+      const yBot = lerp(0.33, 0.08, smoothstep(0.0, 0.45, f));
+      const dSp = sdBox(x, y, z, x, 0.5*(yTop+yBot), 0.5*(0.15+zOut), 0.09, Math.max(0.02, 0.5*(yTop-yBot)), Math.max(0.02, 0.5*(zOut-0.15)), 0.045);
+      if (x >= -0.59 && x <= 1.70) d = smin(d, dSp, 0.075);
+    }
+
+    // 3. Floor Slab (thin slab around y = 0.05..0.075 so flow under y < 0.045 passes through Venturi & rises in diffuser!)
+    if (x > -0.90 && x < 2.28 && z < 0.80) {
+      const diffT = smoothstep(1.45, 2.28, x);
+      const ySlab = 0.058 + 0.235 * Math.pow(diffT, 1.45);
+      const wMax = x > 1.25 ? lerp(0.79, 0.52, smoothstep(1.25, 1.62, x)) : 0.79;
+      if (z <= wMax) {
+        const dFl = Math.abs(y - ySlab) - 0.016;
+        d = smin(d, Math.max(dFl, Math.max(-0.86 - x, x - 2.26)), 0.025);
+      }
+    }
+
+    // 4. Front Wing Slotted Cascade + Endplates
+    if (x > -2.92 && x < -2.12 && z < 1.02) {
+      const az = clamp(z / 0.955, 0.0, 1.0);
+      const xWing = -2.56 + 0.15 * Math.pow(az, 1.5);
+      const yWing = 0.125 + 0.04 * ((x - xWing) / 0.25);
+      const dFw = sdBox(x, y, z, xWing, yWing, 0.48, 0.23, 0.025, 0.48, 0.02);
+      const dEp = sdBox(x, y, z, -2.44, 0.225, 0.958, 0.21, 0.145, 0.014, 0.015);
+      d = smin(d, smin(dFw, dEp, 0.025), 0.03);
+    }
+
+    // 5. Rear Wing, Beam Wing & Endplates
+    if (x > 2.00 && x < 2.74 && z < 0.60) {
+      const dRw = sdBox(x, y, z, 2.43, 0.825 + 0.18 * (x - 2.43), 0.0, 0.22, 0.032, 0.51, 0.02);
+      const dBw = sdBox(x, y, z, 2.16, 0.385 + 0.16 * (x - 2.16), 0.0, 0.13, 0.022, 0.49, 0.015);
+      const dRe = sdBox(x, y, z, 2.38, 0.655, 0.512, 0.21, 0.285, 0.014, 0.015);
+      d = smin(d, smin(dRw, smin(dBw, dRe, 0.02), 0.02), 0.025);
+    }
+
+    // 6. Front & Rear Wheels
+    d = smin(d, sdWheelZ(x, y, z, FRONT_AXLE_X, TIRE_RADIUS, FRONT_TRACK_Z, TIRE_RADIUS + 0.010, 0.158), 0.03);
+    d = smin(d, sdWheelZ(x, y, z, REAR_AXLE_X,  TIRE_RADIUS, REAR_TRACK_Z,  TIRE_RADIUS + 0.010, 0.208), 0.03);
+
+    return d;
+  }
+
+  class AeroFlowField {
+    constructor() {
+      // Half-symmetric grid covering x: [-4.8, +6.6], y: [0.0, +2.25], z: [0.0, +1.85]
+      this.xMin = -4.80; this.xMax = +6.60; this.nx = 136;
+      this.yMin =  0.00; this.yMax = +2.25; this.ny = 46;
+      this.zMin =  0.00; this.zMax = +1.85; this.nz = 38;
+      this.dx = (this.xMax - this.xMin) / (this.nx - 1);
+      this.dy = (this.yMax - this.yMin) / (this.ny - 1);
+      this.dz = (this.zMax - this.zMin) / (this.nz - 1);
+
+      const total = this.nx * this.ny * this.nz;
+      this.sdf = new Float32Array(total);
+      this.vx  = new Float32Array(total);
+      this.vy  = new Float32Array(total);
+      this.vz  = new Float32Array(total);
+      this.turb = new Float32Array(total); // Local aerodynamic wake turbulence intensity [0..1]
+
+      this.solvePotentialAndVortices();
+    }
+
+    idx(ix, iy, iz) {
+      return (ix * this.ny + iy) * this.nz + iz;
+    }
+
+    solvePotentialAndVortices() {
+      const { nx, ny, nz, dx, dy, dz, xMin, yMin, zMin, sdf } = this;
+      const total = nx * ny * nz;
+      const phi = new Float32Array(total);
+      const solid = new Uint8Array(total);
+
+      // 1. Evaluate car SDF and initialize perturbation potential phi (total potential = U*x + phi)
+      for (let ix = 0; ix < nx; ix++) {
+        const x = xMin + ix * dx;
+        for (let iy = 0; iy < ny; iy++) {
+          const y = yMin + iy * dy;
+          for (let iz = 0; iz < nz; iz++) {
+            const z = zMin + iz * dz;
+            const id = (ix * ny + iy) * nz + iz;
+            const d = carSDF(x, y, z);
+            sdf[id] = d;
+            solid[id] = d <= 0.012 ? 1 : 0;
+            phi[id] = 0.0;
+          }
+        }
+      }
+
+      // 2. Solve 3D Laplace equation for perturbation potential with Neumann body-obstruction BC (-dPhi/dn = U_inf * nx)
+      const invDx2 = 1.0 / (dx * dx), invDy2 = 1.0 / (dy * dy), invDz2 = 1.0 / (dz * dz);
+      const omegaSOR = 1.62;
+
+      for (let iter = 0; iter < 38; iter++) {
+        for (let ix = 1; ix < nx - 1; ix++) {
+          for (let iy = 0; iy < ny - 1; iy++) {
+            for (let iz = 0; iz < nz - 1; iz++) {
+              const id = (ix * ny + iy) * nz + iz;
+              if (solid[id]) continue;
+
+              let sum = 0.0, weight = 0.0, rhs = 0.0;
+
+              // -X neighbor
+              const idXm = ((ix - 1) * ny + iy) * nz + iz;
+              if (solid[idXm]) rhs -= dx * 1.0 * invDx2;
+              else { sum += phi[idXm] * invDx2; weight += invDx2; }
+
+              // +X neighbor
+              const idXp = ((ix + 1) * ny + iy) * nz + iz;
+              if (solid[idXp]) rhs += dx * 1.0 * invDx2;
+              else { sum += phi[idXp] * invDx2; weight += invDx2; }
+
+              // -Y neighbor (floor y=0 has no-penetration dPhi/dy = 0!)
+              if (iy > 0) {
+                const idYm = (ix * ny + (iy - 1)) * nz + iz;
+                if (!solid[idYm]) { sum += phi[idYm] * invDy2; weight += invDy2; }
+              }
+              // +Y neighbor
+              const idYp = (ix * ny + (iy + 1)) * nz + iz;
+              if (!solid[idYp]) { sum += phi[idYp] * invDy2; weight += invDy2; }
+
+              // -Z neighbor (symmetry plane z=0 has dPhi/dz = 0!)
+              if (iz > 0) {
+                const idZm = (ix * ny + iy) * nz + (iz - 1);
+                if (!solid[idZm]) { sum += phi[idZm] * invDz2; weight += invDz2; }
+              }
+              // +Z neighbor
+              const idZp = (ix * ny + iy) * nz + (iz + 1);
+              if (!solid[idZp]) { sum += phi[idZp] * invDz2; weight += invDz2; }
+
+              if (weight > 1e-8) {
+                const target = (sum - rhs) / weight;
+                phi[id] += omegaSOR * (target - phi[id]);
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Differentiate potential + superpose authentic F1 bound downforce circulation,
+      //    sidepod downwash, Venturi suction, diffuser upwash, & trailing wingtip helical vortices!
+      for (let ix = 0; ix < nx; ix++) {
+        const x = xMin + ix * dx;
+        for (let iy = 0; iy < ny; iy++) {
+          const y = yMin + iy * dy;
+          for (let iz = 0; iz < nz; iz++) {
+            const z = zMin + iz * dz;
+            const id = (ix * ny + iy) * nz + iz;
+
+            const ixm = Math.max(0, ix - 1), ixp = Math.min(nx - 1, ix + 1);
+            const iym = Math.max(0, iy - 1), iyp = Math.min(ny - 1, iy + 1);
+            const izm = Math.max(0, iz - 1), izp = Math.min(nz - 1, iz + 1);
+
+            let ux = 1.0 + (phi[(ixp*ny + iy)*nz + iz] - phi[(ixm*ny + iy)*nz + iz]) / ((ixp - ixm) * dx);
+            let uy = (phi[(ix*ny + iyp)*nz + iz] - phi[(ix*ny + iym)*nz + iz]) / ((iyp - iym) * dy);
+            let uz = iz === 0 ? 0.0 : (phi[(ix*ny + iy)*nz + izp] - phi[(ix*ny + iy)*nz + izm]) / ((izp - izm) * dz);
+
+            // A. Front Wing upwash/outwash & endplate vortex (x > -2.55)
+            if (x > -2.65 && x < -1.10) {
+              // Upward kick behind inverted cambered front wing (creating front downforce!)
+              if (z < 0.96) {
+                const fwW = Math.exp(-Math.pow((x + 2.28) / 0.45, 2.0)) * Math.exp(-Math.pow((y - 0.18) / 0.16, 2.0));
+                uy += 0.22 * fwW;
+                uz += 0.18 * fwW * smoothstep(0.35, 0.92, z); // Outwash around front tire!
+              }
+              // Front wing endplate outwash vortex core at (y ~ 0.22, z ~ 0.97)
+              const dyE = y - 0.23, dzE = z - 0.97;
+              const r2E = dyE * dyE + dzE * dzE;
+              const gamE = 0.048 * smoothstep(-2.55, -2.20, x) * Math.exp(-(x + 2.20) * 0.65) * (1.0 - Math.exp(-r2E / 0.008)) / (r2E + 0.006);
+              uy +=  dzE * gamE;
+              uz += -dyE * gamE;
+            }
+
+            // B. Sidepod undercut inwash & downwash waterslide ramp (-0.5 < x < +1.75)
+            if (x > -0.55 && x < 1.85 && z > 0.18 && z < 0.78) {
+              const spEnv = smoothstep(-0.50, -0.10, x) * (1.0 - smoothstep(1.35, 1.85, x));
+              // Coanda downwash hugging sloped upper sidepod toward beam wing & coke-bottle floor
+              if (y > 0.22 && y < 0.72) {
+                uy -= 0.23 * spEnv * Math.exp(-Math.pow((y - lerp(0.54, 0.30, (x + 0.5) / 2.2)) / 0.20, 2.0));
+                uz -= 0.16 * spEnv * smoothstep(0.2, 1.4, x); // Coke-bottle inward sweep!
+              }
+            }
+
+            // C. Venturi Underfloor Suction + Strong Rear Diffuser Upwash Plume
+            if (x > -1.0 && x < 1.55 && y < 0.09 && z < 0.75) {
+              ux += 0.38 * (1.0 - y / 0.09); // Bernoulli acceleration under ground-effect floor!
+            }
+            if (x > 1.48 && z < 0.68) {
+              const dfEnv = smoothstep(1.48, 2.15, x) * Math.exp(-Math.max(0, x - 2.35) * 0.32);
+              const yCore = 0.16 + 0.22 * Math.max(0, x - 1.85);
+              uy += 0.34 * dfEnv * Math.exp(-Math.pow((y - yCore) / 0.34, 2.0)) * (1.0 - Math.pow(z / 0.68, 2.0));
+            }
+
+            // D. Rear Wing & Beam Wing Strong Upwash ("Rooster-Tail" Downforce Reaction!) + Helical Wingtip Vortices
+            if (x > 2.10) {
+              const rwSpan = smoothstep(0.68, 0.38, z);
+              const yWake = 0.76 + 0.21 * Math.max(0, x - 2.45);
+              const rwUp = 0.42 * rwSpan * smoothstep(2.10, 2.58, x) * Math.exp(-Math.max(0, x - 2.65) * 0.18) * Math.exp(-Math.pow((y - yWake) / 0.48, 2.0));
+              uy += rwUp;
+
+              // Counter-rotating Trailing Rear-Wingtip Helical Vortex!
+              // High-pressure outboard/lower air curls UP outboard of z=0.51 and INWARD over top of rear wingtip!
+              if (x > 2.40) {
+                const dxW = Math.max(0, x - 2.46);
+                const yVort = 0.90 + 0.185 * dxW;
+                const zVort = Math.max(0.35, 0.505 - 0.018 * dxW);
+                const dyV = y - yVort;
+                const dzV = z - zVort;
+                const r2V = dyV * dyV + dzV * dzV;
+                const coreR2 = 0.0038 + 0.0042 * dxW;
+                const circ = 0.165 * smoothstep(2.40, 2.60, x) * Math.exp(-dxW * 0.10) * (1.0 - Math.exp(-r2V / coreR2)) / (r2V + 0.0026);
+                uy +=  dzV * circ;
+                uz += -dyV * circ;
+              }
+            }
+
+            // E. Local Wake Deficit & Turbulence Intensity Map (strictly zero upstream for pure laminar entry!)
+            let wakeT = 0.0;
+            // Front wheel wake (only behind front tire x > FRONT_AXLE_X + 0.08)
+            if (x > FRONT_AXLE_X + 0.08) {
+              const dxF = x - (FRONT_AXLE_X + 0.08);
+              const rF = Math.hypot((y - 0.35) / 0.36, (z - FRONT_TRACK_Z) / 0.21);
+              const wF = Math.exp(-rF * rF * (1.0 / (1.0 + 0.22 * dxF))) * smoothstep(0.0, 0.45, dxF) * Math.exp(-dxF * 0.26);
+              wakeT = Math.max(wakeT, 0.42 * wF);
+              ux *= (1.0 - 0.24 * wF);
+            }
+            // Rear wheel wake
+            if (x > REAR_AXLE_X + 0.05) {
+              const dxR = x - (REAR_AXLE_X + 0.05);
+              const rR = Math.hypot((y - 0.38) / 0.44, (z - REAR_TRACK_Z) / 0.26);
+              const wR = Math.exp(-rR * rR * (1.0 / (1.0 + 0.28 * dxR))) * smoothstep(0.0, 0.40, dxR) * Math.exp(-dxR * 0.14);
+              wakeT = Math.max(wakeT, 0.80 * wR);
+              ux *= (1.0 - 0.32 * wR);
+            }
+            // Main car diffuser + rear wing turbulent wake cone (x > +2.02)
+            if (x > 2.02) {
+              const dxC = Math.max(0, x - 2.18);
+              const yCenter = 0.48 + 0.19 * dxC;
+              const spreadY = 0.45 + 0.16 * dxC;
+              const spreadZ = 0.66 + 0.14 * dxC;
+              const rC = Math.hypot((y - yCenter) / spreadY, z / spreadZ);
+              const wC = Math.exp(-rC * rC * 1.15) * smoothstep(2.02, 2.58, x);
+              wakeT = Math.max(wakeT, 0.96 * wC);
+              ux *= (1.0 - 0.28 * wC * Math.exp(-dxC * 0.22));
+            }
+
+            // Enforce symmetry & floor boundary
+            if (iz === 0) uz = 0.0;
+            if (iy === 0 && uy < 0.0) uy = 0.0;
+
+            // Project velocity tangent to car SDF boundary if very close to body surface
+            const dSurf = sdf[id];
+            if (dSurf < 0.11 && dSurf > -0.05) {
+              const gx = (sdf[(ixp*ny + iy)*nz + iz] - sdf[(ixm*ny + iy)*nz + iz]) / ((ixp - ixm) * dx);
+              const gy = (sdf[(ix*ny + iyp)*nz + iz] - sdf[(ix*ny + iym)*nz + iz]) / ((iyp - iym) * dy);
+              const gz = iz === 0 ? 0.0 : (sdf[(ix*ny + iy)*nz + izp] - sdf[(ix*ny + iy)*nz + izm]) / ((izp - izm) * dz);
+              const gl = Math.hypot(gx, gy, gz);
+              if (gl > 1e-5) {
+                const nxS = gx / gl, nyS = gy / gl, nzS = gz / gl;
+                const vn = ux * nxS + uy * nyS + uz * nzS;
+                const blend = smoothstep(0.11, 0.018, dSurf);
+                if (vn < 0.02) {
+                  ux += (0.02 - vn) * nxS * blend;
+                  uy += (0.02 - vn) * nyS * blend;
+                  uz += (0.02 - vn) * nzS * blend;
+                }
+              }
+            }
+
+            this.vx[id] = ux * WIND_SPEED;
+            this.vy[id] = uy * WIND_SPEED;
+            this.vz[id] = uz * WIND_SPEED;
+            this.turb[id] = wakeT;
+          }
+        }
+      }
+
+      // 4. 1-Pass 3D Fluid Velocity Smoothing outside solid cells so streamline curvature is C2-silky!
+      const vxCopy = new Float32Array(this.vx);
+      const vyCopy = new Float32Array(this.vy);
+      const vzCopy = new Float32Array(this.vz);
+      for (let ix = 1; ix < nx - 1; ix++) {
+        for (let iy = 1; iy < ny - 1; iy++) {
+          for (let iz = 0; iz < nz - 1; iz++) {
+            const id = (ix * ny + iy) * nz + iz;
+            if (sdf[id] < 0.02) continue;
+            const izm = Math.max(0, iz - 1), izp = iz + 1;
+            const ixm = ((ix - 1) * ny + iy) * nz + iz, ixp = ((ix + 1) * ny + iy) * nz + iz;
+            const iym = (ix * ny + (iy - 1)) * nz + iz, iyp = (ix * ny + (iy + 1)) * nz + iz;
+            const kzm = (ix * ny + iy) * nz + izm,      kzp = (ix * ny + iy) * nz + izp;
+            this.vx[id] = 0.52 * vxCopy[id] + 0.08 * (vxCopy[ixm] + vxCopy[ixp] + vxCopy[iym] + vxCopy[iyp] + vxCopy[kzm] + vxCopy[kzp]);
+            this.vy[id] = 0.52 * vyCopy[id] + 0.08 * (vyCopy[ixm] + vyCopy[ixp] + vyCopy[iym] + vyCopy[iyp] + vyCopy[kzm] + vyCopy[kzp]);
+            this.vz[id] = iz === 0 ? 0.0 : (0.52 * vzCopy[id] + 0.08 * (vzCopy[ixm] + vzCopy[ixp] + vzCopy[iym] + vzCopy[iyp] + vzCopy[kzm] + vzCopy[kzp]));
+          }
+        }
+      }
+    }
+
+    // Fast trilinear lookup of velocity + SDF + wake turbulence at any 3D world point (x, y, z)
+    sample(x, y, z, out) {
+      const signZ = z < 0.0 ? -1.0 : 1.0;
+      const az = Math.abs(z);
+      const fx = clamp((x - this.xMin) / this.dx, 0.0, this.nx - 1.001);
+      const fy = clamp((y - this.yMin) / this.dy, 0.0, this.ny - 1.001);
+      const fz = clamp((az - this.zMin) / this.dz, 0.0, this.nz - 1.001);
+
+      const ix = fx | 0, iy = fy | 0, iz = fz | 0;
+      const tx = fx - ix, ty = fy - iy, tz = fz - iz;
+      const ny = this.ny, nz = this.nz;
+
+      const i000 = (ix * ny + iy) * nz + iz;
+      const i100 = ((ix + 1) * ny + iy) * nz + iz;
+      const i010 = (ix * ny + (iy + 1)) * nz + iz;
+      const i110 = ((ix + 1) * ny + (iy + 1)) * nz + iz;
+      const i001 = i000 + 1, i101 = i100 + 1, i011 = i010 + 1, i111 = i110 + 1;
+
+      const w000 = (1 - tx) * (1 - ty) * (1 - tz);
+      const w100 = tx * (1 - ty) * (1 - tz);
+      const w010 = (1 - tx) * ty * (1 - tz);
+      const w110 = tx * ty * (1 - tz);
+      const w001 = (1 - tx) * (1 - ty) * tz;
+      const w101 = tx * (1 - ty) * tz;
+      const w011 = (1 - tx) * ty * tz;
+      const w111 = tx * ty * tz;
+
+      out[0] = this.vx[i000]*w000 + this.vx[i100]*w100 + this.vx[i010]*w010 + this.vx[i110]*w110 +
+               this.vx[i001]*w001 + this.vx[i101]*w101 + this.vx[i011]*w011 + this.vx[i111]*w111;
+      out[1] = this.vy[i000]*w000 + this.vy[i100]*w100 + this.vy[i010]*w010 + this.vy[i110]*w110 +
+               this.vy[i001]*w001 + this.vy[i101]*w101 + this.vy[i011]*w011 + this.vy[i111]*w111;
+      out[2] = signZ * (
+               this.vz[i000]*w000 + this.vz[i100]*w100 + this.vz[i010]*w010 + this.vz[i110]*w110 +
+               this.vz[i001]*w001 + this.vz[i101]*w101 + this.vz[i011]*w011 + this.vz[i111]*w111);
+      out[3] = this.turb[i000]*w000 + this.turb[i100]*w100 + this.turb[i010]*w010 + this.turb[i110]*w110 +
+               this.turb[i001]*w001 + this.turb[i101]*w101 + this.turb[i011]*w011 + this.turb[i111]*w111;
+      out[4] = this.sdf[i000]*w000 + this.sdf[i100]*w100 + this.sdf[i010]*w010 + this.sdf[i110]*w110 +
+               this.sdf[i001]*w001 + this.sdf[i101]*w101 + this.sdf[i011]*w011 + this.sdf[i111]*w111;
+      return out;
+    }
+  }
+
+  // Fast 3D Divergence-Free Curl-Wave Turbulence (travelling downstream at convective velocity!)
+  function evalCurlTurbulence(x, y, z, time, out) {
+    const cx = x - WIND_SPEED * 0.88 * time;
+    const s1 = 2.15, s2 = 4.65;
+    // Analytic curl of 3-octave trigonometric vector potential -> strictly divergence-free!
+    const px = cx * s1, py = y * s1, pz = z * s1;
+    const qx = cx * s2 + 1.7, qy = y * s2 - 0.9, qz = z * s2 + 2.3;
+
+    // dPsi_z/dy - dPsi_y/dz etc.
+    const ux = 0.62 * (Math.cos(py + Math.sin(px * 0.7)) - Math.cos(pz + Math.sin(px * 0.8))) +
+               0.32 * (Math.cos(qy + 1.3 * Math.sin(qx * 0.6)) - Math.cos(qz - 1.1 * Math.sin(qx * 0.7)));
+    const uy = 0.68 * (Math.cos(pz + Math.sin(py * 0.7)) - Math.cos(px + Math.sin(pz * 0.9))) +
+               0.36 * (Math.cos(qz + 1.2 * Math.sin(qy * 0.6)) - Math.cos(qx + 1.1 * Math.sin(qz * 0.8)));
+    const uz = 0.68 * (Math.cos(px + Math.sin(pz * 0.8)) - Math.cos(py + Math.sin(px * 0.9))) +
+               0.36 * (Math.cos(qx - 1.1 * Math.sin(qz * 0.7)) - Math.cos(qy + 1.2 * Math.sin(qx * 0.8)));
+
+    out[0] = ux;
+    out[1] = uy;
+    out[2] = uz;
+  }
+
+  // ============================================================================
+  // 7. DYNAMIC VIEW-ALIGNED VOLUMETRIC SMOKE RIBBONS & ADVECTED WAKE BILLOWS
+  // ============================================================================
+  function buildSmokeSeeds() {
+    const seeds = [];
+    const addNozzle = (y, z, widthScale = 1.0, opacity = 1.0) => {
+      // Primary crisp laminar core + 2 soft companion sheath wisps for rich volumetric structure
+      seeds.push({ x: -4.52, y, z, w: 0.0145 * widthScale, alpha: opacity, phase: seeds.length * 1.37, primary: true });
+      seeds.push({ x: -4.52, y: y + 0.006, z: z - 0.006, w: 0.025 * widthScale, alpha: opacity * 0.42, phase: seeds.length * 2.11, primary: false });
+      seeds.push({ x: -4.52, y: y - 0.006, z: z + 0.006, w: 0.025 * widthScale, alpha: opacity * 0.42, phase: seeds.length * 3.07, primary: false });
+    };
+
+    // 1. Centerline Vertical Aero Rake (z = 0): iconic wind-tunnel symmetry profile!
+    // Lowest stream dives under splitter -> Venturi floor -> shoots up out of rear diffuser!
+    const centerHeights = [0.042, 0.135, 0.225, 0.335, 0.465, 0.605, 0.755, 0.915, 1.085, 1.280];
+    for (let i = 0; i < centerHeights.length; i++) {
+      addNozzle(centerHeights[i], 0.0, i === 0 ? 1.15 : 1.0, i < 8 ? 1.0 : 0.78);
+    }
+
+    // 2. Symmetric Lateral Aero Nozzles (Front Wing, Sidepod Undercut, Waterslide, Wheel Wake & Rear Wingtip Vortex!)
+    for (const side of [-1, 1]) {
+      // Front wing inner flap -> sidepod undercut channel -> diffuser edge!
+      addNozzle(0.140, side * 0.35, 1.0, 0.94);
+      // Front wing mid-span -> over-wheel deflector / sidepod waterslide ramp -> beam wing!
+      addNozzle(0.140, side * 0.62, 1.0, 0.90);
+      // Front wing endplate tip -> outwash vortex around front tire!
+      addNozzle(0.140, side * 0.94, 1.05, 0.92);
+
+      // Sidepod shoulder & deep undercut streams
+      addNozzle(0.420, side * 0.38, 1.0, 0.92);
+      addNozzle(0.420, side * 0.64, 1.0, 0.86);
+
+      // Rear-wingtip vortex feeder streams (graze outer rear wing corners & corkscrew into twin vortices!)
+      addNozzle(0.780, side * 0.47, 1.05, 0.96);
+    }
+
+    return seeds;
+  }
+
+  class SmokeSystem {
+    constructor(gl, flow, seeds) {
+      this.gl = gl;
+      this.flow = flow;
+      this.seeds = seeds;
+      this.nRibbons = seeds.length;
+      this.segs = 176; // Stations per streamline from x=-4.52 to x=+6.35
+
+      // Dynamic ribbon vertex buffer:
+      // Each station has 2 vertices (side = -1, +1)
+      // Attributes: a_pos(3), a_tang(3), a_params(4): [side(-1/+1), radius, alpha, uDist]
+      const vertsPerRibbon = this.segs * 2;
+      const totalVerts = this.nRibbons * vertsPerRibbon;
+      this.ribbonData = new Float32Array(totalVerts * 10);
+
+      const indices = [];
+      for (let r = 0; r < this.nRibbons; r++) {
+        const base = r * vertsPerRibbon;
+        for (let s = 0; s < this.segs - 1; s++) {
+          const i0 = base + s * 2;
+          indices.push(i0, i0 + 1, i0 + 2, i0 + 1, i0 + 3, i0 + 2);
+        }
+      }
+      this.ribbonIndexCount = indices.length;
+
+      this.ribbonVao = gl.createVertexArray();
+      gl.bindVertexArray(this.ribbonVao);
+      this.ribbonVbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.ribbonVbo);
+      gl.bufferData(gl.ARRAY_BUFFER, this.ribbonData.byteLength, gl.DYNAMIC_DRAW);
+
+      const stride = 10 * 4;
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 24);
+
+      const ib = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(indices), gl.STATIC_DRAW);
+      gl.bindVertexArray(null);
+
+      // Scratch buffers for integration
+      this.ptsX = new Float32Array(this.segs);
+      this.ptsY = new Float32Array(this.segs);
+      this.ptsZ = new Float32Array(this.segs);
+      this.ptsT = new Float32Array(this.segs);
+      this.sampleTmp = new Float32Array(5);
+      this.sampleTmp2 = new Float32Array(5);
+      this.curlTmp = [0, 0, 0];
+
+      // ----------------------------------------------------------------------
+      // Advected 3D Volumetric Wake Billow & Wheel-Wash Particle System
+      // ----------------------------------------------------------------------
+      this.nParticles = 1900;
+      this.partState = [];
+      for (let i = 0; i < this.nParticles; i++) {
+        const p = { x: 0, y: 0, z: 0, age: 0, life: 1, size0: 0.1, size1: 0.5, alpha: 0.2, rot: 0, spin: 0, seed: Math.random() * 100 };
+        this.respawnParticle(p, true);
+        this.partState.push(p);
+      }
+
+      // Instanced quad for volumetric wake puffs
+      this.partInstanceData = new Float32Array(this.nParticles * 7); // [x, y, z, radius, alpha, rot, seed]
+      this.partVao = gl.createVertexArray();
+      gl.bindVertexArray(this.partVao);
+
+      const quad = new Float32Array([-1, -1,  1, -1,  1, 1,  -1, -1,  1, 1,  -1, 1]);
+      const qBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+      this.partVbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.partVbo);
+      gl.bufferData(gl.ARRAY_BUFFER, this.partInstanceData.byteLength, gl.DYNAMIC_DRAW);
+
+      const pStride = 7 * 4;
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, pStride, 0); // xyz, radius
+      gl.vertexAttribDivisor(1, 1);
+
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 3, gl.FLOAT, false, pStride, 16); // alpha, rot, seed
+      gl.vertexAttribDivisor(2, 1);
+
+      gl.bindVertexArray(null);
+    }
+
+    respawnParticle(p, randomizeAge = false) {
+      const r = Math.random();
+      const side = Math.random() < 0.5 ? -1 : 1;
+      if (r < 0.34) {
+        // Rear Diffuser Expansion Plume (turbulent upwash behind diffuser & rain light, calibrated for crisp non-washed volume!)
+        p.x = 2.02 + Math.random() * 0.45;
+        p.y = 0.08 + Math.random() * 0.28;
+        p.z = (Math.random() * 2 - 1) * 0.48;
+        p.size0 = 0.075 + Math.random() * 0.05;
+        p.size1 = 0.46 + Math.random() * 0.32;
+        p.alpha = 0.072 + Math.random() * 0.048;
+        p.life  = 0.38 + Math.random() * 0.32;
+      } else if (r < 0.64) {
+        // Rear Wing Shear Layer & Helical Wingtip Vortex Cloud
+        p.x = 2.44 + Math.random() * 0.32;
+        const tipFocus = Math.random() < 0.68;
+        p.z = tipFocus ? side * (0.42 + Math.random() * 0.16) : (Math.random() * 2 - 1) * 0.48;
+        p.y = tipFocus ? (0.82 + Math.random() * 0.16) : (0.72 + Math.random() * 0.22);
+        p.size0 = 0.055 + Math.random() * 0.04;
+        p.size1 = 0.42 + Math.random() * 0.30;
+        p.alpha = 0.078 + Math.random() * 0.052;
+        p.life  = 0.36 + Math.random() * 0.30;
+      } else if (r < 0.84) {
+        // Spinning Rear Tire Turbulent Bluff Wake & Contact-Patch Squirt
+        p.x = REAR_AXLE_X + 0.22 + Math.random() * 0.28;
+        p.y = 0.05 + Math.random() * 0.55;
+        p.z = side * (REAR_TRACK_Z + (Math.random() * 2 - 1) * 0.20);
+        p.size0 = 0.08 + Math.random() * 0.05;
+        p.size1 = 0.48 + Math.random() * 0.32;
+        p.alpha = 0.062 + Math.random() * 0.042;
+        p.life  = 0.34 + Math.random() * 0.28;
+      } else {
+        // Spinning Front Tire Outwash & Sidepod Undercut Mist
+        p.x = FRONT_AXLE_X + 0.22 + Math.random() * 0.25;
+        p.y = 0.05 + Math.random() * 0.46;
+        p.z = side * (FRONT_TRACK_Z + (Math.random() * 2 - 1) * 0.16);
+        p.size0 = 0.065 + Math.random() * 0.04;
+        p.size1 = 0.34 + Math.random() * 0.22;
+        p.alpha = 0.048 + Math.random() * 0.032;
+        p.life  = 0.40 + Math.random() * 0.28;
+      }
+      p.rot = Math.random() * TAU;
+      p.spin = (Math.random() * 2 - 1) * 3.2;
+      p.age = randomizeAge ? Math.random() * p.life : 0.0;
+
+      if (randomizeAge && p.age > 0.001) {
+        // Pre-advect along flow so startup frame already has full developed wake!
+        const steps = 6;
+        const dt = p.age / steps;
+        for (let k = 0; k < steps; k++) {
+          this.flow.sample(p.x, p.y, p.z, this.sampleTmp);
+          p.x += this.sampleTmp[0] * dt;
+          p.y = Math.max(0.03, p.y + this.sampleTmp[1] * dt);
+          p.z += this.sampleTmp[2] * dt;
+        }
+      }
+    }
+
+    update(time, dt, camPos) {
+      const { gl, flow, seeds, segs, ptsX, ptsY, ptsZ, ptsT, sampleTmp, sampleTmp2, curlTmp, ribbonData } = this;
+      const stepDt = 0.0044; // RK2 integration step through velocity field (~6.4cm spatial resolution)
+
+      // 1. Update all dynamic aerodynamic streamlines with live travelling wake turbulence
+      let outPtr = 0;
+      for (let r = 0; r < this.nRibbons; r++) {
+        const seed = seeds[r];
+        let x = seed.x;
+        let y = seed.y;
+        let z = seed.z;
+
+        for (let s = 0; s < segs; s++) {
+          ptsX[s] = x; ptsY[s] = y; ptsZ[s] = z;
+
+          flow.sample(x, y, z, sampleTmp);
+          const turb = sampleTmp[3];
+          ptsT[s] = turb;
+
+          if (s < segs - 1) {
+            // Strictly laminar upstream -> Kelvin-Helmholtz shear & vortex turbulence in wheel/diffuser/wing wakes!
+            let tx = 0, ty = 0, tz = 0;
+            if (turb > 0.025) {
+              evalCurlTurbulence(x, y + seed.phase * 0.03, z - seed.phase * 0.02, time, curlTmp);
+              const amp = WIND_SPEED * 0.36 * Math.pow(turb, 1.35);
+              tx = curlTmp[0] * amp;
+              ty = curlTmp[1] * amp;
+              tz = curlTmp[2] * amp;
+            }
+
+            // Midpoint RK2 step
+            const vx1 = sampleTmp[0] + tx;
+            const vy1 = sampleTmp[1] + ty;
+            const vz1 = sampleTmp[2] + tz;
+            const mx = x + vx1 * stepDt * 0.5;
+            const my = Math.max(0.016, y + vy1 * stepDt * 0.5);
+            const mz = z + vz1 * stepDt * 0.5;
+
+            flow.sample(mx, my, mz, sampleTmp2);
+            x += (sampleTmp2[0] + tx) * stepDt;
+            y += (sampleTmp2[1] + ty) * stepDt;
+            z += (sampleTmp2[2] + tz) * stepDt;
+
+            // Smooth surface clearance guard via SDF gradient: zero clipping into wings, body, or spinning tires!
+            const minClearance = seed.w + 0.018;
+            if (sampleTmp2[4] < minClearance + 0.015 && x > -3.0 && x < 2.8) {
+              const eps = 0.03;
+              const d0 = carSDF(x, y, z);
+              if (d0 < minClearance) {
+                const gx = carSDF(x + eps, y, z) - d0;
+                const gy = carSDF(x, y + eps, z) - d0;
+                const gz = carSDF(x, y, z + eps) - d0;
+                const gl2 = Math.hypot(gx, gy, gz);
+                if (gl2 > 1e-6) {
+                  const push = (minClearance - d0) / gl2;
+                  x += gx * push * 0.85;
+                  y += gy * push * 0.85;
+                  z += gz * push * 0.85;
+                }
+              }
+            }
+            if (y < seed.w + 0.012) y = seed.w + 0.012;
+          }
+        }
+
+        // 2-Pass Laplacian curve smoothing on laminar segments to guarantee liquid-smooth spline curvature!
+        for (let pass = 0; pass < 2; pass++) {
+          for (let s = 1; s < segs - 1; s++) {
+            const wSmooth = 0.36 * (1.0 - 0.65 * ptsT[s]);
+            ptsX[s] += wSmooth * (0.5 * (ptsX[s - 1] + ptsX[s + 1]) - ptsX[s]);
+            ptsY[s] += wSmooth * (0.5 * (ptsY[s - 1] + ptsY[s + 1]) - ptsY[s]);
+            ptsZ[s] += wSmooth * (0.5 * (ptsZ[s - 1] + ptsZ[s + 1]) - ptsZ[s]);
+          }
+        }
+
+        // Emit paired vertices along the streamline with tangent, turbulent diffusion width, & optical density
+        let arcLen = 0.0;
+        for (let s = 0; s < segs; s++) {
+          if (s > 0) {
+            arcLen += Math.hypot(ptsX[s] - ptsX[s - 1], ptsY[s] - ptsY[s - 1], ptsZ[s] - ptsZ[s - 1]);
+          }
+          const sPrev = Math.max(0, s - 1);
+          const sNext = Math.min(segs - 1, s + 1);
+          let dx = ptsX[sNext] - ptsX[sPrev];
+          let dy = ptsY[sNext] - ptsY[sPrev];
+          let dz = ptsZ[sNext] - ptsZ[sPrev];
+          const dl = Math.hypot(dx, dy, dz) || 1.0;
+          dx /= dl; dy /= dl; dz /= dl;
+
+          const turb = ptsT[s];
+          const wakeSpread = Math.max(0.0, ptsX[s] - 1.75) * turb;
+          // Conservation of smoke mass: as turbulent eddy diffusion widens the filament, peak optical density softens!
+          const radius = seed.w * (1.0 + 3.8 * turb * turb + 2.9 * wakeSpread);
+          const endFade = smoothstep(0.0, 0.03, s / (segs - 1)) * (1.0 - smoothstep(0.80, 1.0, s / (segs - 1)));
+          const massConserve = 1.0 / (1.0 + 2.1 * turb + 1.8 * wakeSpread);
+          const alpha = seed.alpha * endFade * massConserve;
+
+          // Vertex -1
+          ribbonData[outPtr++] = ptsX[s];
+          ribbonData[outPtr++] = ptsY[s];
+          ribbonData[outPtr++] = ptsZ[s];
+          ribbonData[outPtr++] = dx;
+          ribbonData[outPtr++] = dy;
+          ribbonData[outPtr++] = dz;
+          ribbonData[outPtr++] = -1.0;
+          ribbonData[outPtr++] = radius;
+          ribbonData[outPtr++] = alpha;
+          ribbonData[outPtr++] = arcLen + seed.phase;
+
+          // Vertex +1
+          ribbonData[outPtr++] = ptsX[s];
+          ribbonData[outPtr++] = ptsY[s];
+          ribbonData[outPtr++] = ptsZ[s];
+          ribbonData[outPtr++] = dx;
+          ribbonData[outPtr++] = dy;
+          ribbonData[outPtr++] = dz;
+          ribbonData[outPtr++] = +1.0;
+          ribbonData[outPtr++] = radius;
+          ribbonData[outPtr++] = alpha;
+          ribbonData[outPtr++] = arcLen + seed.phase;
+        }
+      }
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.ribbonVbo);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, ribbonData);
+
+      // 2. Advect 3D Volumetric Wake Billow Particles & Back-to-Front Sort for Silky Blending
+      const clampedDt = Math.min(dt, 0.04);
+      for (let i = 0; i < this.nParticles; i++) {
+        const p = this.partState[i];
+        p.age += clampedDt;
+        if (p.age >= p.life || p.x > 6.55) {
+          this.respawnParticle(p, false);
+        } else {
+          flow.sample(p.x, p.y, p.z, sampleTmp);
+          evalCurlTurbulence(p.x, p.y, p.z, time + p.seed * 0.01, curlTmp);
+          const tAmp = WIND_SPEED * (0.18 + 0.30 * sampleTmp[3]);
+          p.x += (sampleTmp[0] + curlTmp[0] * tAmp) * clampedDt;
+          p.y += (sampleTmp[1] + curlTmp[1] * tAmp) * clampedDt;
+          p.z += (sampleTmp[2] + curlTmp[2] * tAmp) * clampedDt;
+          p.rot += p.spin * clampedDt;
+
+          // Keep puffs above rolling road & outside car body
+          const rad = lerp(p.size0, p.size1, p.age / p.life);
+          if (p.y < rad * 0.32 + 0.02) p.y = rad * 0.32 + 0.02;
+          if (sampleTmp[4] < 0.04 && p.x < 2.65) {
+            p.y += 0.05;
+          }
+        }
+        const dx = p.x - camPos[0], dy = p.y - camPos[1], dz = p.z - camPos[2];
+        p.dist2 = dx * dx + dy * dy + dz * dz;
+      }
+
+      // Fast back-to-front sort (1900 objects in V8 takes <0.25ms!)
+      this.partState.sort((a, b) => b.dist2 - a.dist2);
+
+      let pPtr = 0;
+      const pData = this.partInstanceData;
+      for (let i = 0; i < this.nParticles; i++) {
+        const p = this.partState[i];
+        const f = p.age / p.life;
+        const radius = lerp(p.size0, p.size1, Math.pow(f, 0.72));
+        const env = smoothstep(0.0, 0.14, f) * Math.pow(1.0 - f, 1.45);
+        pData[pPtr++] = p.x;
+        pData[pPtr++] = p.y;
+        pData[pPtr++] = p.z;
+        pData[pPtr++] = radius;
+        pData[pPtr++] = p.alpha * env;
+        pData[pPtr++] = p.rot;
+        pData[pPtr++] = p.seed;
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.partVbo);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, pData);
+    }
+  }
+
+  // ============================================================================
+  // 8. GLSL SHADERS (SHADOW, UBER-PBR + ANISOTROPIC CARBON WEAVE, VOLUMETRIC SMOKE, BLOOM & ACES)
+  // ============================================================================
+  function compileShader(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      console.error('Shader compile error:\n', gl.getShaderInfoLog(sh), '\nSource:\n', src);
+      throw new Error(gl.getShaderInfoLog(sh));
+    }
+    return sh;
+  }
+
+  function createProgram(gl, vsSrc, fsSrc) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compileShader(gl, gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compileShader(gl, gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(p));
+      throw new Error(gl.getProgramInfoLog(p));
+    }
+    return p;
+  }
+
+  // Common vertex deformation function for static meshes, spinning F1 wheels (with contact patch!), & rotating tunnel fan
+  const VS_TRANSFORM_CHUNK = `
+    uniform int u_mode;         // 0 = static world, 1 = spinning F1 wheel, 2 = rotating tunnel fan
+    uniform vec3 u_offset;      // wheel axle center or fan hub center
+    uniform float u_spinAngle;  // wheel or fan rotation angle
+    uniform float u_reflection; // +1.0 normal pass, -1.0 planar floor reflection pass
+
+    void computeWorldVertex(
+      in vec3 aPos, in vec3 aNorm, in vec4 aTan,
+      out vec3 wPos, out vec3 wNorm, out vec3 wTan
+    ) {
+      vec3 p = aPos;
+      vec3 n = aNorm;
+      vec3 t = aTan.xyz;
+
+      if (u_mode == 1) {
+        // Spin wheel around Z axle so bottom of tire moves in +X (matching rolling road!)
+        float ca = cos(u_spinAngle);
+        float sa = sin(u_spinAngle);
+        p = vec3(p.x * ca - p.y * sa, p.x * sa + p.y * ca, p.z) + u_offset;
+        n = vec3(n.x * ca - n.y * sa, n.x * sa + n.y * ca, n.z);
+        t = vec3(t.x * ca - t.y * sa, t.x * sa + t.y * ca, t.z);
+
+        // Authentic Loaded Tire Contact-Patch Deformation in World Space!
+        // As the tire spins at 180 km/h, the bottom contact patch stays realistically squashed flat on y = 0
+        // with subtle lower-sidewall load bulge!
+        float loadZone = smoothstep(0.085, 0.0, p.y);
+        float sideBulge = loadZone * 0.0065 * sign(p.z - u_offset.z);
+        p.z += sideBulge;
+        if (p.y < 0.016) {
+          p.y = mix(0.0015, p.y, smoothstep(-0.012, 0.016, p.y));
+        }
+      } else if (u_mode == 2) {
+        // Rotate giant downstream wind tunnel fan around X axis
+        float ca = cos(u_spinAngle);
+        float sa = sin(u_spinAngle);
+        p = vec3(p.x, p.y * ca - p.z * sa, p.y * sa + p.z * ca) + u_offset;
+        n = vec3(n.x, n.y * ca - n.z * sa, n.y * sa + n.z * ca);
+        t = vec3(t.x, t.y * ca - t.z * sa, t.y * sa + t.z * ca);
+      }
+
+      if (u_reflection < 0.0) {
+        p.y = -p.y;
+        n.y = -n.y;
+        t.y = -t.y;
+      }
+
+      wPos = p;
+      wNorm = normalize(n);
+      wTan = normalize(t);
+    }
+  `;
+
+  // --- 8A. SHADOW MAP SHADER ---
+  const SHADOW_VS = `#version 300 es
+    layout(location = 0) in vec3 a_pos;
+    layout(location = 1) in vec3 a_norm;
+    layout(location = 2) in vec4 a_tan;
+    uniform mat4 u_lightVP;
+    ${VS_TRANSFORM_CHUNK}
+    void main() {
+      vec3 wPos, wNorm, wTan;
+      computeWorldVertex(a_pos, a_norm, a_tan, wPos, wNorm, wTan);
+      // Do not cast shadows from tunnel ceiling/walls above y = 3.2m so overhead lights illuminate the car!
+      if (u_mode == 0 && wPos.y > 3.15) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
+      }
+      gl_Position = u_lightVP * vec4(wPos, 1.0);
+    }
+  `;
+  const SHADOW_FS = `#version 300 es
+    precision highp float;
+    void main() {}
+  `;
+
+  // --- 8B. MAIN UBER-PBR + DUAL-LAYER ANISOTROPIC CARBON WEAVE + TIRE & TUNNEL SHADER ---
+  const PBR_VS = `#version 300 es
+    layout(location = 0) in vec3 a_pos;
+    layout(location = 1) in vec3 a_norm;
+    layout(location = 2) in vec4 a_tan;
+    layout(location = 3) in vec2 a_uv;
+    layout(location = 4) in vec2 a_mat;
+
+    uniform mat4 u_viewProj;
+    uniform mat4 u_lightVP;
+    ${VS_TRANSFORM_CHUNK}
+
+    out vec3 v_worldPos;
+    out vec3 v_localPos;
+    out vec3 v_norm;
+    out vec3 v_tan;
+    out float v_tanSign;
+    out vec2 v_uv;
+    out vec2 v_mat;
+    out vec4 v_shadowCoord;
+
+    void main() {
+      vec3 wPos, wNorm, wTan;
+      computeWorldVertex(a_pos, a_norm, a_tan, wPos, wNorm, wTan);
+      v_worldPos = wPos;
+      v_localPos = a_pos;
+      v_norm = wNorm;
+      v_tan = wTan;
+      v_tanSign = a_tan.w * u_reflection;
+      v_uv = a_uv;
+      v_mat = a_mat;
+      // Compute shadow coord from un-reflected world height
+      vec3 shadowWorld = vec3(wPos.x, abs(wPos.y), wPos.z);
+      v_shadowCoord = u_lightVP * vec4(shadowWorld, 1.0);
+      gl_Position = u_viewProj * vec4(wPos, 1.0);
+    }
+  `;
+
+  const PBR_FS = `#version 300 es
+    precision highp float;
+    precision highp sampler2DShadow;
+
+    in vec3 v_worldPos;
+    in vec3 v_localPos;
+    in vec3 v_norm;
+    in vec3 v_tan;
+    in float v_tanSign;
+    in vec2 v_uv;
+    in vec2 v_mat;
+    in vec4 v_shadowCoord;
+
+    uniform vec3 u_camPos;
+    uniform float u_time;
+    uniform float u_reflection;
+    uniform float u_wheelSpeed;
+    uniform vec2 u_resolution;
+    uniform sampler2DShadow u_shadowMap;
+    uniform sampler2D u_planarRefl;
+
+    out vec4 fragColor;
+
+    const float PI = 3.14159265359;
+
+    // Hash & Procedural Noise
+    float hash21(vec2 p) {
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+    float noise2D(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      float a = hash21(i);
+      float b = hash21(i + vec2(1.0, 0.0));
+      float c = hash21(i + vec2(0.0, 1.0));
+      float d = hash21(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    }
+
+    // Soft 9-tap rotated Poisson PCF Shadow + Analytical Ground-Effect Underbody Contact AO!
+    float computeShadowAndContactAO(vec3 wPos, vec3 N) {
+      vec3 proj = v_shadowCoord.xyz / v_shadowCoord.w;
+      proj = proj * 0.5 + 0.5;
+      float shadow = 1.0;
+      if (proj.x > 0.01 && proj.x < 0.99 && proj.y > 0.01 && proj.y < 0.99 && proj.z < 0.995) {
+        float bias = max(0.0014 * (1.0 - abs(N.y)), 0.00055);
+        vec2 texel = vec2(1.0 / 2048.0);
+        float ang = hash21(wPos.xz * 97.3) * 6.283185;
+        mat2 rot = mat2(cos(ang), -sin(ang), sin(ang), cos(ang));
+        const vec2 poisson[9] = vec2[9](
+          vec2( 0.00,  0.00), vec2(-0.72, -0.45), vec2( 0.68, -0.52),
+          vec2(-0.55,  0.68), vec2( 0.74,  0.58), vec2( 0.08, -0.88),
+          vec2(-0.92,  0.12), vec2( 0.89,  0.05), vec2(-0.06,  0.91)
+        );
+        float sum = 0.0;
+        for (int i = 0; i < 9; i++) {
+          vec2 off = rot * poisson[i] * texel * 2.3;
+          sum += texture(u_shadowMap, vec3(proj.xy + off, proj.z - bias));
+        }
+        float rawShadow = sum / 9.0;
+        // Smooth frustum-border feathering so zero rectangular shadow-map boundary ever appears on the floor!
+        float border = min(min(proj.x, 1.0 - proj.x), min(proj.y, 1.0 - proj.y));
+        float borderFade = smoothstep(0.01, 0.16, border) * smoothstep(0.995, 0.90, proj.z);
+        shadow = mix(1.0, rawShadow, borderFade);
+      }
+
+      // Deep velvety analytical contact ambient occlusion under 26mm Venturi floor & 4 tire contact patches!
+      float py = abs(wPos.y);
+      float carBox = smoothstep(0.95, 0.55, abs(wPos.z)) * smoothstep(-2.75, -0.85, wPos.x) * (1.0 - smoothstep(1.85, 2.55, wPos.x));
+      float underFloorAO = 1.0 - 0.86 * carBox * exp(-py * 7.5);
+      // Front Wing proximity AO on floor
+      float fwBox = smoothstep(1.02, 0.80, abs(wPos.z)) * exp(-pow((wPos.x + 2.50) / 0.36, 2.0));
+      float fwAO = 1.0 - 0.62 * fwBox * exp(-py * 8.0);
+      // 4 Tire contact patch shadows
+      float az = abs(wPos.z);
+      float dFTire = length(vec2((wPos.x - (${FRONT_AXLE_X.toFixed(2)})) / 0.24, (az - ${FRONT_TRACK_Z.toFixed(3)}) / 0.19));
+      float dRTire = length(vec2((wPos.x - (${REAR_AXLE_X.toFixed(2)})) / 0.26, (az - ${REAR_TRACK_Z.toFixed(3)}) / 0.23));
+      float tireAO = (1.0 - 0.92 * exp(-dFTire * dFTire * 1.9) * exp(-py * 11.0)) *
+                     (1.0 - 0.92 * exp(-dRTire * dRTire * 1.9) * exp(-py * 11.0));
+
+      return min(shadow, underFloorAO * fwAO * tireAO);
+    }
+
+    // Standard Isotropic GGX & Schlick Fresnel
+    float D_GGX(float NdotH, float alpha) {
+      float a2 = alpha * alpha;
+      float d = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+      return a2 / max(PI * d * d, 1e-6);
+    }
+    // Anisotropic GGX Distribution (for orthotropic warp/weft carbon fiber bundles & brushed CNC metal!)
+    float D_GGX_Aniso(vec3 N, vec3 H, vec3 T, vec3 B, float ax, float ay) {
+      float TdotH = dot(T, H);
+      float BdotH = dot(B, H);
+      float NdotH = max(dot(N, H), 0.0);
+      float d = (TdotH * TdotH) / (ax * ax) + (BdotH * BdotH) / (ay * ay) + NdotH * NdotH;
+      return 1.0 / max(PI * ax * ay * d * d, 1e-6);
+    }
+    float V_SmithGGXCorrelated(float NdotV, float NdotL, float alpha) {
+      float a2 = alpha * alpha;
+      float gv = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+      float gl = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+      return 0.5 / max(gv + gl, 1e-5);
+    }
+    vec3 F_Schlick(float cosTheta, vec3 F0) {
+      return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    }
+
+    // Karis Representative-Point Linear Tube Area Light Evaluation
+    vec3 evalTubeLight(
+      vec3 P, vec3 N, vec3 V, vec3 R,
+      vec3 Ncoat, vec3 Rcoat, float coatWeight, float coatRough,
+      vec3 la, vec3 lb, float tubeRadius, vec3 lightColor,
+      vec3 albedo, vec3 F0, float rough,
+      bool useAniso, vec3 T_fiber, vec3 B_fiber, float ax, float ay
+    ) {
+      // Base layer closest point along segment
+      vec3 L0 = la - P;
+      vec3 L1 = lb - P;
+      vec3 Ld = L1 - L0;
+      float ldLen2 = dot(Ld, Ld);
+      float rDotLd = dot(R, Ld);
+      float tSpec = clamp((dot(R, L0) * rDotLd - dot(L0, Ld)) / max(ldLen2 - rDotLd * rDotLd, 1e-4), 0.0, 1.0);
+      vec3 LspecVec = L0 + tSpec * Ld;
+      float distSpec = length(LspecVec);
+      vec3 L = LspecVec / max(distSpec, 1e-4);
+
+      // Diffuse integrates toward midpoint + clamped projection
+      float tDiff = clamp(-dot(L0, Ld) / ldLen2, 0.0, 1.0);
+      vec3 LdiffVec = L0 + tDiff * Ld;
+      float distDiff = length(LdiffVec);
+      vec3 LdDir = LdiffVec / max(distDiff, 1e-4);
+
+      float attenDiff = 1.0 / (1.0 + 0.14 * distDiff + 0.045 * distDiff * distDiff);
+      float attenSpec = 1.0 / (1.0 + 0.10 * distSpec + 0.028 * distSpec * distSpec);
+
+      float NdotV = max(dot(N, V), 1e-4);
+      float NdotL = max(dot(N, L), 0.0);
+      float NdotLd = max(dot(N, LdDir), 0.0);
+
+      vec3 H = normalize(V + L);
+      float VdotH = max(dot(V, H), 0.0);
+      float NdotH = max(dot(N, H), 0.0);
+
+      float alpha = max(rough * rough, 0.008);
+      float alphaMod = clamp(alpha + tubeRadius / (2.0 * max(distSpec, 0.25)), 0.012, 1.0);
+
+      float D = useAniso
+        ? D_GGX_Aniso(N, H, T_fiber, B_fiber, clamp(ax + 0.04, 0.03, 1.0), clamp(ay + 0.02, 0.02, 1.0))
+        : D_GGX(NdotH, alphaMod);
+      float Vis = V_SmithGGXCorrelated(NdotV, max(NdotL, 1e-4), alphaMod);
+      vec3 F = F_Schlick(VdotH, F0);
+
+      vec3 spec = min(D * Vis * F * NdotL * attenSpec, vec3(2.8));
+      vec3 diff = (1.0 - F) * (albedo / PI) * NdotLd * attenDiff;
+
+      // Clearcoat specular layer (liquid-smooth white LED tube reflection on curved carbon bodywork, clamped against subpixel fireflies!)
+      vec3 coatSpec = vec3(0.0);
+      if (coatWeight > 0.001) {
+        float rcDotLd = dot(Rcoat, Ld);
+        float tCoat = clamp((dot(Rcoat, L0) * rcDotLd - dot(L0, Ld)) / max(ldLen2 - rcDotLd * rcDotLd, 1e-4), 0.0, 1.0);
+        vec3 LcVec = L0 + tCoat * Ld;
+        float distC = length(LcVec);
+        vec3 Lc = LcVec / max(distC, 1e-4);
+        float NcdotL = max(dot(Ncoat, Lc), 0.0);
+        float NcdotV = max(dot(Ncoat, V), 1e-4);
+        vec3 Hc = normalize(V + Lc);
+        float aCoat = clamp(coatRough * coatRough + tubeRadius / (3.0 * max(distC, 0.25)), 0.006, 1.0);
+        float Dc = D_GGX(max(dot(Ncoat, Hc), 0.0), aCoat);
+        float Vc = V_SmithGGXCorrelated(NcdotV, max(NcdotL, 1e-4), aCoat);
+        float Fc = (0.04 + 0.96 * pow(1.0 - max(dot(V, Hc), 0.0), 5.0)) * coatWeight;
+        coatSpec = min(vec3(Dc * Vc * Fc * NcdotL / (1.0 + 0.08 * distC + 0.020 * distC * distC)), vec3(2.4));
+        diff *= (1.0 - Fc * 0.5);
+        spec *= (1.0 - Fc * 0.65);
+      }
+
+      return lightColor * (diff + spec + coatSpec);
+    }
+
+    // Analytical Wind-Tunnel Studio Environment Reflection (moody dark slate chamber + crisp linear light strips!)
+    vec3 sampleTunnelEnv(vec3 dir, float rough) {
+      vec3 d = normalize(dir);
+      float up = clamp(d.y, 0.0, 1.0);
+      vec3 base = mix(vec3(0.008, 0.010, 0.015), vec3(0.024, 0.032, 0.045), pow(up, 0.75));
+      if (d.y > 0.04) {
+        float tCeil = 3.8 / max(d.y, 0.06);
+        vec2 hitXZ = d.xz * tCeil;
+        float blur = 0.12 + rough * 1.55;
+        float stripInner = exp(-pow((abs(hitXZ.y) - 0.58) / blur, 2.0)) * smoothstep(5.2, 2.8, abs(hitXZ.x));
+        float stripOuter = exp(-pow((abs(hitXZ.y) - 3.35) / (blur * 1.25), 2.0)) * smoothstep(10.0, 6.5, abs(hitXZ.x));
+        base += vec3(1.25, 1.34, 1.48) * (stripInner * 0.78 + stripOuter * 0.52) / (1.0 + rough * 4.0);
+      }
+      float downGlow = pow(max(dot(d, normalize(vec3(1.0, 0.12, 0.0))), 0.0), 6.0);
+      base += vec3(0.03, 0.06, 0.12) * downGlow;
+      return base;
+    }
+
+    void main() {
+      // Discard pixels below floor in planar reflection pass
+      if (u_reflection < 0.0 && v_worldPos.y > 0.002) {
+        discard;
+      }
+
+      int matId = int(v_mat.x + 0.5);
+      float matAux = v_mat.y;
+
+      vec3 Ngeom = normalize(v_norm);
+      if (!gl_FrontFacing) Ngeom = -Ngeom;
+      vec3 T = normalize(v_tan - Ngeom * dot(Ngeom, v_tan));
+      vec3 B = normalize(cross(Ngeom, T)) * v_tanSign;
+      vec3 V = normalize(u_camPos - v_worldPos);
+
+      // Pure emissive materials shortcut
+      if (matId == 8) {
+        vec3 em = vec3(6.8, 7.1, 7.6); // Crisp 6200K tunnel LED strip
+        if (matAux > 0.5 && matAux < 1.5) {
+          // FIA Rear Rain/Aero-Test Ruby LED Matrix (15 individual LEDs!)
+          vec2 ledUV = vec2(v_worldPos.z / 0.044, (abs(v_worldPos.y) - 0.300) / 0.070) * vec2(3.0, 5.0);
+          vec2 cell = fract(ledUV + 0.5) - 0.5;
+          float diode = smoothstep(0.42, 0.18, length(cell));
+          float pulse = 0.82 + 0.18 * sin(u_time * 18.0);
+          em = mix(vec3(0.18, 0.01, 0.015), vec3(13.5, 0.55, 0.35) * pulse, diode);
+        } else if (matAux > 1.5 && matAux < 2.5) {
+          // Steering wheel telemetry LEDs
+          float bar = fract(v_worldPos.z * 95.0);
+          em = v_worldPos.z < 0.0 ? vec3(0.3, 4.5, 1.8) : vec3(0.4, 2.2, 5.5);
+          em *= smoothstep(0.15, 0.35, bar);
+        } else if (matAux > 2.5 && matAux < 3.5) {
+          // Tinted Control Room Observation Window (dark glass + faint warm/cyan telemetry screens inside)
+          float screenGlow = smoothstep(0.2, 0.8, noise2D(vec2(v_worldPos.x * 1.8, abs(v_worldPos.y) * 2.5)));
+          vec3 interior = mix(vec3(0.015, 0.025, 0.038), vec3(0.08, 0.18, 0.28), screenGlow);
+          float glassFres = 0.06 + 0.65 * pow(1.0 - max(dot(Ngeom, V), 0.0), 4.0);
+          vec3 refl = sampleTunnelEnv(reflect(-V, Ngeom), 0.05);
+          fragColor = vec4(interior + refl * glassFres, 1.0);
+          return;
+        } else if (matAux > 3.5) {
+          // Backlit atmospheric glow behind downstream wind-tunnel turbine fan!
+          float rad = length(vec2(abs(v_worldPos.y) - 2.25, v_worldPos.z)) / 5.2;
+          em = mix(vec3(0.42, 0.62, 0.88), vec3(0.04, 0.07, 0.12), smoothstep(0.15, 0.95, rad));
+        }
+        fragColor = vec4(em, 1.0);
+        return;
+      }
+
+      // Material PBR parameters
+      vec3 albedo = vec3(0.03);
+      vec3 F0 = vec3(0.04);
+      float rough = 0.35;
+      float metallic = 0.0;
+      float coatWeight = 0.0;
+      float coatRough = 0.04;
+      bool useAniso = false;
+      vec3 T_fiber = T;
+      vec3 B_fiber = B;
+      float ax = 0.25, ay = 0.25;
+      vec3 N = Ngeom;
+      vec3 Ncoat = Ngeom;
+
+      // ----------------------------------------------------------------------
+      // MATERIAL 0 & 1: DUAL-LAYER ANISOTROPIC 2x2 TWILL AUTOCLAVE CARBON FIBER!
+      // ----------------------------------------------------------------------
+      if (matId == 0 || matId == 1) {
+        bool isGloss = (matId == 0);
+        // Triplanar-assisted metric UV fallback if local UV derivatives are stretched, ensuring uniform 3.1mm carbon weave everywhere!
+        vec2 duv = max(abs(dFdx(v_uv)), abs(dFdy(v_uv)));
+        vec2 metricUV = v_uv;
+        if (length(duv) < 1e-6) {
+          metricUV = abs(Ngeom.y) > 0.65 ? v_worldPos.xz : (abs(Ngeom.z) > 0.65 ? v_worldPos.xy : v_worldPos.yz);
+        }
+        vec2 weaveUV = metricUV * 315.0; // ~3.17mm 2x2 twill carbon tow width!
+        vec2 fw = fwidth(weaveUV);
+        float mipVis = 1.0 / (1.0 + max(fw.x, fw.y) * 1.45); // Anti-aliased analytical mip filtering!
+
+        vec2 cell = floor(weaveUV);
+        vec2 f = fract(weaveUV);
+        // Authentic 2x2 Twill diagonal [1, 1, 0, 0] weave pattern!
+        float twillPhase = mod(cell.x + cell.y, 4.0);
+        bool isWarp = (twillPhase < 1.99);
+
+        float across = isWarp ? f.y : f.x;
+        float along  = isWarp ? f.x : f.y;
+        float spanPhase = ((isWarp ? mod(twillPhase, 2.0) : mod(twillPhase - 2.0, 2.0)) + along) * 0.5;
+
+        // Individual carbon tow crown & inter-tow resin pocket micro-normal!
+        float towCrown = sin(across * PI);
+        float dAcross = cos(across * PI) * 0.22 * mipVis;
+        float dAlong  = cos(spanPhase * PI) * 0.14 * mipVis;
+        float microThread = sin(across * 26.0) * 0.03 * mipVis;
+
+        vec3 nPerturb = isWarp
+          ? (T * dAlong + B * (dAcross + microThread))
+          : (B * dAlong + T * (dAcross + microThread));
+        N = normalize(Ngeom - nPerturb);
+
+        // Orthotropic fiber orientation: warp reflects along T, weft reflects along B -> authentic flip-flop shimmer!
+        useAniso = true;
+        T_fiber = isWarp ? T : B;
+        B_fiber = isWarp ? B : T;
+        // Blend anisotropy smoothly at far distances so zero pixel aliasing occurs
+        ax = mix(0.22, 0.42, mipVis);
+        ay = mix(0.22, 0.085, mipVis);
+
+        float crevice = mix(1.0, smoothstep(0.0, 0.18, towCrown), mipVis);
+        albedo = (isGloss ? vec3(0.0085, 0.0095, 0.0115) : vec3(0.0135, 0.0150, 0.0180)) * (0.55 + 0.60 * crevice);
+        F0 = mix(vec3(0.058), isWarp ? vec3(0.086, 0.090, 0.096) : vec3(0.042, 0.044, 0.048), mipVis) * crevice;
+        rough = isGloss ? 0.21 : 0.32;
+        coatWeight = isGloss ? 1.0 : 0.30;
+        coatRough  = isGloss ? 0.026 : 0.13;
+
+        // Flush Laser-Cut Sidepod Cooling Gill Louvers (when matAux > 1.5 on upper sidepod shoulder!)
+        if (matAux > 1.5 && abs(v_worldPos.y) > 0.35) {
+          float az = abs(v_worldPos.z);
+          float gillBox = smoothstep(-0.14, -0.09, v_worldPos.x) * (1.0 - smoothstep(0.66, 0.72, v_worldPos.x)) *
+                          smoothstep(0.27, 0.30, az) * (1.0 - smoothstep(0.41, 0.44, az)) *
+                          smoothstep(0.35, 0.55, Ngeom.y);
+          if (gillBox > 0.01) {
+            float gPhase = fract((v_worldPos.x + az * 0.22) * 9.2);
+            float slotOpen = smoothstep(0.24, 0.32, gPhase) * (1.0 - smoothstep(0.66, 0.74, gPhase));
+            float lipBevel = exp(-pow((gPhase - 0.28) * 18.0, 2.0)) - exp(-pow((gPhase - 0.70) * 18.0, 2.0));
+            N = normalize(N + vec3(lipBevel * 0.42 * gillBox, 0.0, 0.0));
+            Ncoat = N;
+            albedo *= (1.0 - 0.88 * slotOpen * gillBox);
+            F0 *= (1.0 - 0.82 * slotOpen * gillBox);
+            coatWeight *= (1.0 - 0.90 * slotOpen * gillBox);
+          }
+        }
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 2: PROTOTYPE SATIN METALLIC-ICE AERO TRIM
+      // ----------------------------------------------------------------------
+      else if (matId == 2) {
+        metallic = 0.88;
+        albedo = vec3(0.62, 0.69, 0.78);
+        F0 = mix(vec3(0.04), albedo, metallic);
+        albedo *= (1.0 - metallic);
+        rough = 0.20;
+        coatWeight = 0.45;
+        coatRough = 0.05;
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 3: BRUSHED CNC ALUMINUM / HEAT-TINTED TITANIUM / SUCTION GRATE
+      // ----------------------------------------------------------------------
+      else if (matId == 3) {
+        metallic = 0.90;
+        vec3 baseMetal = vec3(0.56, 0.59, 0.63);
+        if (matAux > 0.5 && matAux < 1.5) {
+          // Heat-blued titanium exhaust tailpipe!
+          float tipHeat = smoothstep(2.18, 2.40, v_worldPos.x);
+          vec3 straw = vec3(0.76, 0.62, 0.38);
+          vec3 violetBlue = vec3(0.30, 0.42, 0.78);
+          baseMetal = mix(baseMetal, mix(straw, violetBlue, smoothstep(0.35, 0.88, tipHeat)), smoothstep(0.05, 0.6, tipHeat));
+        } else if (matAux > 1.5) {
+          // Upstream boundary-layer suction grate slots!
+          float slot = smoothstep(0.32, 0.44, abs(fract(v_worldPos.x * 55.0) - 0.5));
+          baseMetal *= (0.12 + 0.88 * slot);
+        }
+        F0 = baseMetal;
+        albedo = baseMetal * 0.08;
+        rough = 0.25;
+        useAniso = true;
+        ax = 0.34; ay = 0.13;
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 4: F1 DRY SLICK TIRE ELASTOMER + SCULPTED SIDEWALL DETAIL!
+      // ----------------------------------------------------------------------
+      else if (matId == 4) {
+        float thetaU = v_uv.x;      // 0..1 around circumference (already spinning with wheel!)
+        float merS   = v_uv.y;      // -1..+1 across tire cross-section
+        float absS   = abs(merS);
+
+        if (absS <= 0.56) {
+          // SLICK TREAD SURFACE: polished heat-cycled central running belt + scuffed shoulder graining!
+          float uTread = absS / 0.56;
+          float shoulderScuff = smoothstep(0.68, 0.98, uTread);
+          // Rotational motion-streaked micro-wear grooves along circumference
+          float wearLines = noise2D(vec2(thetaU * 14.0, merS * 190.0)) * 0.65 +
+                            noise2D(vec2(thetaU * 42.0, merS * 420.0)) * 0.35;
+          float rubberGrain = noise2D(vec2(thetaU * 260.0, merS * 160.0));
+
+          float nBump = (wearLines - 0.5) * 0.14 + (rubberGrain - 0.5) * 0.18 * shoulderScuff;
+          N = normalize(Ngeom + B * nBump);
+
+          // Central belt catches rich satin sheen under tunnel lights; shoulders are matte scuffed rubber
+          albedo = mix(vec3(0.014, 0.015, 0.017), vec3(0.026, 0.027, 0.030), shoulderScuff * (0.7 + 0.3 * rubberGrain));
+          rough  = mix(0.32 + 0.09 * wearLines, 0.68, shoulderScuff);
+          F0     = vec3(0.040);
+          coatWeight = 0.18 * (1.0 - shoulderScuff);
+          coatRough  = 0.24;
+          useAniso = true;
+          T_fiber = T; B_fiber = B;
+          ax = 0.20; ay = 0.48; // Stretches specular highlight cleanly along rolling direction!
+        } else {
+          // TIRE SIDEWALL: Molded concentric cord ribs, radial vulcanized serrations, & motion-blurred prototype rings!
+          float rFrac = (absS - 0.56) / 0.44; // 0 at shoulder -> 1 at 18" rim bead
+          float rib1 = exp(-pow((rFrac - 0.17) * 68.0, 2.0)) - exp(-pow((rFrac - 0.19) * 68.0, 2.0));
+          float rib2 = exp(-pow((rFrac - 0.34) * 78.0, 2.0)) - exp(-pow((rFrac - 0.36) * 78.0, 2.0));
+          float rib3 = exp(-pow((rFrac - 0.68) * 78.0, 2.0)) - exp(-pow((rFrac - 0.70) * 78.0, 2.0));
+          float rib4 = exp(-pow((rFrac - 0.88) * 62.0, 2.0));
+
+          float knurlMask = smoothstep(0.36, 0.40, rFrac) * (1.0 - smoothstep(0.64, 0.68, rFrac));
+          float motionBlurAtten = 1.0 / (1.0 + u_wheelSpeed * 0.09);
+          float knurl = sin(thetaU * 320.0 * PI) * knurlMask * 0.18 * motionBlurAtten;
+
+          N = normalize(Ngeom + B * (rib1 + rib2 + rib3 + rib4 * 0.9) * 0.38 + T * knurl);
+          Ncoat = N;
+          albedo = vec3(0.017, 0.019, 0.022) * (0.90 + 0.18 * knurlMask);
+          rough = mix(0.46, 0.36, smoothstep(0.72, 0.96, rFrac));
+          F0 = vec3(0.042);
+          coatWeight = 0.26; // Authentic vulcanized sidewall elastomer sheen catching grazing tunnel lights!
+          coatRough = 0.25;
+
+          // Clean Original Aero-Test Prototype Sidewall Tracking Ring (NO brand names/logos!)
+          float bandMask = smoothstep(0.46, 0.48, rFrac) * (1.0 - smoothstep(0.535, 0.555, rFrac));
+          if (bandMask > 0.001) {
+            float ang2 = fract(thetaU * 2.0);
+            float arcBlur = 0.05 + 0.16 * clamp(u_wheelSpeed * 0.05, 0.0, 1.0);
+            float arc = smoothstep(0.10 - arcBlur, 0.16 + arcBlur, ang2) * (1.0 - smoothstep(0.58 - arcBlur, 0.64 + arcBlur, ang2));
+            vec3 stripeCol = vec3(0.75, 0.84, 0.95);
+            albedo = mix(albedo, stripeCol * 0.42, bandMask * arc * 0.88);
+            F0 = mix(F0, vec3(0.08), bandMask * arc);
+            rough = mix(rough, 0.24, bandMask * arc);
+          }
+        }
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 5: MOVING ROLLING-ROAD CONTINUOUS BELT (SYNCHRONIZED WITH TIRES!)
+      // ----------------------------------------------------------------------
+      else if (matId == 5) {
+        float beltX = v_worldPos.x - u_time * ${WIND_SPEED.toFixed(2)};
+        float streak = noise2D(vec2(beltX * 1.6, v_worldPos.z * 85.0)) * 0.6 +
+                       noise2D(vec2(beltX * 4.5, v_worldPos.z * 240.0)) * 0.4;
+        float splice = exp(-pow((fract(beltX * 0.18) - 0.5) * 48.0, 2.0));
+        float trackWear = exp(-pow((abs(v_worldPos.z) - 0.81) / 0.21, 2.0));
+
+        N = normalize(Ngeom + vec3(0.0, 0.0, (streak - 0.5) * 0.032));
+        albedo = mix(vec3(0.0085, 0.0098, 0.0125), vec3(0.0055, 0.0065, 0.0085), trackWear * 0.70) * (0.86 + 0.26 * streak + 0.28 * splice);
+        rough = mix(0.32, 0.21, trackWear) + 0.06 * streak;
+        F0 = vec3(0.038);
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 6: WIND TUNNEL ARCHITECTURAL ACOUSTIC DARK SLATE PANELS
+      // ----------------------------------------------------------------------
+      else if (matId == 6) {
+        vec2 panelUV = vec2(v_worldPos.x * 0.4545, (abs(v_worldPos.y) + abs(v_worldPos.z)) * 0.55);
+        vec2 pf = fract(panelUV);
+        float seamX = smoothstep(0.0, 0.016, pf.x) * smoothstep(1.0, 0.984, pf.x);
+        float seamY = smoothstep(0.0, 0.018, pf.y) * smoothstep(1.0, 0.982, pf.y);
+        float seam = matAux > 0.5 ? 0.75 : (seamX * seamY);
+        float panelVar = hash21(floor(panelUV));
+        albedo = vec3(0.011, 0.013, 0.017) * (0.85 + 0.22 * panelVar) * (0.35 + 0.65 * seam);
+        metallic = 0.25;
+        F0 = vec3(0.048, 0.054, 0.064);
+        rough = 0.48 + 0.08 * panelVar;
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 7: PRECISION MACHINED STEEL TUNNEL FLOOR & CIRCULAR YAW TURNTABLE
+      // ----------------------------------------------------------------------
+      else if (matId == 7) {
+        float rTurn = length(v_worldPos.xz);
+        float turnRing = 1.0 - 0.75 * exp(-pow((rTurn - 3.48) * 55.0, 2.0));
+        float innerRing = 1.0 - 0.45 * exp(-pow((rTurn - 2.65) * 60.0, 2.0));
+        vec2 grid = abs(fract(v_worldPos.xz * 0.5) - 0.5);
+        float tileSeam = smoothstep(0.488, 0.498, max(grid.x, grid.y));
+        float brush = noise2D(v_worldPos.xz * 18.0);
+
+        albedo = vec3(0.007, 0.0085, 0.011) * turnRing * innerRing * (1.0 - 0.45 * tileSeam) * (0.92 + 0.16 * brush);
+        metallic = 0.22;
+        F0 = vec3(0.032, 0.035, 0.040);
+        rough = 0.48 + 0.07 * brush;
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 9: DARK IRIDESCENT HELMET VISOR
+      // ----------------------------------------------------------------------
+      else if (matId == 9) {
+        float fres = pow(1.0 - max(dot(Ngeom, V), 0.0), 3.0);
+        albedo = vec3(0.006, 0.008, 0.012);
+        F0 = mix(vec3(0.16, 0.24, 0.38), vec3(0.45, 0.22, 0.52), fres);
+        rough = 0.035;
+        coatWeight = 1.0;
+        coatRough = 0.02;
+      }
+      // ----------------------------------------------------------------------
+      // MATERIAL 10: DARK CAVITIES & UPSTREAM HONEYCOMB SETTLING SCREEN
+      // ----------------------------------------------------------------------
+      else if (matId == 10) {
+        if (matAux > 0.5 && matAux < 1.5) {
+          // Upstream hexagonal honeycomb flow straightener backlit by cool settling-chamber mist!
+          vec2 p = v_worldPos.zy * 16.0;
+          vec2 h = vec2(1.0, 1.73205);
+          vec2 a = mod(p, h) - 0.5 * h;
+          vec2 b = mod(p - 0.5 * h, h) - 0.5 * h;
+          vec2 gv = dot(a, a) < dot(b, b) ? a : b;
+          float hexDist = max(abs(gv.x), dot(abs(gv), vec2(0.5, 0.866025)));
+          float cellOpen = smoothstep(0.46, 0.38, hexDist);
+          float vignette = 1.0 - 0.55 * smoothstep(1.2, 5.2, length(vec2(v_worldPos.y - 2.3, v_worldPos.z)));
+          fragColor = vec4(vec3(0.10, 0.15, 0.22) * cellOpen * vignette + vec3(0.006, 0.008, 0.012), 1.0);
+          return;
+        } else if (matAux > 1.5) {
+          // Recessed Aluminum Heat-Exchanger Radiator Fin Core inside Sidepod & Airbox Inlets!
+          float fins = sin(v_worldPos.y * 280.0) * 0.5 + 0.5;
+          float tubes = smoothstep(0.08, 0.18, abs(fract(v_worldPos.z * 28.0) - 0.5));
+          albedo = vec3(0.035, 0.040, 0.046) * (0.25 + 0.75 * fins * tubes);
+          F0 = vec3(0.18, 0.20, 0.23) * fins * tubes;
+          rough = 0.38;
+        } else {
+          albedo = vec3(0.004, 0.005, 0.007);
+          F0 = vec3(0.02);
+          rough = 0.78;
+        }
+      }
+
+      // ----------------------------------------------------------------------
+      // LIGHTING ACCUMULATION: OVERHEAD + CHAMFER + LOWER GRAZING LED STRIPS + SHADOWS + PLANAR FLOOR REFLECTION!
+      // ----------------------------------------------------------------------
+      // Toksvig geometric normal-variance specular anti-aliasing (eliminates bright hotspots on thin edges & T-cam!)
+      float geomCurv = clamp(length(fwidth(Ngeom)) * 0.55, 0.0, 0.28);
+      rough = clamp(max(rough, geomCurv), 0.02, 1.0);
+      coatRough = clamp(max(coatRough, geomCurv * 0.85), 0.02, 1.0);
+
+      float shadowAO = computeShadowAndContactAO(v_worldPos, N);
+      vec3 R = reflect(-V, N);
+      vec3 Rcoat = reflect(-V, Ncoat);
+
+      vec3 color = vec3(0.0);
+      // Vignette tunnel floor/walls gently away from test-section spotlight pool (r > 3.5m)
+      float spotPool = 1.0 - 0.55 * smoothstep(3.2, 8.5, length(v_worldPos.xz)) * step(v_worldPos.y, 0.05);
+
+      // 1. Twin Overhead Precision Car-Inspection Strips (z = ±0.58, y = 4.14, x: -4.2 .. +4.4)
+      vec3 keyLightCol = vec3(2.75, 2.90, 3.15) * (0.14 + 0.86 * shadowAO) * spotPool;
+      color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+        vec3(-4.2, 4.14, -0.58), vec3(4.4, 4.14, -0.58), 0.065, keyLightCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+      color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+        vec3(-4.2, 4.14, +0.58), vec3(4.4, 4.14, +0.58), 0.065, keyLightCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+
+      // 2. Long Upper-Chamfer Architectural Tunnel LED Strips (z = ±3.41, y = 3.61, x: -9.0 .. +9.5)
+      float sideShadow = 0.26 + 0.74 * shadowAO;
+      vec3 rimStripCol = vec3(1.65, 1.78, 2.00) * sideShadow * spotPool;
+      color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+        vec3(-9.0, 3.61, -3.41), vec3(9.5, 3.61, -3.41), 0.085, rimStripCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+      color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+        vec3(-9.0, 3.61, +3.41), vec3(9.5, 3.61, +3.41), 0.085, rimStripCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+
+      // 3. Lower-Wall Aero-Inspection Grazing LED Strips (z = ±4.24, y = 0.48, x: -5.5 .. +5.5)
+      // Masked off flat floor (abs(y) < 0.03) so they sculpt tire sidewalls, wheel rims & bodywork without washing out the floor!
+      float aboveFloorMask = smoothstep(0.015, 0.085, abs(v_worldPos.y));
+      if (aboveFloorMask > 0.005) {
+        vec3 lowGrazingCol = vec3(1.45, 1.58, 1.80) * (0.35 + 0.65 * shadowAO) * aboveFloorMask;
+        color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+          vec3(-5.5, 0.48, -4.24), vec3(5.5, 0.48, -4.24), 0.05, lowGrazingCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+        color += evalTubeLight(v_worldPos, N, V, R, Ncoat, Rcoat, coatWeight, coatRough,
+          vec3(-5.5, 0.48, +4.24), vec3(5.5, 0.48, +4.24), 0.05, lowGrazingCol, albedo, F0, rough, useAniso, T_fiber, B_fiber, ax, ay);
+      }
+
+      // 4. FIA Ruby Rear Rain-Light Local Point Illumination onto Diffuser, Beam Wing & Rolling Road!
+      vec3 rainPos = vec3(2.56, 0.30, 0.0);
+      vec3 toRain = rainPos - v_worldPos;
+      float rDist = length(toRain);
+      if (rDist < 2.4) {
+        vec3 rDir = toRain / max(rDist, 0.04);
+        float rAtten = 1.0 / (0.22 + 3.2 * rDist * rDist);
+        float pulse = 0.82 + 0.18 * sin(u_time * 18.0);
+        float rNdotL = max(dot(N, rDir), 0.0);
+        vec3 rH = normalize(V + rDir);
+        float rSpec = D_GGX(max(dot(N, rH), 0.0), max(rough * rough, 0.04)) * 0.10;
+        color += vec3(1.45, 0.040, 0.028) * pulse * rAtten * (albedo * rNdotL + rSpec * max(rNdotL, 0.12));
+      }
+
+      // 5. Environment IBL + Clearcoat Fresnel + Controlled Glossy Planar Reflection on Rolling Road & Turntable Floor!
+      float NdotV = max(dot(N, V), 1e-4);
+      vec3 kS = F_Schlick(NdotV, F0);
+      vec3 envSpec = sampleTunnelEnv(R, rough) * kS * (1.0 - 0.55 * rough);
+      vec3 envDiff = albedo * mix(vec3(0.022, 0.027, 0.036), vec3(0.075, 0.088, 0.108), N.y * 0.5 + 0.5) * (0.28 + 0.72 * shadowAO);
+
+      if (coatWeight > 0.001) {
+        float fCoat = (0.04 + 0.96 * pow(1.0 - max(dot(Ncoat, V), 0.0), 5.0)) * coatWeight;
+        envSpec += sampleTunnelEnv(Rcoat, coatRough) * fCoat * (0.30 + 0.70 * shadowAO);
+      }
+
+      if (u_reflection > 0.0 && (matId == 5 || matId == 7)) {
+        vec2 screenUV = gl_FragCoord.xy / u_resolution;
+        vec2 reflUV = clamp(screenUV + N.xz * 0.030, vec2(0.002), vec2(0.998));
+        float mip = clamp(rough * 5.6, 0.8, 4.2);
+        vec3 planarCol = textureLod(u_planarRefl, reflUV, mip).rgb;
+        float floorFres = 0.035 + 0.42 * pow(1.0 - max(dot(Ngeom, V), 0.0), 4.5);
+        envSpec = mix(envSpec, planarCol * floorFres * 0.88, 0.78) * (0.25 + 0.75 * shadowAO);
+      }
+
+      color += envDiff + envSpec;
+
+      // Subtle atmospheric tunnel depth perspective haze far upstream/downstream
+      float camDist = length(v_worldPos - u_camPos);
+      float fog = 1.0 - exp(-max(0.0, camDist - 6.5) * 0.025);
+      color = mix(color, vec3(0.007, 0.010, 0.016), clamp(fog, 0.0, 0.65));
+
+      fragColor = vec4(max(color, vec3(0.0)), 1.0);
+    }
+  `;
+
+  // --- 8C. VIEW-ALIGNED VOLUMETRIC SMOKE STREAMLINE RIBBON SHADER ---
+  const RIBBON_VS = `#version 300 es
+    layout(location = 0) in vec3 a_pos;
+    layout(location = 1) in vec3 a_tang;
+    layout(location = 2) in vec4 a_params; // [side(-1/+1), radius, alpha, arcU]
+
+    uniform mat4 u_viewProj;
+    uniform vec3 u_camPos;
+    uniform float u_reflection;
+
+    out vec3 v_worldPos;
+    out float v_side;
+    out float v_alpha;
+    out float v_arcU;
+    out float v_radius;
+
+    void main() {
+      vec3 center = a_pos;
+      vec3 tang = a_tang;
+      if (u_reflection < 0.0) {
+        center.y = -center.y;
+        tang.y = -tang.y;
+      }
+      // View-aligned cylindrical expansion: ALWAYS faces camera across full 360° orbit & top/side/front views!
+      vec3 toCam = normalize(u_camPos - center);
+      vec3 sideDir = cross(tang, toCam);
+      float sLen = length(sideDir);
+      sideDir = sLen > 1e-4 ? sideDir / sLen : vec3(0.0, 1.0, 0.0);
+
+      float side = a_params.x;
+      float radius = a_params.y;
+      vec3 wPos = center + sideDir * (side * radius);
+
+      v_worldPos = wPos;
+      v_side = side;
+      v_alpha = a_params.z;
+      v_arcU = a_params.w;
+      v_radius = radius;
+
+      gl_Position = u_viewProj * vec4(wPos, 1.0);
+    }
+  `;
+
+  const RIBBON_FS = `#version 300 es
+    precision highp float;
+
+    in vec3 v_worldPos;
+    in float v_side;
+    in float v_alpha;
+    in float v_arcU;
+    in float v_radius;
+
+    uniform sampler2D u_sceneDepth;
+    uniform vec2 u_resolution;
+    uniform vec2 u_nearFar;
+    uniform float u_time;
+    uniform float u_reflection;
+
+    out vec4 fragColor;
+
+    float hash21(vec2 p) {
+      p = fract(p * vec2(127.1, 311.7));
+      p += dot(p, p + 34.23);
+      return fract(p.x * p.y);
+    }
+    float noise2D(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      return mix(
+        mix(hash21(i), hash21(i + vec2(1.0, 0.0)), f.x),
+        mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), f.x),
+        f.y
+      );
+    }
+    float fbm(vec2 p) {
+      float v = 0.0, a = 0.55;
+      mat2 m = mat2(1.6, 1.2, -1.2, 1.6);
+      for (int i = 0; i < 4; i++) {
+        v += a * noise2D(p);
+        p = m * p;
+        a *= 0.5;
+      }
+      return v;
+    }
+
+    float linearizeDepth(float d) {
+      float n = u_nearFar.x, f = u_nearFar.y;
+      return (2.0 * n * f) / (f + n - (d * 2.0 - 1.0) * (f - n));
+    }
+
+    void main() {
+      if (u_reflection < 0.0 && v_worldPos.y > 0.0) discard;
+
+      // Cylindrical volumetric cross-section thickness: dense core -> silky feathered edge!
+      float r = abs(v_side);
+      if (r >= 1.0) discard;
+      float cylProfile = pow(1.0 - r * r, 1.35);
+
+      // Advecting internal FBM smoke wisps: laminar silky threads upstream -> billowing turbulent shreds in wake!
+      float flowScroll = v_arcU * 2.35 - u_time * ${WIND_SPEED.toFixed(2)} * 2.35;
+      float wakeFactor = clamp((v_radius - 0.018) / 0.14, 0.0, 1.0);
+      float wisp = fbm(vec2(flowScroll * mix(0.45, 1.35, wakeFactor), v_side * mix(1.4, 3.2, wakeFactor) + v_arcU * 0.4));
+      float density = cylProfile * mix(0.82 + 0.26 * wisp, smoothstep(0.20, 0.88, wisp * 1.15), wakeFactor * 0.85);
+
+      // Soft scene-depth intersection fade so smoke skimming 5mm over carbon wings has zero hard clipping!
+      float softDepth = 1.0;
+      if (u_reflection > 0.0) {
+        vec2 uvScreen = gl_FragCoord.xy / u_resolution;
+        float sceneD = texture(u_sceneDepth, uvScreen).r;
+        float linScene = linearizeDepth(sceneD);
+        float linFrag  = linearizeDepth(gl_FragCoord.z);
+        softDepth = smoothstep(0.0, max(0.035, v_radius * 1.8), linScene - linFrag);
+      }
+
+      float finalAlpha = clamp(v_alpha * density * softDepth * 0.58, 0.0, 0.82);
+      if (finalAlpha < 0.002) discard;
+
+      // Volumetric smoke illumination kept below HDR bloom threshold so ribbons stay silky & crisp!
+      float underCarDim = 1.0 - 0.55 * exp(-abs(v_worldPos.y) * 5.0) * smoothstep(0.85, 0.35, abs(v_worldPos.z)) *
+                          smoothstep(-2.4, -0.8, v_worldPos.x) * (1.0 - smoothstep(1.6, 2.3, v_worldPos.x));
+      float coreSheen = 0.72 + 0.28 * (1.0 - r);
+      vec3 smokeLight = vec3(0.68, 0.74, 0.82) * coreSheen * underCarDim;
+
+      // Localized FIA ruby rear rain-light volumetric scatter right behind crash attenuator!
+      vec3 rainPos = vec3(2.56, 0.30 * u_reflection, 0.0);
+      float dRain = length(v_worldPos - rainPos);
+      if (dRain < 1.35) {
+        float pulse = 0.82 + 0.18 * sin(u_time * 18.0);
+        float falloff = smoothstep(1.35, 0.15, dRain) / (0.35 + 4.5 * dRain * dRain);
+        smokeLight += vec3(0.95, 0.045, 0.032) * pulse * falloff;
+      }
+
+      fragColor = vec4(smokeLight * finalAlpha, finalAlpha);
+    }
+  `;
+
+  // --- 8D. ADVECTED 3D VOLUMETRIC WAKE BILLOW PARTICLE SHADER ---
+  const PARTICLE_VS = `#version 300 es
+    layout(location = 0) in vec2 a_quad;
+    layout(location = 1) in vec4 a_posRad;   // xyz, radius
+    layout(location = 2) in vec3 a_meta;     // alpha, rot, seed
+
+    uniform mat4 u_viewProj;
+    uniform vec3 u_camRight;
+    uniform vec3 u_camUp;
+    uniform float u_reflection;
+
+    out vec2 v_uv;
+    out vec3 v_worldPos;
+    out float v_alpha;
+    out float v_seed;
+    out float v_radius;
+
+    void main() {
+      vec3 center = a_posRad.xyz;
+      if (u_reflection < 0.0) center.y = -center.y;
+      float rad = a_posRad.w;
+      float ca = cos(a_meta.y), sa = sin(a_meta.y);
+      vec2 rq = vec2(a_quad.x * ca - a_quad.y * sa, a_quad.x * sa + a_quad.y * ca);
+
+      vec3 wPos = center + (u_camRight * rq.x + u_camUp * rq.y) * rad;
+      v_uv = a_quad;
+      v_worldPos = wPos;
+      v_alpha = a_meta.x;
+      v_seed = a_meta.z;
+      v_radius = rad;
+
+      gl_Position = u_viewProj * vec4(wPos, 1.0);
+    }
+  `;
+
+  const PARTICLE_FS = `#version 300 es
+    precision highp float;
+
+    in vec2 v_uv;
+    in vec3 v_worldPos;
+    in float v_alpha;
+    in float v_seed;
+    in float v_radius;
+
+    uniform sampler2D u_sceneDepth;
+    uniform vec2 u_resolution;
+    uniform vec2 u_nearFar;
+    uniform float u_time;
+    uniform vec3 u_camPos;
+
+    out vec4 fragColor;
+
+    float hash21(vec2 p) {
+      p = fract(p * vec2(127.1, 311.7));
+      p += dot(p, p + 34.23);
+      return fract(p.x * p.y);
+    }
+    float noise2D(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      return mix(
+        mix(hash21(i), hash21(i + vec2(1.0, 0.0)), f.x),
+        mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), f.x),
+        f.y
+      );
+    }
+    float fbm(vec2 p) {
+      float v = 0.0, a = 0.54;
+      mat2 m = mat2(1.6, 1.2, -1.2, 1.6);
+      for (int i = 0; i < 4; i++) {
+        v += a * noise2D(p);
+        p = m * p;
+        a *= 0.5;
+      }
+      return v;
+    }
+
+    float linearizeDepth(float d) {
+      float n = u_nearFar.x, f = u_nearFar.y;
+      return (2.0 * n * f) / (f + n - (d * 2.0 - 1.0) * (f - n));
+    }
+
+    void main() {
+      float r2 = dot(v_uv, v_uv);
+      if (r2 >= 1.0) discard;
+      float radial = pow(1.0 - r2, 1.75);
+
+      // Animated multi-octave swirling turbulent eddy cloud
+      vec2 np = v_uv * 2.3 + vec2(v_seed * 0.73, u_time * 0.65);
+      float cloud = fbm(np + 0.45 * fbm(np * 1.8 - u_time * 0.4));
+      float puff = radial * smoothstep(0.22, 0.85, cloud * 1.18);
+
+      vec2 uvScreen = gl_FragCoord.xy / u_resolution;
+      float linScene = linearizeDepth(texture(u_sceneDepth, uvScreen).r);
+      float linFrag  = linearizeDepth(gl_FragCoord.z);
+      float softDepth = smoothstep(0.0, max(0.14, v_radius * 0.95), linScene - linFrag);
+      float floorSoft = smoothstep(0.0, 0.09, v_worldPos.y);
+
+      // Prevent axial optical pileup when looking straight down the +X wake axis from dead-rear!
+      vec3 viewDir = normalize(u_camPos - v_worldPos);
+      float axialAtten = mix(1.0, 0.44, pow(abs(viewDir.x), 3.2));
+      float a = clamp(v_alpha * puff * softDepth * floorSoft * axialAtten, 0.0, 0.40);
+      if (a < 0.002) discard;
+
+      // Rich 3D self-shadowed turbulent cloud shading (darker underside, lit top crown) + tight ruby FIA rain-light scatter!
+      float topShade = mix(0.34, 0.78, clamp(v_uv.y * 0.5 + 0.5, 0.0, 1.0)) * (0.80 + 0.30 * cloud);
+      vec3 col = vec3(0.58, 0.64, 0.73) * topShade;
+
+      float dRain = length(v_worldPos - vec3(2.56, 0.30, 0.0));
+      if (dRain < 1.45) {
+        float pulse = 0.82 + 0.18 * sin(u_time * 18.0);
+        float falloff = smoothstep(1.45, 0.15, dRain) / (0.38 + 4.2 * dRain * dRain);
+        col += vec3(0.92, 0.04, 0.03) * pulse * falloff;
+      }
+
+      fragColor = vec4(col * a, a);
+    }
+  `;
+
+  // --- 8E. FULLSCREEN QUAD, HDR DUAL-KAWASE BLOOM & ACES FILMIC POST-PROCESSING ---
+  const QUAD_VS = `#version 300 es
+    out vec2 v_uv;
+    void main() {
+      vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+      v_uv = p;
+      gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    }
+  `;
+
+  const BLOOM_DOWN_FS = `#version 300 es
+    precision highp float;
+    in vec2 v_uv;
+    uniform sampler2D u_tex;
+    uniform vec2 u_texelSize;
+    uniform int u_firstPass;
+    out vec4 fragColor;
+
+    vec3 prefilter(vec3 c) {
+      float br = max(c.r, max(c.g, c.b));
+      float soft = clamp(br - 1.45, 0.0, 1.4);
+      soft = soft * soft / (2.8 + 1e-4);
+      float contrib = max(soft, br - 1.85) / max(br, 1e-4);
+      return c * max(contrib, 0.0);
+    }
+
+    void main() {
+      vec2 o = u_texelSize;
+      vec3 c = texture(u_tex, v_uv).rgb * 0.50;
+      c += texture(u_tex, v_uv + vec2(-o.x, -o.y)).rgb * 0.125;
+      c += texture(u_tex, v_uv + vec2( o.x, -o.y)).rgb * 0.125;
+      c += texture(u_tex, v_uv + vec2(-o.x,  o.y)).rgb * 0.125;
+      c += texture(u_tex, v_uv + vec2( o.x,  o.y)).rgb * 0.125;
+      if (u_firstPass == 1) c = prefilter(c);
+      fragColor = vec4(c, 1.0);
+    }
+  `;
+
+  const BLOOM_UP_FS = `#version 300 es
+    precision highp float;
+    in vec2 v_uv;
+    uniform sampler2D u_tex;
+    uniform vec2 u_texelSize;
+    out vec4 fragColor;
+    void main() {
+      vec2 o = u_texelSize * 1.35;
+      vec3 c = vec3(0.0);
+      c += texture(u_tex, v_uv + vec2(-o.x * 2.0, 0.0)).rgb;
+      c += texture(u_tex, v_uv + vec2( o.x * 2.0, 0.0)).rgb;
+      c += texture(u_tex, v_uv + vec2(0.0, -o.y * 2.0)).rgb;
+      c += texture(u_tex, v_uv + vec2(0.0,  o.y * 2.0)).rgb;
+      c += texture(u_tex, v_uv + vec2(-o.x, -o.y)).rgb * 2.0;
+      c += texture(u_tex, v_uv + vec2( o.x, -o.y)).rgb * 2.0;
+      c += texture(u_tex, v_uv + vec2(-o.x,  o.y)).rgb * 2.0;
+      c += texture(u_tex, v_uv + vec2( o.x,  o.y)).rgb * 2.0;
+      fragColor = vec4(c / 12.0, 1.0);
+    }
+  `;
+
+  const COMPOSITE_FS = `#version 300 es
+    precision highp float;
+    in vec2 v_uv;
+    uniform sampler2D u_scene;
+    uniform sampler2D u_bloom;
+    uniform vec2 u_texelSize;
+    uniform float u_time;
+    out vec4 fragColor;
+
+    // Narkowicz ACES Filmic Tone Mapping Curve
+    vec3 acesTonemap(vec3 x) {
+      const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+      return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    }
+
+    float luma(vec3 c) {
+      return dot(c, vec3(0.299, 0.587, 0.114));
+    }
+
+    void main() {
+      // High-quality FXAA-lite luminance edge anti-aliasing on HDR color before tone-mapping
+      vec3 rgbM  = texture(u_scene, v_uv).rgb;
+      vec3 rgbNW = texture(u_scene, v_uv + vec2(-1.0, -1.0) * u_texelSize).rgb;
+      vec3 rgbNE = texture(u_scene, v_uv + vec2( 1.0, -1.0) * u_texelSize).rgb;
+      vec3 rgbSW = texture(u_scene, v_uv + vec2(-1.0,  1.0) * u_texelSize).rgb;
+      vec3 rgbSE = texture(u_scene, v_uv + vec2( 1.0,  1.0) * u_texelSize).rgb;
+
+      float lM = luma(acesTonemap(rgbM));
+      float lNW = luma(acesTonemap(rgbNW));
+      float lNE = luma(acesTonemap(rgbNE));
+      float lSW = luma(acesTonemap(rgbSW));
+      float lSE = luma(acesTonemap(rgbSE));
+      float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+      float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+
+      vec3 hdr = rgbM;
+      if (lMax - lMin > max(0.035, lMax * 0.10)) {
+        vec2 dir;
+        dir.x = -((lNW + lNE) - (lSW + lSE));
+        dir.y =  ((lNW + lSW) - (lNE + lSE));
+        float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);
+        float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+        dir = clamp(dir * rcpDirMin, vec2(-6.0), vec2(6.0)) * u_texelSize;
+        vec3 rgbA = 0.5 * (texture(u_scene, v_uv + dir * (1.0/3.0 - 0.5)).rgb + texture(u_scene, v_uv + dir * (2.0/3.0 - 0.5)).rgb);
+        vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(u_scene, v_uv + dir * -0.5).rgb + texture(u_scene, v_uv + dir * 0.5).rgb);
+        float lB = luma(acesTonemap(rgbB));
+        hdr = (lB < lMin || lB > lMax) ? rgbA : rgbB;
+      }
+
+      vec3 bloom = texture(u_bloom, v_uv).rgb;
+      vec3 col = hdr + bloom * 0.18;
+
+      // Cinema exposure & crisp high-contrast wind-tunnel grade
+      col *= vec3(1.02, 1.03, 1.06);
+      col = acesTonemap(col);
+      col = pow(col, vec3(1.0 / 2.2));
+
+      // Subtle optical lens vignette
+      vec2 cv = v_uv - 0.5;
+      float vig = 1.0 - 0.34 * dot(cv, cv);
+      col *= vig;
+
+      // Subtle film sensor dither to prevent 8-bit dark banding on tunnel walls
+      float grain = fract(sin(dot(gl_FragCoord.xy + fract(u_time) * 91.7, vec2(12.9898, 78.233))) * 43758.5453);
+      col += (grain - 0.5) * (1.5 / 255.0);
+
+      fragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // ============================================================================
+  // 9. WEBGL2 INITIALIZATION, FRAMEBUFFERS, INTERACTIVE CAMERA & RENDER LOOP
+  // ============================================================================
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl2', {
+    antialias: false,
+    alpha: false,
+    depth: true,
+    stencil: false,
+    powerPreference: 'high-performance'
+  });
+
+  if (!gl) {
+    document.getElementById('loading').innerHTML = '<div style="padding:24px;text-align:center;">WebGL 2 is required to render this Formula 1 Wind Tunnel simulation.</div>';
+    return;
+  }
+
+  const extColorFloat = gl.getExtension('EXT_color_buffer_float');
+  const extFloatLinear = gl.getExtension('OES_texture_float_linear');
+  const hdrInternalFormat = extColorFloat ? gl.RGBA16F : gl.RGBA8;
+  const hdrType = extColorFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+  const hdrFilter = (extColorFloat && !extFloatLinear) ? gl.NEAREST : gl.LINEAR;
+
+  // Compile all shader programs
+  const progShadow   = createProgram(gl, SHADOW_VS, SHADOW_FS);
+  const progPBR      = createProgram(gl, PBR_VS, PBR_FS);
+  const progRibbon   = createProgram(gl, RIBBON_VS, RIBBON_FS);
+  const progParticle = createProgram(gl, PARTICLE_VS, PARTICLE_FS);
+  const progBloomDn  = createProgram(gl, QUAD_VS, BLOOM_DOWN_FS);
+  const progBloomUp  = createProgram(gl, QUAD_VS, BLOOM_UP_FS);
+  const progComp     = createProgram(gl, QUAD_VS, COMPOSITE_FS);
+
+  const emptyVao = gl.createVertexArray();
+
+  // Cache uniform locations helper
+  function getUniforms(prog, names) {
+    const u = {};
+    for (const n of names) u[n] = gl.getUniformLocation(prog, n);
+    return u;
+  }
+
+  const uShadow = getUniforms(progShadow, ['u_lightVP', 'u_mode', 'u_offset', 'u_spinAngle', 'u_reflection']);
+  const uPBR = getUniforms(progPBR, [
+    'u_viewProj', 'u_lightVP', 'u_mode', 'u_offset', 'u_spinAngle', 'u_reflection',
+    'u_camPos', 'u_time', 'u_wheelSpeed', 'u_resolution', 'u_shadowMap', 'u_planarRefl'
+  ]);
+  const uRibbon = getUniforms(progRibbon, [
+    'u_viewProj', 'u_camPos', 'u_reflection', 'u_sceneDepth', 'u_resolution', 'u_nearFar', 'u_time'
+  ]);
+  const uParticle = getUniforms(progParticle, [
+    'u_viewProj', 'u_camRight', 'u_camUp', 'u_reflection', 'u_sceneDepth', 'u_resolution', 'u_nearFar', 'u_time', 'u_camPos'
+  ]);
+  const uBloomDn = getUniforms(progBloomDn, ['u_tex', 'u_texelSize', 'u_firstPass']);
+  const uBloomUp = getUniforms(progBloomUp, ['u_tex', 'u_texelSize']);
+  const uComp    = getUniforms(progComp, ['u_scene', 'u_bloom', 'u_texelSize', 'u_time']);
+
+  // Build Scene Geometry & 3D Aerodynamic Flow Solver
+  const smokeSeeds = buildSmokeSeeds();
+  const staticBuilder = new MeshBuilder();
+  buildF1CarStatic(staticBuilder);
+  buildWindTunnelStatic(staticBuilder);
+  addSmokeNozzlesToTunnel(staticBuilder, smokeSeeds);
+  const meshStatic = staticBuilder.compile(gl);
+
+  // Build 4 Spinning 18-inch Wheels (Front Left/Right: 305mm wide, Rear Left/Right: 405mm wide)
+  const meshWheelFL = buildSingleWheelMesh(gl, 0.305, false); // z = -FRONT_TRACK_Z
+  const meshWheelFR = buildSingleWheelMesh(gl, 0.305, true);  // z = +FRONT_TRACK_Z
+  const meshWheelRL = buildSingleWheelMesh(gl, 0.405, false); // z = -REAR_TRACK_Z
+  const meshWheelRR = buildSingleWheelMesh(gl, 0.405, true);  // z = +REAR_TRACK_Z
+
+  const wheelInstances = [
+    { mesh: meshWheelFL, pos: [FRONT_AXLE_X, TIRE_RADIUS - 0.004, -FRONT_TRACK_Z] },
+    { mesh: meshWheelFR, pos: [FRONT_AXLE_X, TIRE_RADIUS - 0.004, +FRONT_TRACK_Z] },
+    { mesh: meshWheelRL, pos: [REAR_AXLE_X,  TIRE_RADIUS - 0.004, -REAR_TRACK_Z] },
+    { mesh: meshWheelRR, pos: [REAR_AXLE_X,  TIRE_RADIUS - 0.004, +REAR_TRACK_Z] }
+  ];
+
+  // Build Giant Downstream Wind-Tunnel Axial Turbine Fan
+  const meshTunnelFan = buildTunnelFanMesh(gl);
+  const fanCenter = [12.35, 2.25, 0.0];
+
+  // Solve 3D Aerodynamic Potential Flow + Bound Vortex Circulation + Wake Field
+  const aeroFlow = new AeroFlowField();
+  const smokeSystem = new SmokeSystem(gl, aeroFlow, smokeSeeds);
+
+  // --------------------------------------------------------------------------
+  // Shadow Map FBO (2048 x 2048 Hardware Depth Compare)
+  // --------------------------------------------------------------------------
+  const SHADOW_SIZE = 2048;
+  const fboShadow = gl.createFramebuffer();
+  const texShadow = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texShadow);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboShadow);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, texShadow, 0);
+  gl.drawBuffers([gl.NONE]);
+  gl.readBuffer(gl.NONE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // Light orthographic ViewProj matrix centered tightly over the F1 car & rolling road
+  const matLightView = mat4Identity();
+  const matLightProj = mat4Identity();
+  const matLightVP   = mat4Identity();
+  mat4LookAt(matLightView, [-0.35, 5.20, 0.25], [-0.05, 0.25, 0.0], [0, 0, -1]);
+  mat4Ortho(matLightProj, -3.45, 3.45, -1.75, 1.75, 1.2, 6.2);
+  mat4Multiply(matLightVP, matLightProj, matLightView);
+
+  // --------------------------------------------------------------------------
+  // Dynamic Resolution-Dependent Framebuffers (Scene HDR, Depth Copy, Planar Refl, Bloom Pyramid)
+  // --------------------------------------------------------------------------
+  let rtWidth = 0, rtHeight = 0;
+  let fboScene = null, texSceneColor = null, texSceneDepth = null;
+  let fboDepthCopy = null, texSceneDepthCopy = null;
+  let fboPlanar = null, texPlanarColor = null, rbPlanarDepth = null, planarW = 0, planarH = 0;
+  const bloomLevels = 4;
+  let bloomDownFbos = [], bloomDownTexs = [], bloomSizes = [];
+  let bloomUpFbos = [], bloomUpTexs = [];
+
+  function createColorTex(w, h, mipmap = false) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, hdrInternalFormat, w, h, 0, gl.RGBA, hdrType, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mipmap ? gl.LINEAR_MIPMAP_LINEAR : hdrFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, hdrFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+
+  function createDepthTex(w, h) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+
+  function resizeRenderTargets() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+    const w = Math.max(2, Math.floor(window.innerWidth * dpr));
+    const h = Math.max(2, Math.floor(window.innerHeight * dpr));
+    if (w === rtWidth && h === rtHeight) return;
+
+    rtWidth = w; rtHeight = h;
+    canvas.width = w; canvas.height = h;
+
+    // Cleanup old targets
+    const delTex = (t) => t && gl.deleteTexture(t);
+    const delFbo = (f) => f && gl.deleteFramebuffer(f);
+    delTex(texSceneColor); delTex(texSceneDepth); delFbo(fboScene);
+    delTex(texSceneDepthCopy); delFbo(fboDepthCopy);
+    delTex(texPlanarColor); if (rbPlanarDepth) gl.deleteRenderbuffer(rbPlanarDepth); delFbo(fboPlanar);
+    bloomDownTexs.forEach(delTex); bloomDownFbos.forEach(delFbo);
+    bloomUpTexs.forEach(delTex); bloomUpFbos.forEach(delFbo);
+    bloomDownTexs = []; bloomDownFbos = []; bloomSizes = [];
+    bloomUpTexs = []; bloomUpFbos = [];
+
+    // 1. Main HDR Scene FBO
+    texSceneColor = createColorTex(w, h, false);
+    texSceneDepth = createDepthTex(w, h);
+    fboScene = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texSceneColor, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, texSceneDepth, 0);
+
+    // 2. Depth Copy FBO (prevents feedback loop during soft-depth volumetric smoke pass!)
+    texSceneDepthCopy = createDepthTex(w, h);
+    fboDepthCopy = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboDepthCopy);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, texSceneDepthCopy, 0);
+    gl.drawBuffers([gl.NONE]);
+    gl.readBuffer(gl.NONE);
+
+    // 3. Planar Reflection FBO (half-res with mipmaps for physically rough floor reflections!)
+    planarW = Math.max(64, w >> 1);
+    planarH = Math.max(64, h >> 1);
+    texPlanarColor = createColorTex(planarW, planarH, true);
+    rbPlanarDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rbPlanarDepth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, planarW, planarH);
+    fboPlanar = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboPlanar);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texPlanarColor, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rbPlanarDepth);
+
+    // 4. Dual-Kawase HDR Bloom Mip Chain
+    let bw = Math.max(16, w >> 1), bh = Math.max(16, h >> 1);
+    for (let i = 0; i < bloomLevels; i++) {
+      bloomSizes.push([bw, bh]);
+      const td = createColorTex(bw, bh, false);
+      const fd = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fd);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, td, 0);
+      bloomDownTexs.push(td);
+      bloomDownFbos.push(fd);
+
+      const tu = createColorTex(bw, bh, false);
+      const fu = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fu);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tu, 0);
+      bloomUpTexs.push(tu);
+      bloomUpFbos.push(fu);
+
+      bw = Math.max(8, bw >> 1);
+      bh = Math.max(8, bh >> 1);
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  window.addEventListener('resize', resizeRenderTargets);
+  resizeRenderTargets();
+
+  // ============================================================================
+  // 10. CINEMATIC AUTO-GLIDE + FULL 360° INTERACTIVE CAMERA (MOUSE + TOUCH + PINCH + AUTO-RESUME)
+  // ============================================================================
+  const cam = {
+    // Current smoothed spherical coordinates around lookAt target
+    theta: -2.42,          // Start at dramatic front-left 3/4 wind-tunnel hero angle!
+    phi: 0.22,             // Low, sleek cinema elevation
+    radius: 5.82,          // Full-car + wake + turbine hero framing distance
+    // Target values driven by user input or automatic glide
+    targetTheta: -2.42,
+    targetPhi: 0.22,
+    targetRadius: 5.82,
+    lookAt: [-0.08, 0.42, 0.0],
+    // Interaction & seamless auto-glide resumption state
+    isDragging: false,
+    lastInputTime: -999.0, // Starts in smooth automatic glide immediately!
+    autoPhase: 0.0,
+    lastX: 0,
+    lastY: 0,
+    pinchDist: 0
+  };
+
+  const IDLE_RESUME_DELAY = 3.5; // Seconds of no input before auto-glide smoothly resumes
+  const camHintEl = document.getElementById('camHint');
+  let hintDimmed = false;
+
+  function markUserInteraction(nowSec) {
+    cam.lastInputTime = nowSec;
+    if (!hintDimmed && camHintEl) {
+      hintDimmed = true;
+      setTimeout(() => { camHintEl.style.opacity = '0.35'; }, 2500);
+    }
+  }
+
+  // Mouse Orbit & Scroll Zoom
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    cam.isDragging = true;
+    cam.lastX = e.clientX;
+    cam.lastY = e.clientY;
+    markUserInteraction(performance.now() * 0.001);
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!cam.isDragging) return;
+    const dx = e.clientX - cam.lastX;
+    const dy = e.clientY - cam.lastY;
+    cam.lastX = e.clientX;
+    cam.lastY = e.clientY;
+    // Unrestricted 360° horizontal orbit + clamped elevation above tunnel floor
+    cam.targetTheta -= dx * 0.0065;
+    cam.targetPhi = clamp(cam.targetPhi + dy * 0.0052, 0.045, 1.38);
+    markUserInteraction(performance.now() * 0.001);
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (cam.isDragging) {
+      cam.isDragging = false;
+      markUserInteraction(performance.now() * 0.001);
+    }
+  });
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomDelta = clamp(e.deltaY, -120, 120) * 0.0034;
+    cam.targetRadius = clamp(cam.targetRadius * (1.0 + zoomDelta), 1.35, 6.80);
+    markUserInteraction(performance.now() * 0.001);
+  }, { passive: false });
+
+  // Touch Support: 1-Finger Drag to Look 360° + 2-Finger Pinch to Zoom (with defensive guards for synthetic events)
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.cancelable) e.preventDefault();
+    const now = performance.now() * 0.001;
+    markUserInteraction(now);
+    if (!e.touches || e.touches.length === 0) return;
+    if (e.touches.length === 1) {
+      cam.isDragging = true;
+      cam.lastX = e.touches[0].clientX;
+      cam.lastY = e.touches[0].clientY;
+    } else if (e.touches.length >= 2) {
+      cam.isDragging = false;
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      cam.pinchDist = Math.hypot(dx, dy);
+      cam.lastX = 0.5 * (e.touches[0].clientX + e.touches[1].clientX);
+      cam.lastY = 0.5 * (e.touches[0].clientY + e.touches[1].clientY);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    if (e.cancelable) e.preventDefault();
+    const now = performance.now() * 0.001;
+    markUserInteraction(now);
+    if (!e.touches || e.touches.length === 0) return;
+    if (e.touches.length === 1 && cam.isDragging) {
+      const dx = e.touches[0].clientX - cam.lastX;
+      const dy = e.touches[0].clientY - cam.lastY;
+      cam.lastX = e.touches[0].clientX;
+      cam.lastY = e.touches[0].clientY;
+      cam.targetTheta -= dx * 0.0072;
+      cam.targetPhi = clamp(cam.targetPhi + dy * 0.0058, 0.045, 1.38);
+    } else if (e.touches.length >= 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      if (cam.pinchDist > 8.0 && dist > 8.0) {
+        const scale = cam.pinchDist / dist;
+        cam.targetRadius = clamp(cam.targetRadius * scale, 1.35, 6.80);
+      }
+      cam.pinchDist = dist;
+
+      // Also allow gentle two-finger orbit while pinching
+      const mx = 0.5 * (e.touches[0].clientX + e.touches[1].clientX);
+      const my = 0.5 * (e.touches[0].clientY + e.touches[1].clientY);
+      cam.targetTheta -= (mx - cam.lastX) * 0.0045;
+      cam.targetPhi = clamp(cam.targetPhi + (my - cam.lastY) * 0.0040, 0.045, 1.38);
+      cam.lastX = mx;
+      cam.lastY = my;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    markUserInteraction(performance.now() * 0.001);
+    if (!e.touches || e.touches.length === 0) {
+      cam.isDragging = false;
+      cam.pinchDist = 0;
+    } else if (e.touches.length === 1) {
+      cam.isDragging = true;
+      cam.lastX = e.touches[0].clientX;
+      cam.lastY = e.touches[0].clientY;
+    }
+  }, { passive: false });
+
+  function updateCamera(nowSec, dt) {
+    const idleTime = cam.isDragging ? 0.0 : (nowSec - cam.lastInputTime);
+    // Smoothly ramp automatic cinematic glide weight from 0 -> 1 after IDLE_RESUME_DELAY seconds!
+    const autoWeight = smoothstep(IDLE_RESUME_DELAY, IDLE_RESUME_DELAY + 2.2, idleTime);
+
+    if (autoWeight > 0.001) {
+      cam.autoPhase += dt * autoWeight;
+      // Slow, majestic 360° wind-tunnel inspection glide (~44 seconds per full revolution)
+      cam.targetTheta += dt * 0.142 * autoWeight;
+
+      // Subtle cinematic elevation & distance choreography synchronized with car azimuth!
+      const az = cam.targetTheta;
+      const desiredPhi = 0.21 + 0.08 * Math.sin(az * 1.0 - 0.4) + 0.04 * Math.cos(az * 2.0);
+      const desiredRad = 5.78 + 0.42 * Math.cos(az * 1.0 + 0.6) - 0.22 * Math.sin(az * 2.0);
+      cam.targetPhi = lerp(cam.targetPhi, desiredPhi, 1.0 - Math.exp(-dt * 0.65 * autoWeight));
+      cam.targetRadius = lerp(cam.targetRadius, desiredRad, 1.0 - Math.exp(-dt * 0.55 * autoWeight));
+    }
+
+    // Critically damped exponential smoothing for buttery 60/120Hz responsiveness
+    const damp = 1.0 - Math.exp(-dt * 10.5);
+    cam.theta  = lerp(cam.theta, cam.targetTheta, damp);
+    cam.phi    = lerp(cam.phi, cam.targetPhi, damp);
+    cam.radius = lerp(cam.radius, cam.targetRadius, damp);
+
+    // Aspect-ratio-adaptive framing so narrow/square viewports frame the full 5.5m F1 car & wake without cropping!
+    const aspect = Math.max(0.55, rtWidth / Math.max(1, rtHeight));
+    const aspectScale = clamp(1.50 / aspect, 1.0, 1.56);
+    let effRadius = cam.radius * lerp(1.0, aspectScale, smoothstep(2.4, 4.6, cam.radius));
+
+    // Gaze-aware longitudinal target shift
+    const macroBlend = 1.0 - smoothstep(1.6, 3.8, cam.radius);
+    const lookX = lerp(-0.04, -0.85 * Math.cos(cam.theta), macroBlend * 0.72) + 0.10 * smoothstep(4.2, 6.2, effRadius);
+    const lookY = lerp(0.41, 0.34, macroBlend * 0.6);
+
+    // Ray-accurate tunnel chamber boundary limit so zooming out NEVER clips tunnel walls or ceiling!
+    const cosPhi = Math.cos(cam.phi), sinPhi = Math.sin(cam.phi);
+    const dirX = cosPhi * Math.cos(cam.theta);
+    const dirY = sinPhi;
+    const dirZ = cosPhi * Math.sin(cam.theta);
+    let maxRayR = 9.2;
+    if (Math.abs(dirZ) > 0.01) maxRayR = Math.min(maxRayR, 3.82 / Math.abs(dirZ));
+    if (dirY > 0.01) maxRayR = Math.min(maxRayR, (3.76 - lookY) / dirY);
+    effRadius = Math.min(effRadius, maxRayR);
+
+    const cx = clamp(lookX + effRadius * dirX, -8.5, 9.2);
+    const cy = clamp(lookY + effRadius * dirY, 0.14, 3.82);
+    const cz = effRadius * dirZ;
+
+    return {
+      eye: [cx, cy, cz],
+      target: [lookX, lookY, 0.0]
+    };
+  }
+
+  // ============================================================================
+  // 11. MAIN MULTI-PASS RENDER PIPELINE
+  // ============================================================================
+  const matProj = mat4Identity();
+  const matView = mat4Identity();
+  const matVP   = mat4Identity();
+  const matReflView = mat4Identity();
+  const matReflVP   = mat4Identity();
+  const NEAR_CLIP = 0.12, FAR_CLIP = 34.0;
+
+  function drawOpaqueGeometry(progUniforms, wheelAngle, fanAngle, reflectionSign, isShadowPass) {
+    // 1. Static F1 Car + Wind Tunnel
+    gl.uniform1i(progUniforms.u_mode, 0);
+    gl.uniform3f(progUniforms.u_offset, 0, 0, 0);
+    gl.uniform1f(progUniforms.u_spinAngle, 0);
+    gl.uniform1f(progUniforms.u_reflection, reflectionSign);
+    gl.bindVertexArray(meshStatic.vao);
+    gl.drawElements(gl.TRIANGLES, meshStatic.count, meshStatic.type, 0);
+
+    // 2. 4 Spinning 18-Inch Wheels & Tires (with live rotation + world-space contact patch!)
+    gl.uniform1i(progUniforms.u_mode, 1);
+    gl.uniform1f(progUniforms.u_spinAngle, wheelAngle);
+    for (let i = 0; i < 4; i++) {
+      const w = wheelInstances[i];
+      gl.uniform3f(progUniforms.u_offset, w.pos[0], w.pos[1], w.pos[2]);
+      gl.bindVertexArray(w.mesh.vao);
+      gl.drawElements(gl.TRIANGLES, w.mesh.count, w.mesh.type, 0);
+    }
+
+    // 3. Giant Downstream Rotating Wind-Tunnel Axial Turbine Fan (skip in car tight shadow ortho)
+    if (!isShadowPass) {
+      gl.uniform1i(progUniforms.u_mode, 2);
+      gl.uniform3f(progUniforms.u_offset, fanCenter[0], fanCenter[1], fanCenter[2]);
+      gl.uniform1f(progUniforms.u_spinAngle, fanAngle);
+      gl.bindVertexArray(meshTunnelFan.vao);
+      gl.drawElements(gl.TRIANGLES, meshTunnelFan.count, meshTunnelFan.type, 0);
+    }
+  }
+
+  let prevTime = performance.now() * 0.001;
+  let firstFrameDone = false;
+
+  function renderFrame(nowMs) {
+    const now = nowMs * 0.001;
+    const dt = Math.min(0.05, Math.max(0.001, now - prevTime));
+    prevTime = now;
+
+    resizeRenderTargets();
+
+    // Update Camera
+    const { eye, target } = updateCamera(now, dt);
+    const aspect = rtWidth / rtHeight;
+    mat4Perspective(matProj, 40.0 * Math.PI / 180.0, aspect, NEAR_CLIP, FAR_CLIP);
+    mat4LookAt(matView, eye, target, [0, 1, 0]);
+    mat4Multiply(matVP, matProj, matView);
+
+    // Extract camera right & up vectors from view matrix for billboard wake particles
+    const camRight = [matView[0], matView[4], matView[8]];
+    const camUp    = [matView[1], matView[5], matView[9]];
+
+    // Wheel spin angle synchronized with rolling road speed: omega = V / R_tire!
+    const wheelOmega = WIND_SPEED / TIRE_RADIUS;
+    const wheelAngle = (now * wheelOmega) % TAU;
+    const fanAngle   = (now * 2.65) % TAU;
+
+    // Update Dynamic 3D Smoke Streamlines & Turbulent Wake Particles
+    smokeSystem.update(now, dt, eye);
+
+    // ------------------------------------------------------------------------
+    // PASS 1: OVERHEAD SHADOW MAP (2048x2048)
+    // ------------------------------------------------------------------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboShadow);
+    gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.CULL_FACE);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(progShadow);
+    gl.uniformMatrix4fv(uShadow.u_lightVP, false, matLightVP);
+    drawOpaqueGeometry(uShadow, wheelAngle, fanAngle, 1.0, true);
+
+    // ------------------------------------------------------------------------
+    // PASS 2: REAL-TIME PLANAR FLOOR REFLECTION PASS (Mirrored across y = 0)
+    // ------------------------------------------------------------------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboPlanar);
+    gl.viewport(0, 0, planarW, planarH);
+    gl.clearColor(0.015, 0.020, 0.028, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(progPBR);
+    gl.uniformMatrix4fv(uPBR.u_viewProj, false, matVP);
+    gl.uniformMatrix4fv(uPBR.u_lightVP, false, matLightVP);
+    gl.uniform3f(uPBR.u_camPos, eye[0], eye[1], eye[2]);
+    gl.uniform1f(uPBR.u_time, now);
+    gl.uniform1f(uPBR.u_wheelSpeed, wheelOmega);
+    gl.uniform2f(uPBR.u_resolution, planarW, planarH);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texShadow);
+    gl.uniform1i(uPBR.u_shadowMap, 0);
+
+    drawOpaqueGeometry(uPBR, wheelAngle, fanAngle, -1.0, false);
+
+    // Also render reflected smoke ribbons onto the glossy rolling road!
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.useProgram(progRibbon);
+    gl.uniformMatrix4fv(uRibbon.u_viewProj, false, matVP);
+    gl.uniform3f(uRibbon.u_camPos, eye[0], eye[1], eye[2]);
+    gl.uniform1f(uRibbon.u_reflection, -1.0);
+    gl.uniform2f(uRibbon.u_resolution, planarW, planarH);
+    gl.uniform2f(uRibbon.u_nearFar, NEAR_CLIP, FAR_CLIP);
+    gl.uniform1f(uRibbon.u_time, now);
+    gl.bindVertexArray(smokeSystem.ribbonVao);
+    gl.drawElements(gl.TRIANGLES, smokeSystem.ribbonIndexCount, gl.UNSIGNED_INT, 0);
+
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+
+    // Generate mipmaps on planar reflection texture for physically rough floor reflections!
+    gl.bindTexture(gl.TEXTURE_2D, texPlanarColor);
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    // ------------------------------------------------------------------------
+    // PASS 3: MAIN HDR OPAQUE SCENE PASS (Car, Carbon Weave, Tires, Rolling Road, Tunnel)
+    // ------------------------------------------------------------------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene);
+    gl.viewport(0, 0, rtWidth, rtHeight);
+    gl.clearColor(0.012, 0.016, 0.024, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(progPBR);
+    gl.uniformMatrix4fv(uPBR.u_viewProj, false, matVP);
+    gl.uniformMatrix4fv(uPBR.u_lightVP, false, matLightVP);
+    gl.uniform3f(uPBR.u_camPos, eye[0], eye[1], eye[2]);
+    gl.uniform1f(uPBR.u_time, now);
+    gl.uniform1f(uPBR.u_wheelSpeed, wheelOmega);
+    gl.uniform2f(uPBR.u_resolution, rtWidth, rtHeight);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texShadow);
+    gl.uniform1i(uPBR.u_shadowMap, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, texPlanarColor);
+    gl.uniform1i(uPBR.u_planarRefl, 1);
+
+    drawOpaqueGeometry(uPBR, wheelAngle, fanAngle, 1.0, false);
+
+    // Copy opaque depth buffer to texSceneDepthCopy for soft volumetric smoke intersection!
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboScene);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fboDepthCopy);
+    gl.blitFramebuffer(0, 0, rtWidth, rtHeight, 0, 0, rtWidth, rtHeight, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+
+    // ------------------------------------------------------------------------
+    // PASS 4: VOLUMETRIC WAKE BILLOWS & LAMINAR-TO-VORTEX SMOKE STREAMLINE RIBBONS
+    // ------------------------------------------------------------------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene);
+    gl.viewport(0, 0, rtWidth, rtHeight);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // Premultiplied alpha volumetric compositing
+    gl.depthMask(false);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, texSceneDepthCopy);
+
+    // 4A. Advected 3D Turbulent Wake & Wheel-Wash Billow Clouds
+    gl.useProgram(progParticle);
+    gl.uniformMatrix4fv(uParticle.u_viewProj, false, matVP);
+    gl.uniform3f(uParticle.u_camRight, camRight[0], camRight[1], camRight[2]);
+    gl.uniform3f(uParticle.u_camUp, camUp[0], camUp[1], camUp[2]);
+    gl.uniform1f(uParticle.u_reflection, 1.0);
+    gl.uniform1i(uParticle.u_sceneDepth, 2);
+    gl.uniform2f(uParticle.u_resolution, rtWidth, rtHeight);
+    gl.uniform2f(uParticle.u_nearFar, NEAR_CLIP, FAR_CLIP);
+    gl.uniform1f(uParticle.u_time, now);
+    gl.uniform3f(uParticle.u_camPos, eye[0], eye[1], eye[2]);
+
+    gl.bindVertexArray(smokeSystem.partVao);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, smokeSystem.nParticles);
+
+    // 4B. View-Aligned Volumetric Smoke Streamline Filaments
+    gl.useProgram(progRibbon);
+    gl.uniformMatrix4fv(uRibbon.u_viewProj, false, matVP);
+    gl.uniform3f(uRibbon.u_camPos, eye[0], eye[1], eye[2]);
+    gl.uniform1f(uRibbon.u_reflection, 1.0);
+    gl.uniform1i(uRibbon.u_sceneDepth, 2);
+    gl.uniform2f(uRibbon.u_resolution, rtWidth, rtHeight);
+    gl.uniform2f(uRibbon.u_nearFar, NEAR_CLIP, FAR_CLIP);
+    gl.uniform1f(uRibbon.u_time, now);
+
+    gl.bindVertexArray(smokeSystem.ribbonVao);
+    gl.drawElements(gl.TRIANGLES, smokeSystem.ribbonIndexCount, gl.UNSIGNED_INT, 0);
+
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+
+    // ------------------------------------------------------------------------
+    // PASS 5: DUAL-KAWASE HDR BLOOM PYRAMID
+    // ------------------------------------------------------------------------
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindVertexArray(emptyVao);
+
+    gl.useProgram(progBloomDn);
+    gl.uniform1i(uBloomDn.u_tex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+
+    let prevTex = texSceneColor;
+    let prevW = rtWidth, prevH = rtHeight;
+    for (let i = 0; i < bloomLevels; i++) {
+      const [bw, bh] = bloomSizes[i];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomDownFbos[i]);
+      gl.viewport(0, 0, bw, bh);
+      gl.bindTexture(gl.TEXTURE_2D, prevTex);
+      gl.uniform2f(uBloomDn.u_texelSize, 1.0 / prevW, 1.0 / prevH);
+      gl.uniform1i(uBloomDn.u_firstPass, i === 0 ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      prevTex = bloomDownTexs[i];
+      prevW = bw; prevH = bh;
+    }
+
+    gl.useProgram(progBloomUp);
+    gl.uniform1i(uBloomUp.u_tex, 0);
+    for (let i = bloomLevels - 1; i >= 0; i--) {
+      const [bw, bh] = bloomSizes[i];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomUpFbos[i]);
+      gl.viewport(0, 0, bw, bh);
+      if (i === bloomLevels - 1) {
+        gl.bindTexture(gl.TEXTURE_2D, bloomDownTexs[i]);
+        gl.uniform2f(uBloomUp.u_texelSize, 1.0 / bw, 1.0 / bh);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      } else {
+        // Additive upsample combine onto current mip level
+        gl.bindTexture(gl.TEXTURE_2D, bloomDownTexs[i]);
+        gl.uniform2f(uBloomUp.u_texelSize, 0.0, 0.0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE);
+        const [pw, ph] = bloomSizes[i + 1];
+        gl.bindTexture(gl.TEXTURE_2D, bloomUpTexs[i + 1]);
+        gl.uniform2f(uBloomUp.u_texelSize, 1.0 / pw, 1.0 / ph);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.disable(gl.BLEND);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // PASS 6: FINAL COMPOSITE (FXAA + BLOOM + ACES FILMIC TONEMAP + VIGNETTE)
+    // ------------------------------------------------------------------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, rtWidth, rtHeight);
+    gl.useProgram(progComp);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texSceneColor);
+    gl.uniform1i(uComp.u_scene, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, bloomUpTexs[0]);
+    gl.uniform1i(uComp.u_bloom, 1);
+
+    gl.uniform2f(uComp.u_texelSize, 1.0 / rtWidth, 1.0 / rtHeight);
+    gl.uniform1f(uComp.u_time, now);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (!firstFrameDone) {
+      firstFrameDone = true;
+      document.getElementById('loading').classList.add('hidden');
+    }
+
+    requestAnimationFrame(renderFrame);
+  }
+
+  requestAnimationFrame(renderFrame);
+})();
+</script>
+</body>
+</html>

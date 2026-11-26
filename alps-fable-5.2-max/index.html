@@ -1,0 +1,1567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Alpine Window Seat</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavior:none;
+  font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none;outline:none}
+#c.drag{cursor:grabbing}
+#hud{position:fixed;left:0;right:0;bottom:calc(22px + env(safe-area-inset-bottom));text-align:center;color:#fff;
+  font-size:11px;font-weight:500;letter-spacing:.24em;text-transform:uppercase;opacity:0;
+  transition:opacity 1.8s ease;pointer-events:none;text-shadow:0 1px 10px rgba(0,0,0,.85)}
+#hud.on{opacity:.78}
+#err{position:fixed;inset:0;display:none;padding:28px;color:#f4d7c8;background:#120c0a;
+  font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;overflow:auto;z-index:9}
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="View from a train window crossing the Alps"></canvas>
+<div id="hud">Drag to look around &nbsp;·&nbsp; Scroll or pinch to zoom</div>
+<div id="err"></div>
+<script id="g-common" type="x-shader/x-fragment">
+// ───────────────────────── shared: noise, track geometry, terrain height ─────────────────────────
+const float PI=3.14159265;
+const float PERIOD=4800.;                 // route program repeats every 4.8 km (mountains do not)
+const float TK1=2.*PI*2./PERIOD, TK2=2.*PI*5./PERIOD;
+const float TA1=105., TA2=26., TP1=.6, TP2=1.9;
+const vec2  TUN_A=vec2(3900.,4500.), TUN_B=vec2(1750.,2000.);   // tunnels (route metres)
+const float VIA0=3452., VIA1=3688., GORGE_X=3570.;              // viaduct over the side gorge
+const float VILA_X=2450., VILA_Z=100., VILA_Y=-30.;             // hamlet below the track
+const float VILB_X=1050.;                                       // lakeside village
+const float WATER=-128.;
+const mat2  M2=mat2(.8,-.6,.6,.8);
+
+uniform sampler2D uNoise;   // lattice value + its 3 neighbours, NEAREST
+uniform sampler2D uHash;    // 4 independent random channels, NEAREST
+uniform sampler2D uSmooth;  // same data as uHash, LINEAR
+uniform sampler2D uRoute;   // per-metre route profile over one 4.8 km cycle: r lake(+) / dense forest(-), g tunnel spur height, b gorge, a valley offset
+uniform sampler2D uForest;  // tiling forest-cover noise (2160 m): r cover, g tree-line jitter
+uniform sampler2D uBake;    // mountain relief baked once at start-up (30.4 km tile): r relief, gb slope accumulator, a massif
+
+float ss(float a,float b,float x){float t=clamp((x-a)/(b-a),0.,1.);return t*t*(3.-2.*t);}   // edges may be given in either order
+float sat(float x){return clamp(x,0.,1.);}
+vec4 hash4(vec2 c){return texelFetch(uHash,ivec2(floor(c))&255,0);}
+vec3 noised(vec2 x){
+  vec2 i=floor(x),f=x-i,u=f*f*(3.-2.*f),du=6.*f*(1.-f);
+  vec4 t=texelFetch(uNoise,ivec2(i)&255,0);
+  float k1=t.y-t.x,k2=t.z-t.x,k4=t.x-t.y-t.z+t.w;
+  return vec3(t.x+k1*u.x+k2*u.y+k4*u.x*u.y,du*(vec2(k1,k2)+k4*u.yx));
+}
+vec4 vnoise4(vec2 x){vec2 i=floor(x),f=x-i;f=f*f*(3.-2.*f);return textureLod(uSmooth,(i+f+.5)/256.,0.);}
+float vnoise(vec2 x){return vnoise4(x).x;}
+float fbm(vec2 p){float a=0.,b=.5;for(int i=0;i<4;i++){a+=b*vnoise(p);p=M2*p*2.03;b*=.5;}return a;}
+// Eroded relief: the 5 coarse octaves come from the baked tile, finer ones are added live.
+// Octaves are damped by the accumulated slope; a fractional octave count fades the last one in.
+float gLod=0.;            // mip level for the baked relief: the marcher uses coarse levels while far above the ground
+float relief(vec2 q,float oct,out float massif){
+  vec4 B=textureLod(uBake,q/30400.,gLod);
+  massif=B.a;
+  float a=B.r;
+  if(oct>5.){
+    float b=1./32.;vec2 d=B.gb,p=q*(32./1900.);
+    for(int i=5;i<11;i++){
+      float w=min(oct-float(i),1.);if(w<=0.)break;
+      vec3 n=noised(p);d+=n.yz;a+=w*b*(n.x-.5)/(1.+dot(d,d));b*=.5;p=M2*p*2.;
+    }
+  }
+  return a;
+}
+
+float trackZ(float x){return TA1*sin(TK1*x+TP1)+TA2*sin(TK2*x+TP2);}
+float trackD(float x){return TA1*TK1*cos(TK1*x+TP1)+TA2*TK2*cos(TK2*x+TP2);}
+bool inTunnel(float xm){return (xm>TUN_A.x&&xm<TUN_A.y)||(xm>TUN_B.x&&xm<TUN_B.y);}
+
+// Macro terrain before the railway bench is cut. g = (zr, u, yFloor, lake(+)/dense forest(-))
+float hBase(vec2 q,float oct,out vec4 g){
+  float x=q.x,xm=mod(x,PERIOD);
+  float zr=q.y-trackZ(x);
+  vec4 L=textureLod(uRoute,vec2(x/PERIOD,.5),0.);
+  float lake=max(L.x,0.),zv=L.w;                                   // valley axis, to the window side
+  float u=zr-zv,a=abs(u);
+  float yF=-112.-28.*lake;
+  float a0=mix(75.,290.,lake);
+  float b=max(a-a0,0.);
+  float nm,rel=relief(q,oct,nm);
+  float w;
+  if(u>0.) w=(1300.+1500.*nm)*(1.-exp(-b/4200.));
+  else{float r=b/(zv-a0);w=-yF*(r<1.?pow(r,1.3):1.+1.3*(r-1.)/(1.+.45*(r-1.)));}
+  float amp=1500.*ss(100.,4300.,a)*(.025+.975*ss(12.,520.,abs(zr)));
+  float h=yF+w+amp*rel;
+  g=vec4(zr,u,yF,L.x);
+  // spurs the tunnels pass under
+  if(L.y>0.) h+=L.y*(1.-ss(90.,560.,zr));
+  // side gorge crossed by the viaduct
+  if(L.z>0.) h-=L.z*ss(40.,-60.,u)*ss(-1500.,-600.,zr)*max(h-max(-66.-.11*zr,yF+1.),0.);
+  // village terraces
+  if(abs(xm-VILA_X)<170.) h=mix(h,VILA_Y,(1.-ss(.55,1.,length(vec2(xm-VILA_X,zr-VILA_Z)/vec2(165.,62.))))*.93);
+  if(abs(xm-VILB_X)<205.) h=mix(h,yF+21.,(1.-ss(.5,1.,length(vec2(xm-VILB_X,u+a0+98.)/vec2(200.,70.))))*.93);
+  return h;
+}
+// railway bench: cut / fill slopes, open under the viaduct, untouched above tunnels
+float bench(float h,float zr,float xm){
+  if(inTunnel(xm)) return h;
+  float w=max(abs(zr)-3.3,0.);
+  float lo=-.72*w-((xm>VIA0&&xm<VIA1)?400.:0.);
+  return clamp(h,lo,(zr<0.?1.15:1.2)*w);
+}
+// where conifers grow (0..1), ignoring the cleared railway corridor. t: distance (level of detail)
+float forestField(vec2 q,float h,vec4 g,float t){
+  float xm=mod(q.x,PERIOD);
+  vec4 fn=textureLod(uForest,q/2160.,max(log2(t*.00028),0.));
+  float thr=mix(.5,.2,max(-g.w,0.))-.17*ss(0.,300.,g.y);
+  float m=ss(thr,thr+.13,fn.x);
+  m*=ss(g.z+3.,g.z+16.,h)*(1.-ss(380.,560.,h+60.*fn.y));
+  if(abs(xm-VILA_X)<210.) m*=ss(.9,1.25,length(vec2(xm-VILA_X,g.x-VILA_Z)/vec2(165.,62.)));
+  if(abs(xm-VILB_X)<255.) m*=ss(.9,1.25,length(vec2(xm-VILB_X,g.y+mix(75.,290.,max(g.w,0.))+98.)/vec2(200.,70.)));
+  return m;
+}
+// beyond the trackside rows the forest is part of the height field
+float forestMask(vec2 q,float h,vec4 g,float t){
+  return forestField(q,h,g,t)*ss(40.,58.,abs(g.x));
+}
+// conifer canopy as a height field: individual cones near, lumpy blanket far
+float canopy(vec2 q,float m,float t){
+  if(m<.01) return 0.;
+  float lump=11.*m*(.75+.5*vnoise(q/7.))*(1.-ss(1800.,2600.,t));
+  if(t>650.) return lump;
+  vec2 c=q/6.4,i=floor(c),f=c-i;vec4 r=hash4(i);
+  vec2 o=.5+(r.xy-.5)*.62,dv=f-o;float d=length(dv)*6.4;
+  d*=1.+.5*(vnoise(vec2(atan(dv.y,dv.x)*1.9+r.x*20.,r.w*31.))-.5);           // ragged outline
+  float cone=m>.15+.5*r.z?(7.+16.*r.w*r.w)*pow(max(0.,1.-d/(1.2+1.5*r.z)),.85):0.;
+  return mix(cone,lump,ss(380.,650.,t));
+}
+// ground height; t = ray distance (level of detail). g as in hBase
+// yq: height of the query point; small relief is only worth evaluating close to the surface
+float ground(vec2 q,float t,float oct,float yq,out vec4 g){
+  float h=hBase(q,oct,g);
+  if(t<450.&&yq-h<4.){
+    float k=(1.-ss(250.,450.,t));
+    vec4 n=vnoise4(q/23.);
+    h+=k*(1.5*(n.x-.5)+.4*(vnoise(q/5.3)-.5))*ss(3.5,9.,abs(g.x));
+  }
+  return bench(h,g.x,mod(q.x,PERIOD));
+}
+</script>
+<script id="g-world" type="x-shader/x-fragment">
+// ───────────────────────── sky, atmosphere, terrain marching and shading, lake ─────────────────────────
+uniform vec3 uSun;          // direction to the sun (world)
+uniform float uTime,uBlur;  // uBlur: metres travelled while the shutter is open
+uniform vec2 uFwd;          // track tangent (xz)
+const vec3 SUNC=vec3(1.,.87,.68)*5.;
+float objShadow(vec3 p);    // train, viaduct, houses – defined with the objects
+
+vec3 skyBase(vec3 rd){
+  float y=max(rd.y,0.),mu=max(dot(rd,uSun),0.);
+  vec3 c=mix(vec3(.46,.63,.88)*3.,vec3(.085,.22,.60)*2.3,pow(y,.4));
+  c+=vec3(1.,.72,.42)*(pow(mu,6.)*.9+pow(mu,60.)*3.);
+  c=mix(c,vec3(.78,.79,.80)*3.1,pow(1.-y,12.)*.5);
+  return c;
+}
+float cloudD(vec2 q){
+  q+=uTime*vec2(7.,2.5);
+  return ss(.5,.76,fbm(q/2600.)*.92+vnoise(q/390.)*.12);
+}
+vec3 sky(vec3 ro,vec3 rd){
+  vec3 c=skyBase(rd);
+  float mu=dot(rd,uSun);
+  c+=vec3(1.,.9,.72)*ss(.99955,.9997,mu)*500.;
+  if(rd.y>.004){
+    float t=(9000.-ro.y)/rd.y;vec2 q=ro.xz+rd.xz*t;
+    float ci=ss(.42,.85,fbm(q*vec2(.35,1.)/5200.+4.)*.8+vnoise(q/21000.)*.4)*exp(-t/90000.);
+    c=mix(c,vec3(1.,.96,.9)*4.2,ci*.55);
+    t=(3600.-ro.y)/rd.y;q=ro.xz+rd.xz*t;
+    float d=cloudD(q);
+    if(d>.001){
+      float lit=cloudD(q+uSun.xz*520.);
+      vec3 cc=mix(vec3(1.,.95,.87)*6.,vec3(.52,.60,.74)*2.3,sat(lit*1.3+.15*(1.-d)));
+      c=mix(c,cc,d*exp(-t/52000.));
+    }
+  }
+  return c;
+}
+// aerial perspective: exponential-height haze, bluer extinction, warm in-scatter toward the sun
+vec3 fog(vec3 col,vec3 rd,float t,float y0){
+  float k=rd.y*t/1500.;
+  float f=abs(k)<1e-3?1.:(1.-exp(-k))/k;
+  float od=2.1e-5*t*exp(-max(y0+112.,0.)/1500.)*f;
+  vec3 T=exp(-od*vec3(.72,1.,1.5));
+  float mu=max(dot(rd,uSun),0.);
+  vec3 fc=mix(vec3(.45,.60,.84)*2.3,vec3(1.,.80,.58)*3.4,pow(mu,4.)*.65);
+  return col*T+fc*(1.-T);
+}
+
+// marching version: canopy is only evaluated when the ray is low enough to touch it
+float terrainM(vec3 p,float t,out vec4 g,out float fm,out float cz){
+  float h=ground(p.xz,t,t<1500.?6.:t<6000.?5.:4.,p.y,g);
+  fm=0.;cz=0.;
+  if(t<2600.&&p.y-h<70.){fm=forestMask(p.xz,h,g,t);if(p.y-h<24.) cz=canopy(p.xz,fm,t);}
+  return h;
+}
+// height-field march. returns distance or -1
+float march(vec3 ro,vec3 rd,float tmin,float tmax,int steps){
+  float t=tmin,lt=tmin,fm,cz;vec4 g;
+  gLod=0.;
+  for(int i=0;i<steps;i++){
+    vec3 p=ro+rd*t;
+    if(p.y>3400.&&rd.y>=0.){gLod=0.;return -1.;}
+    float h=terrainM(p,t,g,fm,cz);
+    float d=p.y-h-cz;
+    if(i==0&&d<0.&&tmin>.06){t=lt=tmin=.05;continue;}           // the head start from the prepass was too generous
+    if(d<.0012*t+gLod*4.){
+      if(gLod>0.){gLod=0.;t=mix(lt,t,.5);continue;}            // re-examine at full detail
+      float a=lt,b=t;
+      for(int j=0;j<5;j++){
+        float m=.5*(a+b);vec3 pm=ro+rd*m;
+        float hm=terrainM(pm,m,g,fm,cz);
+        if(pm.y-hm-cz<.0012*m)b=m;else a=m;
+      }
+      return b;
+    }
+    lt=t;
+    float st,K=t<400.?.55:.72;
+    if(fm>.01) st=d>24.?(d-22.)*K+.5:clamp(d*.35,.3+.003*t,2.5+.005*t);   // above / inside the canopy layer
+    else st=max(d*K,.03+.003*t);
+    gLod=floor(clamp(log2(max(d,1.)/50.),0.,5.));
+    t+=st;
+    if(t>tmax){gLod=0.;return -1.;}
+  }
+  gLod=0.;
+  return t;
+}
+// surface normal with canopy (returned) and of the bare ground (ng)
+vec3 terrainN(vec3 p,float t,out vec3 ng,out vec4 g,out float fm,out float cz){
+  float oct=clamp(1.+log2(633000./max(t,20.)),5.,11.);
+  float e=max(.0012*t,.06);vec4 g1;
+  float h0=ground(p.xz,t,oct,-1e5,g);
+  fm=forestMask(p.xz,h0,g,t);cz=canopy(p.xz,fm,t);
+  float hx=ground(p.xz+vec2(e,0.),t,oct,-1e5,g1),hz=ground(p.xz+vec2(0.,e),t,oct,-1e5,g1);
+  ng=normalize(vec3(h0-hx,e,h0-hz));
+  if(fm<.01) return ng;
+  float cx=canopy(p.xz+vec2(e,0.),fm,t),cy=canopy(p.xz+vec2(0.,e),fm,t);
+  return normalize(vec3(h0+cz-hx-cx,e,h0+cz-hz-cy));
+}
+float shadowT(vec3 p){
+  float res=1.,t=3.;vec4 g;
+  for(int i=0;i<16;i++){
+    vec3 q=p+uSun*t;
+    if(q.y>3300.) break;
+    float h=q.y-ground(q.xz,600.,4.,1e5,g);
+    res=min(res,10.*h/t);
+    if(res<.01) break;
+    t+=clamp(h*.75,3.+t*.16,600.);
+  }
+  return ss(0.,1.,res);
+}
+float cloudSh(vec3 p){return 1.-.6*cloudD(p.xz+uSun.xz*((3600.-p.y)/uSun.y));}
+// detail noise box-filtered along the direction of travel (motion blur of ground texture)
+vec4 streak(vec2 q,float f,float t){
+  if(t>150.) return vnoise4(q*f);
+  vec4 a=vec4(0.);
+  for(int i=0;i<4;i++) a+=vnoise4((q+uFwd*((float(i)-1.5)*uBlur*.25))*f);
+  return a*.25;
+}
+float tubeR(vec3 p,float zr){   // radial distance from the tunnel axis
+  float c=inversesqrt(1.+trackD(p.x)*trackD(p.x));
+  return length(vec2(p.y-2.3,zr*c));
+}
+float portalDist(float xm){
+  return min(min(abs(xm-TUN_A.x),abs(xm-TUN_A.y)),min(abs(xm-TUN_B.x),abs(xm-TUN_B.y)));
+}
+
+vec3 shadeTerrain(vec3 p,vec3 rd,float t,bool lite){
+  vec4 g;float fm,cz;vec3 ng;
+  vec3 n=terrainN(p,t,ng,g,fm,cz);
+  float xm=mod(p.x,PERIOD),zr=g.x,alt=p.y;
+  // tunnel mouth painted on the portal face
+  float pd=portalDist(xm),tr=tubeR(p,zr);
+  if(inTunnel(xm)&&tr<3.4) return vec3(.012,.011,.01)*(1.+3.*exp(-pd*.25));
+  vec4 nA=vnoise4(p.xz/57.),nL=vnoise4(p.xz/900.+11.);
+  vec4 nB=streak(p.xz,1./2.3,t);
+  float fine=t<90.?streak(p.xz,1./.33,t).x:.5;
+  float slope=ng.y;
+  // meadow: several greens, drier and yellower where the ground is convex or high
+  vec3 grass=mix(vec3(.042,.088,.022),vec3(.115,.15,.04),nA.x*.55+nL.y*.45);
+  grass=mix(grass,vec3(.03,.062,.02),ss(.5,.8,nA.w)*.7);
+  grass=mix(grass,vec3(.16,.15,.055),ss(.62,.9,nL.w)*.5);
+  vec4 nM=vnoise4(p.xz/11.3+5.);                                          // tussocks, wet hollows, worn ground
+  grass*=.72+.56*mix(nM.x,.5,ss(900.,2500.,t));
+  grass=mix(grass,vec3(.09,.085,.05),ss(.72,.9,nM.y)*ss(.5,.75,nA.z)*.6*ss(1500.,500.,t));
+  grass*=(.7+.6*nB.y)*(.75+.5*fine);
+  if(t<60.) grass=mix(grass,vec3(.42,.36,.12),ss(.8,.95,nB.w)*ss(.55,.8,nA.y)*.5);      // buttercups by the line
+  if(t<3500.){                                                            // lone trees and shrubs dotting the pastures
+    vec2 c=p.xz/34.,ci=floor(c);vec4 r=hash4(ci+77.);
+    float dd=length(c-ci-.5-(r.xy-.5)*.6)*34.;
+    grass=mix(grass,vec3(.02,.04,.018),step(r.z,.3)*ss(5.5,2.5,dd)*ss(3500.,2000.,t));
+  }
+  grass=mix(grass,vec3(.15,.135,.07),ss(330.,760.,alt));
+  vec3 rock=mix(vec3(.15,.145,.14),vec3(.29,.255,.21),nA.z)*(.6+.8*nB.x);
+  rock*=(.75+.5*vnoise(vec2(alt*.11+nA.y*5.,p.x*.004)))*(.7+.6*fine);
+  float rk=ss(.78,.58,slope+(nB.x-.5)*.16);
+  rk=max(rk,ss(650.,1150.,alt+260.*nL.x)*.85);
+  vec3 alb=mix(grass,rock,rk);
+  alb=mix(alb,vec3(.33,.31,.26),ss(WATER+3.5,WATER+.4,alt)*max(g.w,0.));               // lake shore
+  float gg=textureLod(uRoute,vec2(p.x/PERIOD,.5),0.).z;
+  alb=mix(alb,vec3(.34,.45,.47)*(.7+.9*nB.x),ss(.993,.999,gg)*step(alt,-20.)*step(g.y,0.));   // gorge torrent
+  // railway corridor
+  float az=abs(zr);
+  if(az<9.&&alt<1.5&&alt>-6.){
+    vec3 ballast=vec3(.19,.165,.145)*(.55+.9*nB.z)*(.7+.6*fine);
+    alb=mix(ballast,alb,ss(2.9,4.6,az+(nB.w-.5)*1.4));
+    if(az>3.8&&az<4.25) alb=mix(alb,vec3(.40,.39,.37),.75);                             // cable trough lids
+  }
+  // retaining wall + ring around tunnel portals
+  if(pd<9.&&slope<.5&&az<12.){
+    alb=mix(alb,vec3(.34,.33,.31)*(.7+.5*nB.x),ss(11.,6.,tr));
+    alb=mix(alb,vec3(.5,.49,.47),ss(4.3,4.1,tr)*ss(3.3,3.5,tr));
+  }
+  // snow: above a wandering snow line, where it is flat enough to hold, more in the shade
+  float sline=930.+420.*(nL.z-.5);
+  float sn=sat((alt-sline)/230.+(slope-.62)*2.2+(nB.z-.5)*.6-.3*dot(ng,uSun))*ss(.26,.46,slope);
+  alb=mix(alb,vec3(.80,.84,.90),sn);
+  // forest: individual cones nearby, a textured blanket beyond
+  float ff=forestField(p.xz,alt,g,t);
+  bool blanket=t>650.;
+  float fb=blanket?ss(.06,.4,fm):step(.4,cz);
+  vec3 nl=n;float selfSh=1.,ao=1.;
+  if(ff>.01){
+    vec3 fo=mix(vec3(.016,.036,.019),vec3(.036,.064,.026),nA.y);
+    alb=mix(alb,vec3(.03,.034,.02),ff*.8*(1.-fb));                 // needle litter between the trees
+    if(fb>0.){
+      float crown=.5;
+      if(t<2600.){                                                 // sunlit crowns as jittered dots, not lattice noise
+        vec2 c=p.xz/6.4,ci=floor(c);vec4 r=hash4(ci);
+        crown=(1.-ss(.15,.6,length(c-ci-.5-(r.xy-.5)*.62)))*(.35+.65*r.z)+.18*nA.x;
+        crown=mix(crown,.42,ss(1100.,2600.,t));
+      }
+      // near cones: whorls of boughs as bands up the tree, needles breaking up the smooth surface
+      float bough=.55+.45*fract(cz*.42+nA.x*3.)+.5*(nB.x-.5);
+      alb=mix(alb,fo*(blanket?.4+1.3*crown*crown:(.35+.6*sat(cz/16.))*bough),fb);
+      if(blanket){nl=normalize(mix(ng,n,.3));selfSh=mix(1.,.7,fb);ao=mix(1.,.8,fb);}
+      else{nl=normalize(mix(ng,n,.55));selfSh=(.2+.6*ss(.15,.8,cz/14.))*(.6+.4*bough);ao=.35+.65*sat(cz/15.);}
+    }else{selfSh=1.-.75*ff;ao=1.-.5*ff;}
+  }
+  float ndl=max(dot(nl,uSun),0.);
+  float sh=0.;
+  if(ndl>0.){
+    sh=cloudSh(p)*selfSh;
+    if(!lite) sh*=shadowT(p+vec3(0.,.4+.002*t,0.))*objShadow(p);
+  }
+  vec3 skyA=vec3(.36,.52,.82)*1.75*(.5+.5*nl.y)*ao;
+  vec3 bnc=vec3(.42,.40,.30)*.45*(.6-.4*nl.y)*ao;
+  vec3 col=alb*(SUNC*ndl*sh+skyA+bnc);
+  col+=sn*SUNC*sh*.05*pow(ndl,.4);
+  return col;
+}
+// cheap geometric march for the lake's mirror image
+float marchRefl(vec3 ro,vec3 rd){
+  float t=25.,lt=0.;vec4 g;
+  gLod=2.;
+  for(int i=0;i<22;i++){
+    vec3 p=ro+rd*t;
+    if(p.y>3400.) break;
+    if(p.y<ground(p.xz,2000.,5.,1e5,g)){
+      float a=lt,b=t;
+      for(int j=0;j<4;j++){float m=.5*(a+b);vec3 pm=ro+rd*m;if(pm.y<ground(pm.xz,2000.,5.,1e5,g))b=m;else a=m;}
+      gLod=0.;return b;
+    }
+    lt=t;t*=1.34;
+  }
+  gLod=0.;
+  return -1.;
+}
+vec3 shadeWater(vec3 p,vec3 rd,float t){
+  vec2 q=p.xz;vec4 g;
+  float wind=ss(.36,.64,vnoise(q*vec2(1.,2.6)/700.+uTime*.01));              // ruffled versus glassy water
+  vec3 d1=noised(q/13.+uTime*vec2(.22,.1)),d2=noised(q/3.7-uTime*vec2(.19,.3));
+  vec2 sl=(d1.yz*.65+d2.yz*.35/(1.+t*.004))*mix(.008,.06,wind);
+  vec3 n=normalize(vec3(-sl.x,1.,-sl.y));
+  float fr=.02+.98*pow(1.-max(dot(-rd,n),0.),5.);
+  vec3 rr=reflect(rd,n);rr.y=abs(rr.y)+.003;rr=normalize(rr);
+  vec3 refl=sky(p,rr);
+  float tr=marchRefl(p,rr);
+  if(tr>0.){vec3 pr=p+rr*tr;refl=fog(shadeTerrain(pr,rr,tr,true),rr,tr,p.y);}
+  float depth=WATER-ground(q,2000.,4.,1e5,g);
+  float sh=cloudSh(p);
+  // glacial flour: milky blue-green, paler in the shallows
+  vec3 body=mix(vec3(.12,.30,.28),vec3(.02,.10,.115),1.-exp(-depth/5.))*(.9+2.2*sh);
+  vec3 col=mix(body,refl,fr);
+  col+=SUNC*sh*pow(max(dot(rr,uSun),0.),260.)*3.*wind;
+  return col;
+}
+</script>
+<script id="g-near" type="x-shader/x-fragment">
+// ───────────────────────── tunnel interior and analytically motion-blurred trackside layers ─────────────────────────
+uniform vec2 uTun;        // world-x range of the tunnel nearest the camera
+uniform float uTrainX;    // world x of the camera's carriage
+
+// overlap of [a0,a1] with [b0,b1], as a fraction of the first interval (box-filtered coverage)
+float cover(float a0,float a1,float b0,float b1){return sat((min(a1,b1)-max(a0,b0))/max(a1-a0,1e-4));}
+
+// Ray marched inside the tunnel tube. exits=true when the ray leaves through a portal at pe.
+vec3 tunnel(vec3 ro,vec3 rd,out bool exits,out vec3 pe){
+  float t=0.;vec3 p=ro;exits=false;pe=ro;
+  for(int i=0;i<48;i++){
+    p=ro+rd*t;
+    if(p.x<uTun.x||p.x>uTun.y){
+      exits=true;
+      float xe=rd.x>0.?uTun.y:uTun.x;
+      pe=ro+rd*((xe-ro.x)/rd.x);
+      return vec3(0.);
+    }
+    float d=min(3.4-tubeR(p,p.z-trackZ(p.x)),p.y);
+    if(d<.004) break;
+    t+=d*.92;
+  }
+  float s=mod(p.x,PERIOD),b=uBlur;
+  float pd=min(p.x-uTun.x,uTun.y-p.x);                 // distance to the nearest portal
+  float zr=p.z-trackZ(p.x);
+  float v=atan(p.y-2.3,abs(zr))*3.4;                  // arc length up the wall
+  // rough shotcrete: every feature is smeared along the direction of travel
+  float tex=0.;
+  for(int i=0;i<4;i++) tex+=vnoise(vec2((s+(float(i)-1.5)*b*.25)*1.6,v*4.1));
+  tex=tex*.25*.5+vnoise(vec2(s*.21,v*17.))*.3+vnoise(vec2(s*.07,v*1.3))*.4;
+  vec3 alb=vec3(.21,.2,.185)*(.25+1.4*tex);
+  float joint=mod(s,6.)-3.;                                  // casting joints flick past as faint bands
+  alb*=1.-.35*cover(joint-.5*b,joint+.5*b,-.04,.04);
+  bool floorHit=p.y<.03;
+  if(floorHit) alb=vec3(.12,.105,.095)*(.6+.6*vnoise(vec2(s*.4,zr*9.)));
+  else{
+    float cab=ss(.045,.02,abs(p.y-3.0))+ss(.035,.015,abs(p.y-3.16))+ss(.03,.012,abs(p.y-3.29));
+    alb*=1.-.8*sat(cab);
+    alb=mix(alb,vec3(.5,.5,.47),ss(.05,.03,abs(p.y-1.12))*.8);     // painted guide line
+  }
+  // light from the carriage windows: steady pools that travel with the train
+  float xc=(p.x-uTrainX)/max(uFwd.x,.5);
+  float pool=pow(.55+.45*cos(6.2832*xc/1.9),1.5)*step(abs(xc),62.);
+  vec3 E=vec3(1.,.85,.64)*.05*pool*exp(-pow((p.y-2.5)/1.25,2.));
+  // emergency lamps every 24 m: pool and fixture both box-blurred along the track
+  float ds=mod(s+12.,24.)-12.,dy=p.y-3.55,c=sqrt(dy*dy+.3);
+  float lampPool=(atan((ds+.5*b)/c)-atan((ds-.5*b)/c))/(b*c);
+  E+=vec3(1.,.74,.42)*.11*lampPool*step(.03,p.y);
+  // daylight creeping in from the portals
+  E+=vec3(.55,.68,.9)*2.*exp(-pd/4.5);
+  vec3 col=alb*E;
+  if(!floorHit){
+    float fix=cover(ds-.5*b,ds+.5*b,-.22,.22)*ss(.07,.04,abs(dy+.0));
+    col+=vec3(1.,.8,.5)*26.*fix;
+    float sign2=mod(s+60.,120.)-60.;                             // green escape-route signs
+    col+=vec3(.1,1.,.35)*1.1*cover(sign2-.5*b,sign2+.5*b,-.2,.2)*ss(.1,.07,abs(p.y-2.05));
+  }
+  return col;
+}
+
+// distance along the ray to the vertical surface running parallel to the track at lateral offset zrRow
+float rowHit(vec3 ro,vec3 rd,float zrRow){
+  float den=rd.z-trackD(ro.x)*rd.x;
+  float g0=ro.z-trackZ(ro.x)-zrRow;
+  if(abs(den)<1e-4||-g0/den<=0.) return -1.;
+  float t=-g0/den;
+  for(int i=0;i<2;i++){
+    float x=ro.x+rd.x*t;
+    float dn=rd.z-trackD(x)*rd.x;
+    if(abs(dn)<1e-4) return -1.;
+    t-=(ro.z+rd.z*t-trackZ(x)-zrRow)/dn;
+  }
+  return t>0.?t:-1.;
+}
+float gTreeSh=-1.;      // sunlight at the trackside trees, evaluated once per pixel
+// A row of spruces as camera-facing silhouettes; coverage is integrated over the shutter interval.
+void treeRow(vec3 ro,vec3 rd,float zrRow,float cell,float seed,float tmax,inout vec3 acc,inout float trans){
+  if(trans<.02) return;
+  float t=rowHit(ro,rd,zrRow);
+  if(t<0.||t>min(tmax+40.,340.)) return;
+  vec3 ph=ro+rd*t;
+  vec2 dh=rd.xz;float dl=length(dh);if(dl<1e-3) return;
+  vec2 dn=dh/dl;
+  if(abs(ph.y)>70.) return;
+  vec4 g;float gh=ground(ph.xz,500.,3.,1e5,g);            // ground where the ray crosses the row
+  float xm=mod(ph.x,PERIOD);
+  float dens=max(forestField(ph.xz,gh,g,50.),.045)*ss(25.,70.,portalDist(xm));
+  if(zrRow>0.) dens*=1.-.75*max(g.w,0.);                   // keep the lake view open
+  if(xm>VIA0-25.&&xm<VIA1+25.) return;
+  float sinA=abs(uFwd.x*dn.y-uFwd.y*dn.x);
+  float i0=floor(ph.x/cell);
+  for(int k=-1;k<=1;k++){
+    float i=i0+float(k);
+    vec4 r=hash4(vec2(i,seed)),r2=hash4(vec2(i+31.,seed+9.));
+    if(r2.x>dens) continue;
+    float sc=(i+.5+(r.x-.5)*.7)*cell;
+    vec2 c=vec2(sc,trackZ(sc)+zrRow+(r.y-.5)*3.6);
+    vec2 rel=c-ro.xz;
+    float tc=dot(rel,dn)/dl;
+    if(tc<.5||tc>tmax) continue;
+    float dp=rel.x*dn.y-rel.y*dn.x;                        // signed distance from the ray to the trunk axis
+    float H=6.+17.*r.z*r.z+4.*r2.y,R=H*(.12+.06*r.w),base=gh-.5;
+    float yn=(ro.y+rd.y*tc-base)/H;
+    if(yn<0.||yn>1.) continue;
+    float tier=1.-fract(yn*(7.+5.*r.w)+r.x*3.);            // drooping whorls of boughs
+    float nz=vnoise(vec2(yn*33.+r.y*9.,i*.37+seed));
+    float w=yn<.07?.16:R*pow(1.-yn,.8)*(.45+.3*tier+.4*nz);
+    float hb=.5*uBlur*sinA+.0009*tc;
+    float cov=.5*cover(dp-hb,dp+hb,-w,w)+.5*cover(dp-hb,dp+hb,-w*.68,w*.68);   // feathered outer boughs
+    if(cov<.003) continue;
+    if(gTreeSh<0.){vec3 P=vec3(c.x,base+H*.6,c.y);gTreeSh=shadowT(P)*cloudSh(P);}
+    float u=clamp(dp/max(w,.05),-1.,1.),su=sqrt(1.-u*u);
+    vec3 n=normalize(vec3(-dn.x*su+dn.y*u,.3,-dn.y*su-dn.x*u));
+    float lit=ss(-.15,.75,dot(n,uSun))*gTreeSh;
+    vec3 alb=yn<.07?vec3(.05,.036,.026):mix(vec3(.014,.032,.017),vec3(.034,.06,.024),r.w)*(.5+.5*tier)*(.65+.7*nz);
+    vec3 col=alb*(SUNC*lit*(.25+.75*yn)*.6+vec3(.33,.49,.8)*(.22+.6*yn));
+    acc+=trans*cov*col;trans*=1.-cov;
+  }
+}
+// wooden fence beside the meadows: rails stay sharp, posts dissolve into the motion
+void fence(vec3 ro,vec3 rd,float tmax,inout vec3 acc,inout float trans){
+  float t=rowHit(ro,rd,5.4);
+  if(t<0.||t>min(tmax,220.)) return;
+  vec3 p=ro+rd*t;float xm=mod(p.x,PERIOD);
+  float on=ss(2040.,2070.,xm)*(1.-ss(2840.,2870.,xm))+ss(4560.,4590.,xm)+(1.-ss(215.,245.,xm));
+  if(on<.01) return;
+  if(abs(p.y)>40.) return;
+  vec4 g;float y=p.y-ground(p.xz,t,5.,-1e5,g);
+  if(y<0.||y>1.25) return;
+  float px=.0011*t;
+  float rail=max(ss(.05+px,.05-px,abs(y-.56)),ss(.05+px,.05-px,abs(y-1.02)));
+  float ds=mod(p.x,2.4)-1.2;
+  float post=cover(ds-.5*uBlur-px,ds+.5*uBlur+px,-.065,.065)*step(y,1.15);
+  float cov=max(rail,post)*on;
+  vec3 col=vec3(.2,.17,.135)*(.7+.5*vnoise(vec2(p.x*.6,y*30.)))*(SUNC*.55*shadowT(p)+vec3(.33,.49,.8));
+  acc+=trans*cov*col;trans*=1.-cov;
+}
+// catenary masts on the hillside of the track
+void masts(vec3 ro,vec3 rd,float tmax,inout vec3 acc,inout float trans){
+  float t=rowHit(ro,rd,-2.75);
+  if(t<0.||t>min(tmax,400.)) return;
+  vec3 p=ro+rd*t;
+  if(p.y<0.||p.y>6.7||inTunnel(mod(p.x,PERIOD))) return;
+  float ds=mod(p.x+24.,48.)-24.,px=.0011*t;
+  float cov=cover(ds-.5*uBlur-px,ds+.5*uBlur+px,-.11,.11);
+  cov=max(cov,cover(ds-.5*uBlur-px,ds+.5*uBlur+px,-.11,2.6)*ss(.09+px,.05,abs(p.y-5.7)));
+  vec3 col=vec3(.075,.085,.08)*(SUNC*.5+vec3(.33,.49,.8));
+  acc+=trans*cov*col;trans*=1.-cov;
+}
+// steel railing along the viaduct deck
+void railing(vec3 ro,vec3 rd,float side,float tmax,inout vec3 acc,inout float trans){
+  float t=rowHit(ro,rd,2.55*side);
+  if(t<0.||t>min(tmax,300.)) return;
+  vec3 p=ro+rd*t;float xm=mod(p.x,PERIOD);
+  if(xm<VIA0||xm>VIA1||p.y<0.||p.y>1.1) return;
+  float px=.0011*t;
+  float rail=max(ss(.035+px,.035-px,abs(p.y-1.03)),ss(.025+px,.025-px,abs(p.y-.55)));
+  float ds=mod(p.x,1.8)-.9;
+  float cov=max(rail,cover(ds-.5*uBlur-px,ds+.5*uBlur+px,-.03,.03));
+  vec3 col=vec3(.1,.11,.11)*(SUNC*.6+vec3(.33,.49,.8));
+  acc+=trans*cov*col;trans*=1.-cov;
+}
+</script>
+<script id="g-objects" type="x-shader/x-fragment">
+// ───────────────────────── villages, the old stone viaduct, object shadows, world compositor ─────────────────────────
+uniform vec4 uVil;    // village centre x, base y, centre z, enabled
+uniform vec3 uVilR;   // half extents (x,z) and seed
+const float CELL=22.;
+const float OV_Z=175.,OV_Y=-36.,OV_L=132.;
+
+#define CLIP(N,c) {float dn=dot(N,d),ds=(c)-dot(N,o);if(abs(dn)<1e-6){if(ds<0.)return -1.;}else{float tt=ds/dn;if(dn<0.){if(tt>tn){tn=tt;n=N;}}else tf=min(tf,tt);}}
+// ray vs convex building: box clipped by roof planes (kx/kz pitch, Hx/Hz apex heights)
+float hull(vec3 o,vec3 d,vec3 hs,float kx,float Hx,float kz,float Hz,out vec3 n){
+  float tn=-1e9,tf=1e9;n=vec3(0.,1.,0.);
+  CLIP(vec3(1.,0.,0.),hs.x) CLIP(vec3(-1.,0.,0.),hs.x)
+  CLIP(vec3(0.,0.,1.),hs.z) CLIP(vec3(0.,0.,-1.),hs.z)
+  CLIP(vec3(0.,-1.,0.),0.)
+  CLIP(vec3(kx,1.,0.),Hx) CLIP(vec3(-kx,1.,0.),Hx)
+  CLIP(vec3(0.,1.,kz),Hz) CLIP(vec3(0.,1.,-kz),Hz)
+  if(tn>tf||tn<=0.) return -1.;
+  n=normalize(n);
+  return tn;
+}
+// one lot of the village grid. o is relative to the village centre at terrace level
+float houseCell(vec2 ci,vec3 o,vec3 d,out vec3 n,out vec3 lp,out vec4 id){
+  vec4 r=hash4(ci+uVilR.z),r2=hash4(ci*1.7+uVilR.z+40.);
+  vec2 cc=(ci+.5)*CELL+(r.xy-.5)*6.;
+  id=vec4(r.z,r.w,r2.x,0.);
+  if(ci==vec2(0.)){                                   // church: tower with spire + nave
+    vec3 n2;id.w=2.;
+    vec3 oc=o-vec3(cc.x-5.5,0.,cc.y);
+    float t=hull(oc,d,vec3(2.5,0.,2.5),3.4,23.5,3.4,23.5,n);lp=oc+d*t;
+    vec3 on=o-vec3(cc.x+3.5,0.,cc.y);
+    float t2=hull(on,d,vec3(6.5,0.,4.),0.,1e3,.95,10.3,n2);
+    if(t2>0.&&(t<0.||t2<t)){t=t2;n=n2;lp=on+d*t;id.w=3.;}
+    return t;
+  }
+  if(length(cc/uVilR.xy)>1.||r2.y>.78) return -1.;
+  vec3 hs=vec3(3.6+1.6*r.z,0.,3.1+1.1*r.w);
+  float wall=4.6+2.2*r2.z,k=.62;
+  vec3 oc=o-vec3(cc.x,0.,cc.y);
+  float t=r2.w>.5?hull(oc,d,hs,k,wall+k*hs.x,0.,1e3,n):hull(oc,d,hs,0.,1e3,k,wall+k*hs.z,n);
+  lp=oc+d*t;
+  return t;
+}
+float houses(vec3 ro,vec3 rd,float tmax,out vec3 n,out vec3 lp,out vec4 id){
+  if(uVil.w<.5) return -1.;
+  vec3 o=ro-uVil.xyz;
+  float t0=0.,t1=tmax;
+  vec3 lo=vec3(-uVilR.x-14.,0.,-uVilR.y-14.),hi=vec3(uVilR.x+14.,25.,uVilR.y+14.);
+  vec3 ia=(lo-o)/rd,ib=(hi-o)/rd,mn=min(ia,ib),mx=max(ia,ib);
+  t0=max(t0,max(mn.x,max(mn.y,mn.z)));t1=min(t1,min(mx.x,min(mx.y,mx.z)));
+  if(t0>=t1) return -1.;
+  vec2 gp=(o.xz+rd.xz*(t0+.02))/CELL,ci=floor(gp);
+  vec2 sg=vec2(rd.x<0.?-1.:1.,rd.z<0.?-1.:1.),inv=CELL/max(abs(rd.xz),vec2(1e-5));
+  vec2 tm=t0+((ci+max(sg,0.))-gp)*CELL/(rd.xz+sg*1e-6);
+  for(int k=0;k<18;k++){
+    float t=houseCell(ci,o,rd,n,lp,id);
+    if(t>0.&&t<t1) return t;
+    if(tm.x<tm.y){if(tm.x>t1)break;ci.x+=sg.x;tm.x+=inv.x;}
+    else{if(tm.y>t1)break;ci.y+=sg.y;tm.y+=inv.y;}
+  }
+  return -1.;
+}
+vec3 shadeHouse(vec3 lp,vec3 n,vec4 id,vec3 wp,float t){
+  vec3 alb;
+  bool church=id.w>1.5;
+  if(n.y>.2){
+    alb=mix(vec3(.08,.068,.06),vec3(.15,.085,.055),step(.62,id.z))*(.8+.4*fract(lp.y*2.3));
+    if(church&&id.w<2.5) alb=vec3(.10,.19,.16);                       // copper spire
+  }else{
+    float a=abs(n.x)>.5?lp.z:lp.x;
+    alb=(lp.y<2.7||church)?vec3(.62,.6,.55):vec3(.15,.09,.05)*(.8+.4*step(.5,fract(lp.y*3.)));
+    vec2 wq=vec2(fract(a/2.3+.5)-.5,fract((lp.y-.25)/2.6)-.5);
+    float wy=church?step(lp.y,6.):step(lp.y,4.9);
+    float fade=1.-ss(500.,1100.,t);
+    float win=step(abs(wq.x),.19)*step(abs(wq.y),.2)*wy;
+    float shut=step(abs(wq.x),.3)*step(abs(wq.y),.2)*wy*(1.-win);
+    alb=mix(alb,vec3(.03,.04,.05),win*fade);
+    if(!church) alb=mix(alb,mix(vec3(.07,.17,.09),vec3(.3,.07,.05),step(.5,id.y)),shut*fade);
+    if(church&&id.w<2.5&&lp.y>12.&&lp.y<14.5&&abs(a)<1.1) alb=vec3(.05);      // belfry openings
+  }
+  float sh=shadowT(wp+n*.3)*cloudSh(wp);
+  return alb*(SUNC*max(dot(n,uSun),0.)*sh+vec3(.33,.49,.8)*1.25*(.5+.5*n.y)+vec3(.2,.24,.1)*.5*(1.-n.y));
+}
+
+// arches in elevation: q.x along the bridge, q.y up from the deck top
+float sdVia2(vec2 q){
+  float xr=mod(q.x+11.,22.)-11.;
+  float hole=min(length(vec2(xr,q.y+13.))-9.,max(abs(xr)-9.,q.y+13.));
+  return max(max(q.y,abs(q.x)-OV_L),-hole);
+}
+vec3 viaOrigin(){float x0=uTrainX-mod(uTrainX,PERIOD)+GORGE_X;return vec3(x0,OV_Y,trackZ(x0)+OV_Z);}
+float oldVia(vec3 ro,vec3 rd,float tmax,out vec3 n,out vec3 lp){
+  if(abs(mod(uTrainX,PERIOD)-GORGE_X)>1200.||abs(rd.z)<1e-5) return -1.;
+  vec3 o=ro-viaOrigin();
+  float ta=(-2.5-o.z)/rd.z,tb=(2.5-o.z)/rd.z;
+  float t=max(min(ta,tb),0.),t1=min(max(ta,tb),tmax);
+  if(t>=t1) return -1.;
+  for(int i=0;i<44;i++){
+    vec3 q=o+rd*t;
+    float d=sdVia2(q.xy);
+    if(d<.03){
+      lp=q;
+      if(i==0) n=vec3(0.,0.,-sign(rd.z));
+      else{vec2 e=vec2(.05,0.);n=normalize(vec3(sdVia2(q.xy+e.xy)-d,sdVia2(q.xy+e.yx)-d,0.));}
+      return t;
+    }
+    t+=max(d,.06);
+    if(t>t1) return -1.;
+  }
+  return -1.;
+}
+vec3 shadeStone(vec3 lp,vec3 n,vec3 wp){
+  vec2 uv=abs(n.z)>.5?lp.xy:vec2(lp.x+lp.y,lp.z);
+  float row=floor(uv.y/.55);
+  vec4 r=hash4(vec2(floor(uv.x/1.1+.5*mod(row,2.)),row));
+  vec3 alb=mix(vec3(.26,.24,.21),vec3(.40,.37,.32),r.x)*(.8+.3*vnoise(uv*1.3));
+  alb*=.75+.25*ss(-60.,-5.,lp.y);                                 // damp, darker piers
+  float sh=shadowT(wp+n*.4)*cloudSh(wp);
+  return alb*(SUNC*max(dot(n,uSun),0.)*sh+vec3(.33,.49,.8)*1.2*(.5+.5*n.y)+vec3(.2,.22,.12)*.4);
+}
+
+float objShadow(vec3 p){
+  float sh=1.;
+  float t=rowHit(p,uSun,0.);
+  if(t>0.&&t<500.){
+    vec3 q=p+uSun*t;float sx=q.x-uTrainX;
+    if(q.y>.25) sh=min(sh,ss(-.3,.05,max(q.y-3.85,max(-52.-sx,sx-70.))));    // the train itself
+    float xm=mod(q.x,PERIOD);
+    if(xm>VIA0-20.&&xm<VIA1+20.) sh=min(sh,ss(-.4,.4,sdVia2(vec2(xm-GORGE_X,q.y+.25))));
+  }
+  if(abs(mod(uTrainX,PERIOD)-GORGE_X)<1200.){
+    vec3 o=p-viaOrigin();
+    float tv=-o.z/uSun.z;
+    if(tv>0.&&tv<600.) sh=min(sh,ss(-.4,.4,sdVia2((o+uSun*tv).xy)));
+  }
+  if(uVil.w>.5&&all(lessThan(abs(p.xz-uVil.xz),uVilR.xy+60.))){
+    vec3 n,lp;vec4 id;
+    if(houses(p+vec3(0.,.1,0.),uSun,90.,n,lp,id)>0.) sh=0.;
+  }
+  return sh;
+}
+
+uniform sampler2D uPre;     // half-resolution depth prepass: >0 terrain distance, -1 nothing, -2 interior, -3 no information
+uniform float uPreOn;
+#ifdef PREPASS
+float preWorld(vec3 ro,vec3 rd){
+  if(ro.x>uTun.x&&ro.x<uTun.y){
+    bool ex;vec3 pe;tunnel(ro,rd,ex,pe);
+    if(!ex) return -3.;
+    ro=pe;
+  }
+  if(rd.y<0.){
+    vec3 pd=ro+rd*(-ro.y/rd.y);float xm=mod(pd.x,PERIOD);
+    if(xm>VIA0&&xm<VIA1&&abs(pd.z-trackZ(pd.x))<2.75) return -3.;
+  }
+  return march(ro,rd,.05,min(rd.y<0.?(WATER-ro.y)/rd.y:1e9,32000.),150);
+}
+#endif
+// where the terrain march may start, from the prepass neighbourhood. -1: nothing to hit, 0: unknown
+float preStart(){
+  if(uPreOn<.5) return 0.;
+  ivec2 c=ivec2(gl_FragCoord.xy*.5),sz=textureSize(uPre,0)-1;
+  float t0=1e9;bool any=false;
+  for(int j=-1;j<=1;j++)for(int i=-1;i<=1;i++){
+    float v=texelFetch(uPre,clamp(c+ivec2(i,j),ivec2(0),sz),0).r;
+    if(v<-2.5) return 0.;
+    if(v>0.){t0=min(t0,v);any=true;}
+    else if(v>-1.5) any=true;
+  }
+  if(!any) return 0.;
+  return t0>1e8?-1.:max(.05,t0*.94-1.5);
+}
+// Everything outside the glass. Returns colour and distance (60000 = do not post-blur).
+vec4 renderWorld(vec3 ro,vec3 rd){
+  float tOff=0.;
+  if(ro.x>uTun.x&&ro.x<uTun.y){
+    bool ex;vec3 pe;
+    vec3 c=tunnel(ro,rd,ex,pe);
+    if(!ex) return vec4(c,60000.);
+    tOff=length(pe-ro);ro=pe;
+  }
+  vec3 col;float depth=-1.;
+  // viaduct deck beneath the carriage
+  if(rd.y<0.){
+    float td=-ro.y/rd.y;vec3 pd=ro+rd*td;float xm=mod(pd.x,PERIOD),zr=pd.z-trackZ(pd.x);
+    if(xm>VIA0&&xm<VIA1&&abs(zr)<2.75){
+      vec4 nb=streak(pd.xz,1./.35,td);
+      vec3 alb=abs(zr)<2.25?vec3(.2,.175,.155)*(.6+.8*nb.x):vec3(.4,.38,.35)*(.85+.3*nb.y);
+      col=alb*(SUNC*uSun.y*objShadow(pd)*cloudSh(pd)+vec3(.33,.49,.8)*1.3);
+      depth=td;
+    }
+  }
+  if(depth<0.){
+    float tW=rd.y<0.?(WATER-ro.y)/rd.y:1e9;
+    float ts=preStart();
+    float tT=ts<0.?-1.:march(ro,rd,max(ts,.05),min(tW,32000.),150);
+    if(tT>0.){col=shadeTerrain(ro+rd*tT,rd,tT,false);depth=tT;}
+    else if(tW<32000.){col=shadeWater(ro+rd*tW,rd,tW);depth=tW;}
+    else{col=sky(ro,rd);depth=60000.;}
+    vec3 n,lp;vec4 id;
+    float th=houses(ro,rd,depth,n,lp,id);
+    if(th>0.){col=shadeHouse(lp,n,id,ro+rd*th,th);depth=th;}
+    float tv=oldVia(ro,rd,depth,n,lp);
+    if(tv>0.){col=shadeStone(lp,n,ro+rd*tv);depth=tv;}
+    if(depth<60000.) col=fog(col,rd,depth,ro.y);
+  }
+  // trackside layers, nearest first
+  vec3 acc=vec3(0.);float tr=1.;
+  float side=rd.z-trackD(ro.x)*rd.x;
+  float xm0=mod(ro.x,PERIOD);
+  if(xm0>VIA0-150.&&xm0<VIA1+150.) railing(ro,rd,side>0.?1.:-1.,depth,acc,tr);
+  if(side>0.){
+    fence(ro,rd,depth,acc,tr);
+    treeRow(ro,rd,9.,7.5,1.,depth,acc,tr);
+    treeRow(ro,rd,13.5,8.,2.,depth,acc,tr);
+    treeRow(ro,rd,19.,8.5,3.,depth,acc,tr);
+    treeRow(ro,rd,26.,9.,4.,depth,acc,tr);
+    treeRow(ro,rd,34.,9.5,8.,depth,acc,tr);
+    treeRow(ro,rd,43.,10.,9.,depth,acc,tr);
+  }else{
+    masts(ro,rd,depth,acc,tr);
+    treeRow(ro,rd,-7.5,7.5,5.,depth,acc,tr);
+    treeRow(ro,rd,-12.,8.,6.,depth,acc,tr);
+    treeRow(ro,rd,-18.,8.5,7.,depth,acc,tr);
+    treeRow(ro,rd,-26.,9.,10.,depth,acc,tr);
+    treeRow(ro,rd,-36.,9.5,11.,depth,acc,tr);
+  }
+  col=acc+tr*col;
+  return vec4(col,depth+tOff);
+}
+</script>
+<script id="g-interior" type="x-shader/x-fragment">
+// ───────────────────────── carriage interior (signed distance field, carriage space) ─────────────────────────
+uniform vec3 uSunC;        // sun direction in carriage space
+uniform float uDay;        // daylight reaching the carriage (0 deep inside a tunnel)
+uniform vec3 uCarPos;      // carriage origin (floor centre of the camera's bay) in the world
+uniform mat3 uCarRot;      // carriage -> world
+const float BAY=1.9,HW=1.4,GLASS=1.45,CEIL=2.22,ENDX=8.55;
+const float WIN_X=.74,WIN_Y0=.84,WIN_Y1=1.84;
+const vec3 LAMPC=vec3(1.,.87,.69);
+
+float sdBox(vec3 p,vec3 b){vec3 q=abs(p)-b;return length(max(q,0.))+min(max(q.x,max(q.y,q.z)),0.);}
+float sdRBox(vec3 p,vec3 b,float r){return sdBox(p,b-r)-r;}
+float sdBox2(vec2 p,vec2 b){vec2 q=abs(p)-b;return length(max(q,0.))+min(max(q.x,q.y),0.);}
+float sdCyl(vec3 p,float r,float h){vec2 d=abs(vec2(length(p.xz),p.y))-vec2(r,h);return min(max(d.x,d.y),0.)+length(max(d,0.));}
+float foldX(float x){return x-BAY*clamp(floor(x/BAY+.5),-4.,4.);}
+float winRect(vec2 q){return sdBox2(vec2(q.x,q.y-.5*(WIN_Y0+WIN_Y1)),vec2(WIN_X,.5*(WIN_Y1-WIN_Y0))-.07)-.07;}
+
+#define U(dd,id) {float d_=dd;if(d_<d){d=d_;m=id;}}
+// materials: 1 shell 4 fabric 5 headrest 6 plastic 7 table 8 metal 9 lamp 10 cup 11 coffee 12 bag 13 trim
+float mapInt(vec3 p,out int m){
+  float xb=foldX(p.x),az=abs(p.z),sx=.95-abs(xb);
+  float d=1e9;m=1;
+  // shell with window openings, end walls
+  float room=sdBox2(vec2(az,p.y-.5*CEIL),vec2(HW,.5*CEIL)-.3)-.3;
+  float win=sdRBox(vec3(xb,p.y-.5*(WIN_Y0+WIN_Y1),az-HW-.15),vec3(WIN_X,.5*(WIN_Y1-WIN_Y0),.3),.07);
+  d=min(max(-room,-win),ENDX-abs(p.x));
+  U(sdBox2(vec2(az-1.365,p.y-.815),vec2(.05,.018))-.008,13)                          // sill
+  // seats: two per side, back to back at every bay boundary
+  float zs=abs(az-.82)-.28,lean=.05*(p.y-.85);
+  U(sdRBox(vec3(sx-.078+lean,p.y-.86,zs),vec3(.066,.42,.245),.05),4)                 // backrest
+  U(sdRBox(vec3(sx-.118+lean,p.y-1.2,zs),vec3(.05,.105,.17),.045),5)                 // headrest
+  U(sdRBox(vec3(sx-.35,p.y-.41,zs),vec3(.25,.055,.245),.05),4)                       // cushion
+  U(sdRBox(vec3(sx-.3,p.y-.18,zs),vec3(.2,.18,.2),.02),6)                            // pedestal
+  float za=min(abs(az-.3),abs(az-.82));
+  U(sdRBox(vec3(sx-.32,p.y-.615,za),vec3(.19,.022,.027),.015),6)                     // armrests
+  // table, luggage rack, lamps
+  U(sdRBox(vec3(xb,p.y-.725,az-1.01),vec3(.27,.017,.4),.012),7)
+  U(sdBox(vec3(xb,p.y-.4,az-1.34),vec3(.025,.31,.03)),8)
+  U(sdBox2(vec2(az-1.2,p.y-1.95),vec2(.2,.007)),13)
+  U(length(vec2(az-1.,p.y-1.975))-.014,8)
+  U(sdBox(vec3(sx-.012,p.y-2.04,az-1.2),vec3(.012,.09,.2)),8)
+  U(sdBox2(vec2(az-.52,p.y-CEIL+.012),vec2(.07,.014)),9)
+  // things: coffee on our table, bags on the racks
+  if(abs(p.x)<.6&&p.z>.5&&p.y<1.){
+    vec3 c=p-vec3(.11,.742,1.07);
+    U(sdCyl(c-vec3(0.,.003,0.),.072,.004),10)
+    float cup=max(sdCyl(c-vec3(0.,.048,0.),.041,.042),-sdCyl(c-vec3(0.,.056,0.),.035,.042));
+    U(cup,10)
+    U(sdCyl(c-vec3(0.,.062,0.),.035,.004),11)
+  }
+  if(p.y>1.9){
+    U(sdRBox(p-vec3(1.25,2.075,-1.19),vec3(.31,.11,.17),.07),12)
+    U(sdRBox(p-vec3(-3.7,2.085,1.19),vec3(.27,.12,.17),.08),12)
+    U(sdRBox(p-vec3(4.3,2.07,-1.19),vec3(.33,.105,.17),.06),12)
+  }
+  return d;
+}
+vec3 nrmInt(vec3 p){
+  int m;vec2 e=vec2(.0012,-.0012);
+  return normalize(e.xyy*mapInt(p+e.xyy,m)+e.yyx*mapInt(p+e.yyx,m)+e.yxy*mapInt(p+e.yxy,m)+e.xxx*mapInt(p+e.xxx,m));
+}
+// march the interior. ex=true when the ray leaves through a window pane at pg
+float traceInt(vec3 ro,vec3 rd,int steps,out int m,out bool ex,out vec3 pg){
+  float t=0.;ex=false;m=1;
+  for(int i=0;i<steps;i++){
+    vec3 p=ro+rd*t;
+    if(abs(p.z)>GLASS){
+      ex=true;t=(sign(rd.z)*GLASS-ro.z)/rd.z;pg=ro+rd*t;return t;
+    }
+    float d=mapInt(p,m);
+    if(d<.0012*(1.+t)) break;
+    t+=d;
+    if(t>40.) break;
+  }
+  return t;
+}
+// what a window shows in reflections and glossy highlights (cheap stand-in for the landscape)
+vec3 proxyOut(vec3 rdc){
+  vec3 rw=uCarRot*rdc;
+  vec3 land=mix(vec3(.2,.24,.13),vec3(.5,.52,.5),ss(.0,.2,rw.y))*1.8;
+  return mix(land,skyBase(rw),ss(-.03,.16,rw.y))*uDay*.55;
+}
+// direct sunlight on an interior point: through a window, past the furniture, past the landscape
+float sunIn(vec3 p,vec3 n,bool hi){
+  vec3 s=uSunC;
+  if(uDay<.01||dot(n,s)<=0.||abs(s.z)<.03) return 0.;
+  float t=(sign(s.z)*GLASS-p.z)/s.z;
+  vec3 q=p+s*t;
+  if(abs(q.x)>ENDX) return 0.;
+  float pen=.004+.006*t;
+  float v=ss(pen,-pen,winRect(vec2(foldX(q.x),q.y)));
+  if(v<=0.) return 0.;
+  if(hi){
+    float tt=.03;int m;
+    for(int i=0;i<22;i++){
+      float d=mapInt(p+n*.004+s*tt,m);
+      v=min(v,18.*d/tt);
+      tt+=clamp(d,.02,.25);
+      if(v<.01||tt>t) break;
+    }
+    v=sat(v);
+    if(v<=0.) return 0.;
+  }
+  vec3 wq=uCarPos+uCarRot*q;
+  v*=shadowT(wq)*cloudSh(wq);
+  if(hi&&v>.01){
+    vec3 acc=vec3(0.);float tr=1.;
+    treeRow(wq,uSun,-7.5,7.5,5.,300.,acc,tr);
+    treeRow(wq,uSun,-12.,8.,6.,300.,acc,tr);
+    v*=tr;
+  }
+  return v;
+}
+float aoInt(vec3 p,vec3 n){
+  float a=0.,s=1.;int m;
+  for(int i=1;i<=4;i++){float h=.035*float(i);a+=(h-mapInt(p+n*h,m))*s;s*=.6;}
+  return sat(1.-3.2*a);
+}
+// mirror-like term for glossy materials: the windows by day, the lamp strips always
+vec3 gloss(vec3 p,vec3 r){
+  vec3 c=vec3(0.);
+  if(abs(r.z)>.02){
+    float t=(sign(r.z)*GLASS-p.z)/r.z;vec3 q=p+r*t;
+    c+=proxyOut(r)*ss(.03,-.03,winRect(vec2(foldX(q.x),q.y)))*step(abs(q.x),ENDX);
+  }
+  if(r.y>.02){
+    float t=(CEIL-p.y)/r.y;vec3 q=p+r*t;
+    c+=LAMPC*3.4*ss(.085,.06,abs(abs(q.z)-.52))*step(abs(q.x),ENDX);
+  }
+  return c;
+}
+vec3 shadeInt(vec3 p,vec3 n,vec3 rd,int m,bool hi){
+  float az=abs(p.z),xb=foldX(p.x);
+  vec4 nz=vnoise4(p.xz*37.+p.y*19.);
+  vec3 alb=vec3(.6);float f0=.0,rough=1.;vec3 emi=vec3(0.);
+  if(m==1){
+    if(abs(p.x)>ENDX-.02){                                    // end wall with a glazed door
+      alb=vec3(.52,.51,.48);
+      if(az<.44&&p.y<2.02){alb=vec3(.02,.025,.03);f0=.08;rough=0.;
+        if(az>.38||p.y>1.96||p.y<.12) {alb=vec3(.2);f0=.5;}}
+      if(az<.34&&abs(p.y-2.1)<.045){
+        vec2 dq=fract(vec2(p.z,p.y)*90.)-.5;
+        float on=step(.45,hash4(floor(vec2(p.z*90.,p.y*90.))).x)*step(abs(p.z),.3);
+        emi=vec3(1.,.5,.08)*2.2*on*ss(.4,.2,length(dq));alb=vec3(.01);
+      }
+    }else if(p.y<.02){                                        // floor
+      alb=vec3(.075,.08,.09)*(.75+.5*nz.x);f0=.03;rough=.5;
+      if(az<.27) alb=vec3(.03,.045,.08)*(.7+.6*nz.y);
+    }else if(az>HW+.004){alb=vec3(.012);                      // window reveal, rubber gasket
+    }else if(p.y>CEIL-.35){alb=vec3(.68,.67,.64);
+    }else if(p.y<.16){alb=vec3(.09,.09,.095);
+    }else if(p.y<WIN_Y0-.03){alb=vec3(.47,.46,.43)*(.95+.1*nz.z);
+    }else alb=vec3(.6,.59,.56);
+  }else if(m==4){
+    float weave=.75+.5*vnoise(vec2(p.x+p.z,p.y)*210.)*vnoise(vec2(p.x-p.z,p.y)*190.);
+    alb=vec3(.035,.062,.12)*weave;
+    float stripe=ss(.46,.5,abs(fract((p.y+abs(xb)*.3)*9.)-.5));
+    alb=mix(alb,vec3(.16,.11,.045),stripe*.35);
+  }else if(m==5){alb=vec3(.2,.085,.035)*(.8+.4*nz.x);f0=.035;rough=.8;
+  }else if(m==6){alb=vec3(.045,.046,.05);f0=.04;rough=.6;
+  }else if(m==7){
+    float grain=vnoise(vec2(p.x*7.,p.z*95.))*.6+vnoise(vec2(p.x*3.,p.z*23.))*.4;
+    alb=mix(vec3(.42,.28,.15),vec3(.58,.43,.26),grain);f0=.05;rough=.12;
+    if(n.y<.5) alb=vec3(.05,.05,.055);
+  }else if(m==8){alb=vec3(.5,.51,.52);f0=.6;rough=.25;
+  }else if(m==9){alb=vec3(.8);emi=LAMPC*3.4*step(n.y,-.5);
+  }else if(m==10){alb=vec3(.78,.77,.74);f0=.05;rough=.1;
+  }else if(m==11){alb=vec3(.045,.022,.01);f0=.04;rough=0.;
+  }else if(m==12){alb=p.x>0.?(p.x>3.?vec3(.26,.035,.03):vec3(.1,.11,.065)):vec3(.05,.07,.1);alb*=.8+.4*nz.w;
+  }else if(m==13){alb=vec3(.11,.11,.115);f0=.04;rough=.4;}
+  float ao=hi?aoInt(p,n):1.;
+  // daylight from both window walls
+  vec3 E=vec3(0.);
+  for(int i=0;i<2;i++){
+    float sd=i==0?1.:-1.;
+    vec3 L=vec3(0.,1.42-p.y,sd*GLASS-p.z);float d2=dot(L,L);L*=inversesqrt(d2);
+    float e=(max(dot(n,L),0.)*.85+.15)*abs(L.z)/(.55+d2);
+    E+=mix(vec3(.62,.66,.6),vec3(.74,.86,1.),.5+.5*n.y)*e;
+  }
+  E*=3.1*uDay*ao;
+  // lamp strips (line lights), small fill
+  for(int i=0;i<2;i++){
+    vec3 L=vec3(0.,CEIL-p.y,(i==0?.52:-.52)-p.z);float dl=length(L);
+    E+=LAMPC*.085*(max(dot(n,L/dl),0.)*.9+.1)/(.25+dl)*ao;
+  }
+  E+=vec3(.011,.012,.014)*ao;
+  float sun=sunIn(p,n,hi);
+  E+=SUNC*.6*max(dot(n,uSunC),0.)*sun;
+  vec3 col=alb*E+emi;
+  if(f0>0.){
+    vec3 r=reflect(rd,n);
+    float fr=f0+(1.-f0)*pow(1.-max(dot(-rd,n),0.),5.);
+    col+=gloss(p,r)*fr*(1.-rough*.75)*(hi?ao:1.);
+    col+=SUNC*sun*fr*pow(max(dot(r,uSunC),0.),mix(900.,30.,rough))*(8.-7.*rough);
+  }
+  return col;
+}
+// the interior as mirrored in a window pane
+vec3 reflectInt(vec3 pg,vec3 rr){
+  int m;bool ex;vec3 q;
+  float t=traceInt(pg,rr,40,m,ex,q);
+  if(ex){      // a window opposite: soft-edged, since the eye is focused on the landscape
+    vec3 rw=uCarRot*rr;
+    float streaks=.65+.7*vnoise(vec2(q.x*.35+uTime*4.,q.y*5.));
+    return proxyOut(rr)*streaks*ss(-.005,-.09,winRect(vec2(foldX(q.x),q.y)));
+  }
+  vec3 p=pg+rr*t;
+  return shadeInt(p,nrmInt(p),rr,m,false);
+}
+</script>
+<script id="g-main" type="x-shader/x-fragment">
+// ───────────────────────── scene pass: interior, glass, world ─────────────────────────
+uniform vec2 uRes;
+uniform vec3 uCamPos;      // eye in carriage space
+uniform mat3 uCamRot;      // camera -> carriage (right, up, forward)
+uniform float uTanFov;
+flat in float vSun;        // sunlight reaching the carriage roof (computed once per frame in the vertex stage)
+layout(location=0) out vec4 oExt;   // rgb: world seen through glass, a: distance
+layout(location=1) out vec4 oInt;   // rgb: interior / reflections on the glass, a: glass transmittance
+#ifdef PREPASS
+void main(){                 // half resolution: only how far the terrain is along each ray
+  vec2 uv=(gl_FragCoord.xy*4.-uRes)/uRes.y;
+  vec3 rd=normalize(uCamRot*vec3(uv*uTanFov,1.));
+  int m;bool ex;vec3 pg;
+  traceInt(uCamPos,rd,110,m,ex,pg);
+  oExt=vec4(-2.);oInt=vec4(0.);
+  if(!ex||winRect(vec2(foldX(pg.x),pg.y))>-.013) return;
+  oExt=vec4(preWorld(uCarPos+uCarRot*pg,uCarRot*rd));
+}
+#else
+void main(){
+  vec2 uv=(gl_FragCoord.xy*2.-uRes)/uRes.y;
+  vec3 rd=normalize(uCamRot*vec3(uv*uTanFov,1.));
+  int m;bool ex;vec3 pg;
+  float t=traceInt(uCamPos,rd,110,m,ex,pg);
+  oExt=vec4(0.);
+  if(!ex){
+    vec3 p=uCamPos+rd*t;
+    oInt=vec4(shadeInt(p,nrmInt(p),rd,m,true),0.);
+    return;
+  }
+  if(winRect(vec2(foldX(pg.x),pg.y))>-.013){oInt=vec4(vec3(.004),0.);return;}     // rubber gasket
+  float sd=sign(rd.z);
+  float F=.03+.97*pow(1.-abs(rd.z),5.);
+  vec3 refl=reflectInt(pg-vec3(0.,0.,sd*.003),vec3(rd.xy,-rd.z));
+  // grime on the pane: soft smudges, fine vertical wash marks, a few specks
+  vec2 gq=pg.xy+vec2(sd*3.7,0.);
+  float dirt=vnoise(gq*vec2(6.,2.1))*vnoise(gq*27.)+.3*ss(.72,1.,vnoise(gq*vec2(230.,9.)))*vnoise(gq*3.);
+  float speck=ss(.93,1.,vnoise(gq*190.))*.6;
+  float sunOnPane=max(sd*uSunC.z,0.)*vSun;
+  vec3 veil=(vec3(.7,.79,.92)*uDay*.9+SUNC*sunOnPane*1.6)*(.006+.035*dirt+.05*speck);
+  vec4 w=renderWorld(uCarPos+uCarRot*pg,uCarRot*rd);
+  oExt=vec4(w.rgb,min(t+w.a,60000.));
+  oInt=vec4(F*refl+veil,(1.-F)*(.94-.22*dirt-.3*speck));
+}
+#endif
+</script>
+
+<script id="v-scene" type="x-shader/x-vertex">
+// full-screen triangle; also meters the sunlight at the carriage once per frame
+flat out float vSun;
+uniform vec3 uCarPos;
+float objShadow(vec3 p){return 1.;}
+void main(){
+  vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);
+  gl_Position=vec4(p*2.-1.,0.,1.);
+  vec3 c=uCarPos+vec3(0.,2.6,0.);
+  vSun=shadowT(c)*cloudSh(c);
+}
+</script>
+
+<script id="f-bake" type="x-shader/x-fragment">#version 300 es
+// ───────────────────────── one-off bake of the coarse mountain relief into a seamless tile ─────────────────────────
+precision highp float;precision highp int;precision highp sampler2D;
+uniform sampler2D uHash;uniform float uSize;
+out vec4 o;
+float lat(ivec2 i,int per,ivec2 off){i=((i%per)+per)%per;return texelFetch(uHash,(i+off)&255,0).x;}
+vec3 nd(vec2 x,int per,ivec2 off){                  // periodic value noise with derivatives, quintic
+  vec2 i=floor(x),f=x-i,u=f*f*f*(f*(f*6.-15.)+10.),du=30.*f*f*(f*(f-2.)+1.);
+  ivec2 ii=ivec2(i);
+  float a=lat(ii,per,off),b=lat(ii+ivec2(1,0),per,off),c=lat(ii+ivec2(0,1),per,off),d=lat(ii+ivec2(1,1),per,off);
+  float k1=b-a,k2=c-a,k4=a-b-c+d;
+  return vec3(a+k1*u.x+k2*u.y+k4*u.x*u.y,du*(vec2(k1,k2)+k4*u.yx));
+}
+void main(){
+  vec2 q=gl_FragCoord.xy/uSize*16.;                 // base-octave cells; the tile is 16 of them
+  vec2 w=vec2(nd(q*.5+3.3,8,ivec2(17,91)).x,nd(q*.5+7.1,8,ivec2(63,5)).x)-.5;      // periodic domain warp
+  w+=.5*(vec2(nd(q+1.7,16,ivec2(111,40)).x,nd(q+4.2,16,ivec2(29,77)).x)-.5);
+  vec2 p=q+w*.9,d=vec2(0.);
+  float a=0.,b=1.;int per=16;
+  for(int i=0;i<5;i++){
+    vec3 n=nd(p,per,ivec2(i*37,i*59));
+    d+=n.yz;a+=b*n.x/(1.+dot(d,d));
+    b*=.5;p=p*2.+vec2(.37,.71);per*=2;
+  }
+  float rn=nd(q*2.+w*1.3+5.5,32,ivec2(200,13)).x,rdg=1.-abs(2.*rn-1.);            // sharp crests
+  o=vec4(a-.62+.2*(rdg*rdg-.33),d,nd(q*(5./16.)+.5,5,ivec2(150,150)).x);
+}
+</script>
+
+<script id="v-quad" type="x-shader/x-vertex">#version 300 es
+void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.-1.,0.,1.);}
+</script>
+
+<script id="f-comp" type="x-shader/x-fragment">#version 300 es
+// ───────────────────────── composite: motion blur of the world behind the glass, then the glass layer ─────────────────────────
+precision highp float;precision highp sampler2D;
+uniform sampler2D uExt,uInt;
+uniform vec2 uRes;uniform float uTanFov,uMaxBlur,uJit;
+uniform vec3 uCamW,uPrevCamW;uniform mat3 uBasis,uPrevBasis;
+out vec4 o;
+float ign(vec2 p){return fract(52.9829189*fract(dot(p,vec2(.06711056,.00583715))));}
+// screen-space motion (pixels) of a world point at this pixel and distance over the shutter interval
+vec2 vel(vec2 fc,float depth){
+  vec2 uv=(fc*2.-uRes)/uRes.y;
+  vec3 pw=uCamW+normalize(uBasis*vec3(uv*uTanFov,1.))*depth;
+  vec3 q=(pw-uPrevCamW)*uPrevBasis;
+  return (uv-q.xy/(max(q.z,1e-3)*uTanFov))*uRes.y*.5;
+}
+void main(){
+  vec2 fc=gl_FragCoord.xy;ivec2 ic=ivec2(fc);
+  vec4 I=texelFetch(uInt,ic,0);
+  if(I.a<=0.){o=vec4(I.rgb,1.);return;}
+  vec4 E=texelFetch(uExt,ic,0);
+  vec2 vn=vel(fc,6.);float ln=length(vn);
+  vec2 dir=ln>1e-3?vn/ln:vec2(1.,0.);
+  const int N=14;
+  float R=uMaxBlur,D=2.*R/float(N),jit=ign(fc+uJit)-.5;
+  vec3 acc=vec3(0.);float ws=0.;
+  for(int i=0;i<N;i++){
+    float s=((float(i)+.5+jit)/float(N)*2.-1.)*R;
+    vec2 pc=fc+dir*s;
+    if(pc.x<0.||pc.y<0.||pc.x>=uRes.x||pc.y>=uRes.y) continue;
+    ivec2 ip=ivec2(pc);
+    if(texelFetch(uInt,ip,0).a<=0.) continue;
+    vec4 e=texelFetch(uExt,ip,0);
+    float L=min(length(vel(pc,e.a))*.5,R);          // half-length of that sample's streak
+    if(L<D*.5) continue;                            // practically static: only matters for its own pixel
+    float w=D/(2.*L)*(1.-smoothstep(L-D*.5,L+D*.5,abs(s)));
+    acc+=e.rgb*w;ws+=w;
+  }
+  vec3 c=ws>1.?acc/ws:acc+E.rgb*(1.-ws);
+  o=vec4(c*I.a*vec3(.955,1.,.975)+I.rgb,1.);
+}
+</script>
+
+<script id="g-expo" type="x-shader/x-fragment">
+uniform sampler2D uAdapt;uniform float uKey;
+float lum(vec3 c){return dot(c,vec3(.2126,.7152,.0722));}
+float exposure(){float L=texelFetch(uAdapt,ivec2(0),0).r;return clamp(uKey*pow(max(L,1e-4),-.95),.04,14.);}
+</script>
+
+<script id="f-bright" type="x-shader/x-fragment">
+// half-resolution bright pass (exposed units) + luminance for metering in alpha; mip chain is built from it
+uniform sampler2D uSrc;uniform vec2 uResB;
+out vec4 o;
+void main(){
+  vec2 uv=gl_FragCoord.xy/uResB,px=.5/uResB;
+  vec3 a=texture(uSrc,uv+px*vec2(-1.,-1.)).rgb,b=texture(uSrc,uv+px*vec2(1.,-1.)).rgb;
+  vec3 c=texture(uSrc,uv+px*vec2(-1.,1.)).rgb,d=texture(uSrc,uv+px).rgb;
+  float E=exposure();
+  vec4 w=1./(1.+E*vec4(lum(a),lum(b),lum(c),lum(d)));
+  vec3 m=(a*w.x+b*w.y+c*w.z+d*w.w)/(w.x+w.y+w.z+w.w)*E;
+  float l=lum(m);
+  vec3 br=min(m*max(l-.85,0.)/max(l,1e-4),vec3(30.));
+  // metering: plain average luminance (highlights count, so snow and sky keep their detail); the sun itself is clipped
+  o=vec4(br,clamp(lum((a+b+c+d)*.25),1e-5,40.));
+}
+</script>
+
+<script id="f-adapt" type="x-shader/x-fragment">#version 300 es
+// eye / auto-exposure adaptation: quick when the scene brightens, slow when it darkens
+precision highp float;precision highp sampler2D;
+uniform sampler2D uBright,uPrev;uniform float uDt,uReset;
+out vec4 o;
+void main(){
+  // centre-weighted average of the frame, read from a coarse mip (about 8 texels wide)
+  ivec2 sz=textureSize(uBright,0);
+  float lod=max(log2(float(max(sz.x,sz.y)))-3.,0.),s=0.,ws=0.;
+  for(int j=0;j<4;j++)for(int i=0;i<4;i++){
+    float w=((i==1||i==2)&&(j==1||j==2))?2.:1.;
+    s+=w*textureLod(uBright,(vec2(i,j)+.5)*.25,lod).a;ws+=w;
+  }
+  float target=log2(max(s/ws,1e-4));
+  float prev=log2(max(texelFetch(uPrev,ivec2(0),0).r,1e-4));
+  float rate=target>prev?2.3:.8;
+  float v=mix(prev,target,1.-exp(-uDt*rate));
+  if(uReset>.5) v=target;
+  o=vec4(exp2(v),0.,0.,1.);
+}
+</script>
+
+<script id="f-final" type="x-shader/x-fragment">
+// ───────────────────────── lens + film: exposure, bloom, vignette, tone curve, grain ─────────────────────────
+uniform sampler2D uSrc,uBright;uniform vec2 uOut;uniform float uTime,uBloom;
+out vec4 o;
+float h13(vec3 p){p=fract(p*.1031);p+=dot(p,p.zyx+31.32);return fract((p.x+p.y)*p.z);}
+vec3 aces(vec3 x){return clamp(x*(2.51*x+.03)/(x*(2.43*x+.59)+.14),0.,1.);}
+void main(){
+  vec2 uv=gl_FragCoord.xy/uOut,c=uv-.5;float r2=dot(c,c);
+  float E=exposure();
+  vec3 col=vec3(texture(uSrc,uv-c*r2*.007).r,texture(uSrc,uv).g,texture(uSrc,uv+c*r2*.007).b);
+  // the scene is rendered below display resolution: restore some edge contrast after the upscale
+  vec2 px=1./vec2(textureSize(uSrc,0));
+  vec3 nb=(texture(uSrc,uv+vec2(px.x,0.)).rgb+texture(uSrc,uv-vec2(px.x,0.)).rgb+texture(uSrc,uv+vec2(0.,px.y)).rgb+texture(uSrc,uv-vec2(0.,px.y)).rgb)*.25;
+  col=max(col+(col-nb)*.45*col/(col+nb+1e-3)*2.,0.)*E;
+  vec3 bl=vec3(0.);
+  vec2 ts=1./vec2(textureSize(uBright,0));
+  for(int i=1;i<=6;i++){
+    float l=float(i),r=exp2(l)*.5;
+    vec3 s=textureLod(uBright,uv+ts*r*vec2(1.,1.),l).rgb+textureLod(uBright,uv+ts*r*vec2(-1.,1.),l).rgb
+          +textureLod(uBright,uv+ts*r*vec2(1.,-1.),l).rgb+textureLod(uBright,uv+ts*r*vec2(-1.,-1.),l).rgb;
+    bl+=s*.25*(.34-.045*l);
+  }
+  // faint horizontal streak, as from an anamorphic lens
+  bl+=(textureLod(uBright,uv+vec2(ts.x*40.,0.),4.).rgb+textureLod(uBright,uv-vec2(ts.x*40.,0.),4.).rgb
+      +textureLod(uBright,uv+vec2(ts.x*90.,0.),5.).rgb+textureLod(uBright,uv-vec2(ts.x*90.,0.),5.).rgb)*vec3(.05,.06,.085);
+  col+=bl*uBloom;
+  col*=mix(1.,.5,smoothstep(.12,.62,r2));
+  col/=1.+.16*lum(col);                             // long, gentle shoulder before the film curve
+  col=aces(col*.95);
+  col=mix(col,sqrt(col),.14);                       // a little lift in the shadows, as a film print would have
+  float g=lum(col);
+  col=mix(vec3(g),col,1.06);
+  col=mix(col,col*vec3(1.03,1.,.96),smoothstep(.2,.9,g))+vec3(-.004,0.,.006)*(1.-g);
+  col=pow(max(col,0.),vec3(1./2.2));
+  float gain=smoothstep(.6,6.,E);
+  float n=h13(vec3(gl_FragCoord.xy,fract(uTime)*91.7))-.5;
+  col+=n*(.022+.05*gain)*(1.-.5*g);
+  o=vec4(col,1.);
+}
+</script>
+<script>
+(()=>{'use strict';
+// ───────────────────────── WebGL plumbing ─────────────────────────
+const $=id=>document.getElementById(id),src=id=>$(id).textContent;
+const canvas=$('c'),qs=new URLSearchParams(location.search);
+const fail=msg=>{const e=$('err');e.style.display='block';e.textContent=msg;throw new Error(msg);};
+const gl=canvas.getContext('webgl2',{antialias:false,alpha:false,depth:false,stencil:false,powerPreference:'high-performance'});
+if(!gl) fail('This scene needs WebGL 2, which this browser does not provide.');
+if(!gl.getExtension('EXT_color_buffer_float')&&!gl.getExtension('EXT_color_buffer_half_float'))
+  fail('This scene needs floating-point render targets, which this GPU does not provide.');
+const HDR='#version 300 es\nprecision highp float;precision highp int;precision highp sampler2D;\n';
+
+function shader(type,code,name){
+  const s=gl.createShader(type);gl.shaderSource(s,code);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+    const log=gl.getShaderInfoLog(s)||'',lines=code.split('\n');
+    const at=[...log.matchAll(/ERROR: \d+:(\d+)/g)].slice(0,8).map(m=>+m[1]);
+    fail(name+' failed to compile\n\n'+log+'\n'+[...new Set(at)].map(n=>n+': '+lines[n-1]).join('\n'));
+  }
+  return s;
+}
+function program(vs,fs,name){
+  const p=gl.createProgram();
+  gl.attachShader(p,shader(gl.VERTEX_SHADER,vs,name+' vertex shader'));
+  gl.attachShader(p,shader(gl.FRAGMENT_SHADER,fs,name+' fragment shader'));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) fail(name+' failed to link\n\n'+gl.getProgramInfoLog(p));
+  const u={},n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);
+  for(let i=0;i<n;i++){const a=gl.getActiveUniform(p,i);u[a.name]=gl.getUniformLocation(p,a.name);}
+  return {p,u};
+}
+const world=src('g-common')+src('g-world'),sceneFS=world+src('g-near')+src('g-objects')+src('g-interior')+src('g-main');
+const P={
+  scene:program(HDR+world+src('v-scene'),HDR+sceneFS,'Scene'),
+  pre:qs.has('nopre')?null:program(HDR+world+src('v-scene'),HDR+'#define PREPASS\n'+sceneFS,'Depth prepass'),
+  comp:program(src('v-quad'),src('f-comp'),'Composite'),
+  bright:program(src('v-quad'),HDR+src('g-expo')+src('f-bright'),'Bright pass'),
+  adapt:program(src('v-quad'),src('f-adapt'),'Adaptation'),
+  final:program(src('v-quad'),HDR+src('g-expo')+src('f-final'),'Final')
+};
+
+// procedural lookup textures (no image files): a random lattice with its neighbours packed per texel, and 4 random channels
+function mulberry(seed){return()=>{seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const N=256,rnd=mulberry(1907);
+const base=new Uint8Array(N*N),hashD=new Uint8Array(N*N*4),noiseD=new Uint8Array(N*N*4);
+for(let i=0;i<N*N;i++) base[i]=rnd()*256;
+for(let i=0;i<N*N*4;i++) hashD[i]=rnd()*256;
+for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+  const o=(y*N+x)*4,x1=(x+1)&255,y1=(y+1)&255;
+  noiseD[o]=base[y*N+x];noiseD[o+1]=base[y*N+x1];noiseD[o+2]=base[y1*N+x];noiseD[o+3]=base[y1*N+x1];
+}
+function lut(data,filter){
+  const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,N,N,0,gl.RGBA,gl.UNSIGNED_BYTE,data);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+  return t;
+}
+const texNoise=lut(noiseD,gl.NEAREST),texHash=lut(hashD,gl.NEAREST),texSmooth=lut(hashD,gl.LINEAR);
+
+// the route program, shared by the shaders (as a lookup texture) and the simulation
+const PERIOD=4800,TUNNELS=[[3900,4500],[1750,2000]];
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+const smooth=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const route={
+  lake:xm=>smooth(260,560,xm)*(1-smooth(1440,1700,xm)),
+  dense:xm=>smooth(2850,2980,xm)*(1-smooth(3330,3440,xm)),
+  spur:xm=>230*smooth(3870,4070,xm)*(1-smooth(4330,4530,xm))+150*smooth(1720,1860,xm)*(1-smooth(1890,2030,xm)),
+  gorge:xm=>1-smooth(0,105,Math.abs(xm-3570)),
+  zv:xm=>450+95*Math.sin(2*Math.PI*xm/PERIOD+1)+45*Math.sin(6*Math.PI*xm/PERIOD)+150*route.lake(xm)
+};
+const texRoute=gl.createTexture();
+{
+  const n=4096,d=new Float32Array(n*4);
+  for(let i=0;i<n;i++){const xm=(i+.5)/n*PERIOD;d.set([route.lake(xm)-route.dense(xm),route.spur(xm),route.gorge(xm),route.zv(xm)],i*4);}
+  gl.bindTexture(gl.TEXTURE_2D,texRoute);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,n,1,0,gl.RGBA,gl.FLOAT,d);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+// forest cover: three octaves of periodic value noise, tile = 2160 m
+const texForest=gl.createTexture();
+{
+  const n=512,d=new Uint8Array(n*n*4);
+  const vn=(x,y,per,sx,sy)=>{
+    const xi=Math.floor(x),yi=Math.floor(y),fx=x-xi,fy=y-yi,u=fx*fx*(3-2*fx),v=fy*fy*(3-2*fy);
+    const L=(i,j)=>base[((((i%per)+per)%per+sx)&255)+((((j%per)+per)%per+sy)&255)*N]/255;
+    const a=L(xi,yi),b=L(xi+1,yi),c=L(xi,yi+1),e=L(xi+1,yi+1);
+    return a+(b-a)*u+(c-a)*v+(a-b-c+e)*u*v;
+  };
+  for(let y=0;y<n;y++)for(let x=0;x<n;x++){
+    const u=(x+.5)/n,v=(y+.5)/n,o=(y*n+x)*4;
+    d[o]=255*(.6*vn(u*8,v*8,8,3,7)+.28*vn(u*24,v*24,24,40,90)+.12*vn(u*72,v*72,72,120,30));
+    d[o+1]=255*vn(u*8,v*8,8,77,151);d[o+2]=255*vn(u*144,v*144,144,9,60);d[o+3]=255;
+  }
+  gl.bindTexture(gl.TEXTURE_2D,texForest);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,n,n,0,gl.RGBA,gl.UNSIGNED_BYTE,d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+}
+
+function target(w,h,n,filter,mips,wrap){
+  const f=gl.createFramebuffer(),t=[];gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  for(let i=0;i<n;i++){
+    const x=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,x);
+    gl.texStorage2D(gl.TEXTURE_2D,mips?Math.floor(Math.log2(Math.max(w,h)))+1:1,gl.RGBA16F,w,h);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,mips?gl.LINEAR_MIPMAP_LINEAR:filter);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,wrap||gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,wrap||gl.CLAMP_TO_EDGE);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,x,0);t.push(x);
+  }
+  gl.drawBuffers(t.map((_,i)=>gl.COLOR_ATTACHMENT0+i));
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) fail('Could not create the render targets.');
+  return {f,t,w,h};
+}
+const drop=T=>{if(T){T.t.forEach(x=>gl.deleteTexture(x));gl.deleteFramebuffer(T.f);}};
+const adapt=[target(1,1,1,gl.NEAREST),target(1,1,1,gl.NEAREST)];
+let adaptI=0,adaptReset=1;
+const R={scene:null,pre:null,comp:null,bright:null,w:0,h:0};
+let budget=(+qs.get('mp')||.75)*1e6;                       // pixels shaded per frame by the scene pass
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const cw=Math.max(2,Math.round(canvas.clientWidth*dpr)),ch=Math.max(2,Math.round(canvas.clientHeight*dpr));
+  if(canvas.width!==cw||canvas.height!==ch){canvas.width=cw;canvas.height=ch;}
+  const s=Math.min(1,Math.sqrt(budget/(cw*ch)));
+  const w=Math.max(32,Math.round(cw*s)),h=Math.max(32,Math.round(ch*s));
+  if(w===R.w&&h===R.h) return;
+  drop(R.scene);drop(R.pre);drop(R.comp);drop(R.bright);
+  R.w=w;R.h=h;
+  R.scene=target(w,h,2,gl.NEAREST);
+  R.pre=target((w+1)>>1,(h+1)>>1,1,gl.NEAREST);
+  R.comp=target(w,h,1,gl.LINEAR);
+  R.bright=target(Math.max(2,w>>1),Math.max(2,h>>1),1,gl.LINEAR,true);
+}
+// bake the coarse mountain relief once
+const BAKE=Math.min(2048,gl.getParameter(gl.MAX_TEXTURE_SIZE));
+const bake=target(BAKE,BAKE,1,gl.LINEAR,true,gl.REPEAT);
+{
+  const b=program(src('v-quad'),src('f-bake'),'Terrain bake');
+  gl.useProgram(b.p);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,texHash);
+  gl.uniform1i(b.u.uHash,0);gl.uniform1f(b.u.uSize,BAKE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,bake.f);gl.viewport(0,0,BAKE,BAKE);gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.bindTexture(gl.TEXTURE_2D,bake.t[0]);gl.generateMipmap(gl.TEXTURE_2D);
+  gl.deleteProgram(b.p);
+}
+const bind=(unit,t)=>{gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t);};
+const draw=(T,w,h)=>{gl.bindFramebuffer(gl.FRAMEBUFFER,T?T.f:null);gl.viewport(0,0,T?T.w:w,T?T.h:h);gl.drawArrays(gl.TRIANGLES,0,3);};
+
+// ───────────────────────── the journey: track, carriage motion, camera ─────────────────────────
+const TK1=2*Math.PI*2/PERIOD,TK2=2*Math.PI*5/PERIOD,TA1=105,TA2=26,TP1=.6,TP2=1.9;
+const trackZ=x=>TA1*Math.sin(TK1*x+TP1)+TA2*Math.sin(TK2*x+TP2);
+const trackD=x=>TA1*TK1*Math.cos(TK1*x+TP1)+TA2*TK2*Math.cos(TK2*x+TP2);
+const SPEED=24,SHUTTER=1/48;                       // 86 km/h, 180-degree shutter at 24 fps
+const EYE=[-.5,1.24,.8];                           // window seat, carriage space
+const DEF={yaw:.38,pitch:-.09,fov:56*Math.PI/180},FOV_MIN=.3,FOV_MAX=1.45;
+const norm=v=>{const l=Math.hypot(...v);return v.map(x=>x/l);};
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+// 3x3 matrices, column-major
+const mul=(a,b)=>{const o=[];for(let c=0;c<3;c++)for(let r=0;r<3;r++)o[c*3+r]=a[r]*b[c*3]+a[3+r]*b[c*3+1]+a[6+r]*b[c*3+2];return o;};
+const mv=(m,v)=>[m[0]*v[0]+m[3]*v[1]+m[6]*v[2],m[1]*v[0]+m[4]*v[1]+m[7]*v[2],m[2]*v[0]+m[5]*v[1]+m[8]*v[2]];
+const tmv=(m,v)=>[m[0]*v[0]+m[1]*v[1]+m[2]*v[2],m[3]*v[0]+m[4]*v[1]+m[5]*v[2],m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];
+const rotX=a=>{const c=Math.cos(a),s=Math.sin(a);return[1,0,0,0,c,s,0,-s,c];};
+const rotY=a=>{const c=Math.cos(a),s=Math.sin(a);return[c,0,-s,0,1,0,s,0,c];};
+const rotZ=a=>{const c=Math.cos(a),s=Math.sin(a);return[c,s,0,-s,c,0,0,0,1];};
+const SUN=norm([.62,.40,-.55]);
+
+const sim={x:qs.has('x')?+qs.get('x'):4350,t:qs.has('t')?+qs.get('t'):0,paused:qs.has('pause'),frame:0};
+const view={yaw:DEF.yaw,pitch:DEF.pitch,fov:DEF.fov,tyaw:DEF.yaw,tpitch:DEF.pitch,tfov:DEF.fov,idle:0,home:true,vy:0,vp:0};
+for(const k of['yaw','pitch','fov']) if(qs.has(k)){view[k]=view['t'+k]=+qs.get(k)*Math.PI/180;view.home=false;view.idle=-1e9;}
+
+// carriage sway: slow roll and hunting, plus a small kick at every rail joint
+function sway(t,x){
+  const j=((x%18)+18)%18/SPEED,jolt=Math.exp(-9*j)*Math.sin(46*j);
+  return{
+    roll:.0075*Math.sin(1.9*t+.3)+.0045*Math.sin(3.1*t+1.3)+.003*Math.sin(.71*t)+.0012*jolt,
+    yaw:.0022*Math.sin(1.3*t+.4)+.0013*Math.sin(2.7*t+2),
+    pitch:.001*Math.sin(2.1*t+.3)+.0006*jolt,
+    lat:.016*Math.sin(1.1*t+2)+.008*Math.sin(2.3*t+.7),
+    bounce:.005*Math.sin(5.3*t)+.003*Math.sin(7.9*t+1)+.004*jolt
+  };
+}
+function carPose(x,t){
+  const th=Math.atan(trackD(x)),c=Math.cos(th),s=Math.sin(th),sw=sway(t,x);
+  const lat=sw.lat+1.1*sw.roll;                                 // rolls about rail level
+  const rot=mul([c,0,s,0,1,0,-s,0,c],mul(rotX(sw.roll),mul(rotY(sw.yaw),rotZ(sw.pitch))));
+  return{rot,pos:[x-s*lat,1.1+sw.bounce,trackZ(x)+c*lat],sw,th};
+}
+// the passenger's head rides the motion loosely: it lags and partly cancels the carriage
+function camPose(t,sw){
+  const eye=[EYE[0]+.004*Math.sin(.9*t+1),EYE[1]+.003*Math.sin(1.7*t)-.3*sw.bounce,EYE[2]+.006*Math.sin(1.2*t+.5)-.25*sw.lat];
+  const yaw=view.yaw-.4*sw.yaw+.0015*Math.sin(.6*t),pitch=view.pitch+.001*Math.sin(.83*t+2);
+  const roll=-.45*sw.roll+.002*Math.sin(.5*t+1);
+  const cp=Math.cos(pitch),f=[Math.sin(yaw)*cp,Math.sin(pitch),Math.cos(yaw)*cp];
+  const r0=norm([-f[2],0,f[0]]),u0=cross(r0,f),cr=Math.cos(roll),sr=Math.sin(roll);
+  const r=[r0[0]*cr+u0[0]*sr,r0[1]*cr+u0[1]*sr,r0[2]*cr+u0[2]*sr],u=cross(r,f);
+  return{eye,rot:[...r,...u,...f]};
+}
+function nearestTunnel(x){
+  const k=Math.floor(x/PERIOD);let best={a:-1e6,b:-1e6+1,depth:-1e9};
+  for(const dk of[-1,0,1])for(const[a,b]of TUNNELS){
+    const a0=(k+dk)*PERIOD+a,b0=(k+dk)*PERIOD+b;
+    const depth=x<a0?x-a0:x>b0?b0-x:Math.min(x-a0,b0-x);        // positive inside, negative outside
+    if(depth>best.depth) best={a:a0,b:b0,depth};
+  }
+  return best;
+}
+function village(x){
+  const k=Math.floor(x/PERIOD),xm=x-k*PERIOD;
+  if(xm>1900&&xm<3600){const cx=k*PERIOD+2450;return{v:[cx,-30,trackZ(cx)+100,1],r:[86,31,3]};}
+  const cx=(xm>=3600?k+1:k)*PERIOD+1050;
+  return{v:[cx,-119,trackZ(cx)+route.zv(1050)-290-98,1],r:[96,33,11]};
+}
+
+// ───────────────────────── input: drag to look, wheel / pinch to zoom, drift home when left alone ─────────────────────────
+const pts=new Map();let pinch=0,lastMove=0;
+const touched=()=>{view.idle=0;view.home=false;};
+const spread=()=>{const[a,b]=[...pts.values()];return Math.hypot(a[0]-b[0],a[1]-b[1]);};
+canvas.addEventListener('pointerdown',e=>{
+  try{canvas.setPointerCapture(e.pointerId);}catch(_){}
+  pts.set(e.pointerId,[e.clientX,e.clientY]);
+  if(pts.size===2) pinch=spread();
+  view.vy=view.vp=0;lastMove=performance.now();canvas.classList.add('drag');touched();
+});
+canvas.addEventListener('pointermove',e=>{
+  const p=pts.get(e.pointerId);if(!p) return;
+  const dx=e.clientX-p[0],dy=e.clientY-p[1];pts.set(e.pointerId,[e.clientX,e.clientY]);touched();
+  if(pts.size===1){
+    const k=2*Math.tan(view.fov/2)/canvas.clientHeight,now=performance.now(),dt=Math.max(.004,(now-lastMove)/1000);lastMove=now;
+    view.tyaw+=dx*k;view.tpitch=clamp(view.tpitch+dy*k,-1.45,1.45);
+    view.vy=.6*view.vy+.4*dx*k/dt;view.vp=.6*view.vp+.4*dy*k/dt;
+  }else if(pts.size===2){
+    const d=spread();if(pinch>0&&d>0) view.tfov=clamp(view.tfov*pinch/d,FOV_MIN,FOV_MAX);pinch=d;
+  }
+});
+const release=e=>{
+  pts.delete(e.pointerId);pinch=0;
+  if(!pts.size){canvas.classList.remove('drag');if(performance.now()-lastMove>90) view.vy=view.vp=0;}
+  touched();
+};
+canvas.addEventListener('pointerup',release);canvas.addEventListener('pointercancel',release);
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  view.tfov=clamp(view.tfov*Math.exp(e.deltaY*(e.ctrlKey?.01:.0012)),FOV_MIN,FOV_MAX);touched();
+},{passive:false});
+canvas.addEventListener('dblclick',()=>{view.idle=1e3;});
+for(const g of['gesturestart','gesturechange','gestureend']) document.addEventListener(g,e=>e.preventDefault());
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+
+function updateView(dt){
+  view.idle+=dt;
+  if(!pts.size){
+    view.tyaw+=view.vy*dt;view.tpitch=clamp(view.tpitch+view.vp*dt,-1.45,1.45);
+    const f=Math.exp(-dt*5.5);view.vy*=f;view.vp*=f;
+    if(view.idle>3.5&&!view.home){                               // ease back to the window
+      const k=1-Math.exp(-dt*1.7*smooth(3.5,5,view.idle));
+      let dy=DEF.yaw-view.tyaw;dy-=Math.round(dy/(2*Math.PI))*2*Math.PI;
+      view.tyaw+=dy*k;view.tpitch+=(DEF.pitch-view.tpitch)*k;view.tfov+=(DEF.fov-view.tfov)*k;
+      if(Math.abs(dy)<2e-4&&Math.abs(DEF.pitch-view.tpitch)<2e-4&&Math.abs(DEF.fov-view.tfov)<2e-4) view.home=true;
+    }
+  }
+  const s=1-Math.exp(-dt*16);
+  view.yaw+=(view.tyaw-view.yaw)*s;view.pitch+=(view.tpitch-view.pitch)*s;view.fov+=(view.tfov-view.fov)*s;
+}
+
+// ───────────────────────── frame ─────────────────────────
+const perf={sum:0,n:0,ok:0,cap:Math.max(budget,1.7e6),up:false,fixed:qs.has('mp')};
+function tune(ms){                                               // keep the frame rate by trading resolution
+  if(perf.fixed||ms>100||sim.t<1.5) return;                      // ignore hitches, throttled tabs and start-up
+  perf.sum+=ms;if(++perf.n<40) return;
+  const avg=perf.sum/perf.n;perf.sum=perf.n=0;
+  if(avg>21.5){if(perf.up) perf.cap=budget*.9;budget=Math.max(1.4e5,budget*(avg>32?.68:.84));perf.ok=0;perf.up=false;}
+  else if(avg<17.6){perf.up=false;if(++perf.ok>=3&&budget<perf.cap*.99){budget=Math.min(perf.cap,budget*1.12);perf.ok=0;perf.up=true;}}
+  else{perf.ok=0;perf.up=false;}
+}
+function render(dt){
+  resize();
+  const car=carPose(sim.x,sim.t),cam=camPose(sim.t,car.sw);
+  const xp=sim.x-SPEED*SHUTTER/Math.hypot(1,trackD(sim.x));
+  const carP=carPose(xp,sim.t-SHUTTER),camP=camPose(sim.t-SHUTTER,carP.sw);
+  const tun=nearestTunnel(sim.x),vil=village(sim.x),tf=Math.tan(view.fov/2);
+  let s;
+  const sceneUniforms=()=>{
+    bind(0,texNoise);bind(1,texHash);bind(2,texSmooth);bind(3,bake.t[0]);bind(4,texRoute);bind(5,texForest);
+    gl.uniform1i(s.u.uNoise,0);gl.uniform1i(s.u.uHash,1);gl.uniform1i(s.u.uSmooth,2);gl.uniform1i(s.u.uBake,3);
+    gl.uniform1i(s.u.uRoute,4);gl.uniform1i(s.u.uForest,5);gl.uniform1i(s.u.uPre,6);
+    gl.uniform2f(s.u.uRes,R.w,R.h);gl.uniform1f(s.u.uTime,sim.t);gl.uniform1f(s.u.uTanFov,tf);
+    gl.uniform3fv(s.u.uSun,SUN);gl.uniform3fv(s.u.uSunC,tmv(car.rot,SUN));
+    gl.uniform1f(s.u.uBlur,SPEED*SHUTTER);gl.uniform2f(s.u.uFwd,Math.cos(car.th),Math.sin(car.th));
+    gl.uniform2f(s.u.uTun,tun.a,tun.b);gl.uniform1f(s.u.uTrainX,sim.x);
+    gl.uniform4fv(s.u.uVil,vil.v);gl.uniform3fv(s.u.uVilR,vil.r);
+    gl.uniform1f(s.u.uDay,1-smooth(-5,13,tun.depth));
+    gl.uniform3fv(s.u.uCarPos,car.pos);gl.uniformMatrix3fv(s.u.uCarRot,false,car.rot);
+    gl.uniform3fv(s.u.uCamPos,cam.eye);gl.uniformMatrix3fv(s.u.uCamRot,false,cam.rot);
+  };
+  bind(6,null);
+  if(P.pre){s=P.pre;gl.useProgram(s.p);sceneUniforms();gl.uniform1f(s.u.uPreOn,0);draw(R.pre);}
+  s=P.scene;gl.useProgram(s.p);sceneUniforms();
+  bind(6,P.pre?R.pre.t[0]:null);gl.uniform1f(s.u.uPreOn,P.pre?1:0);
+  draw(R.scene);
+
+  s=P.comp;gl.useProgram(s.p);bind(0,R.scene.t[0]);bind(1,R.scene.t[1]);
+  gl.uniform1i(s.u.uExt,0);gl.uniform1i(s.u.uInt,1);
+  gl.uniform2f(s.u.uRes,R.w,R.h);gl.uniform1f(s.u.uTanFov,tf);
+  gl.uniform1f(s.u.uMaxBlur,R.w*.05);gl.uniform1f(s.u.uJit,(sim.frame%64)*7.31);
+  gl.uniform3fv(s.u.uCamW,add(car.pos,mv(car.rot,cam.eye)));gl.uniform3fv(s.u.uPrevCamW,add(carP.pos,mv(carP.rot,camP.eye)));
+  gl.uniformMatrix3fv(s.u.uBasis,false,mul(car.rot,cam.rot));gl.uniformMatrix3fv(s.u.uPrevBasis,false,mul(carP.rot,camP.rot));
+  draw(R.comp);
+
+  const key=+qs.get('key')||.15;
+  s=P.bright;gl.useProgram(s.p);bind(0,R.comp.t[0]);bind(1,adapt[adaptI].t[0]);
+  gl.uniform1i(s.u.uSrc,0);gl.uniform1i(s.u.uAdapt,1);gl.uniform1f(s.u.uKey,key);
+  gl.uniform2f(s.u.uResB,R.bright.w,R.bright.h);
+  draw(R.bright);
+  bind(0,R.bright.t[0]);gl.generateMipmap(gl.TEXTURE_2D);
+
+  s=P.adapt;gl.useProgram(s.p);bind(0,R.bright.t[0]);bind(1,adapt[adaptI].t[0]);
+  gl.uniform1i(s.u.uBright,0);gl.uniform1i(s.u.uPrev,1);
+  gl.uniform1f(s.u.uDt,dt);gl.uniform1f(s.u.uReset,adaptReset);
+  draw(adapt[1-adaptI]);adaptI=1-adaptI;adaptReset=0;
+
+  s=P.final;gl.useProgram(s.p);bind(0,R.comp.t[0]);bind(1,R.bright.t[0]);bind(2,adapt[adaptI].t[0]);
+  gl.uniform1i(s.u.uSrc,0);gl.uniform1i(s.u.uBright,1);gl.uniform1i(s.u.uAdapt,2);gl.uniform1f(s.u.uKey,key);
+  gl.uniform2f(s.u.uOut,canvas.width,canvas.height);gl.uniform1f(s.u.uTime,sim.t+sim.frame*.618);gl.uniform1f(s.u.uBloom,+qs.get('bloom')||.4);
+  draw(null,canvas.width,canvas.height);
+  sim.frame++;
+}
+let last=0;
+function step(dt){
+  sim.t+=dt;
+  sim.x+=SPEED*dt/Math.hypot(1,trackD(sim.x));
+  if(sim.x>8*PERIOD+4200) sim.x-=8*PERIOD;                        // loop the route, unseen, deep inside the long tunnel
+}
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(.1,Math.max(0,(now-last)/1000));last=now;
+  if(!sim.paused){step(dt);if(!document.hidden) tune(dt*1000);}
+  updateView(dt);
+  render(sim.paused?0:dt);
+}
+window.__alps={sim,view,render,step,updateView,gl,canvas,R,get budget(){return budget;},set budget(v){budget=v;}};   // handle for inspection from the console
+requestAnimationFrame(t=>{last=t;frame(t);const h=$('hud');h.classList.add('on');setTimeout(()=>h.classList.remove('on'),9000);});
+})();
+</script>
+</body>
+</html>

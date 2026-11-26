@@ -1,0 +1,1451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#130e0b">
+<title>Whiskey, on the rocks</title>
+<style>
+:root { color-scheme: dark; font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+* { box-sizing: border-box; }
+html,body { height:100%; margin:0; overflow:hidden; background:#130e0b; }
+main,canvas { width:100%; height:100%; display:block; }
+main { position:relative; isolation:isolate; }
+canvas { touch-action:none; cursor:grab; outline:0; }
+canvas:active { cursor:grabbing; }
+canvas:focus-visible { outline:1px solid #c5ad8c; outline-offset:-4px; }
+#controls { position:absolute; inset:auto max(24px,env(safe-area-inset-right)) max(22px,env(safe-area-inset-bottom)) max(24px,env(safe-area-inset-left)); display:flex; justify-content:space-between; align-items:center; gap:16px; pointer-events:none; color:rgba(255,248,234,.82); transition:opacity .65s ease; }
+#hint { font-size:11px; letter-spacing:.045em; font-weight:450; text-shadow:0 1px 5px #080402; }
+#actions { display:flex; gap:7px; pointer-events:auto; }
+button { width:36px;height:36px;display:grid;place-items:center; appearance:none; background:rgba(22,18,14,.44); border:1px solid rgba(244,227,201,.23); color:inherit; border-radius:50%; cursor:pointer; backdrop-filter:blur(8px); }
+button[hidden],#controls[hidden] { display:none; }
+button:hover,button:focus-visible { background:rgba(60,46,34,.85); color:white; border-color:rgba(255,246,226,.7); }
+button:focus-visible { outline:2px solid #ebc997; outline-offset:2px; }
+button svg { width:14px;height:14px; fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round; }
+#controls.quiet:not(:focus-within):not(:hover) { opacity:0; }
+#controls.quiet:hover { opacity:1; }
+#orbit[aria-pressed="true"] .play,#orbit[aria-pressed="false"] .pause { display:none; }
+#status { position:absolute; inset:0; display:grid; place-items:center; text-align:center; padding:24px; pointer-events:none; color:#e9d3b7; font-size:13px; letter-spacing:.03em; }
+#status[hidden] { display:none; }
+@media (max-width:600px) { #controls { inset-inline:16px; bottom:max(16px,env(safe-area-inset-bottom)); } button {width:39px;height:39px;} }
+@media (prefers-reduced-motion:reduce) { #controls {transition:none;} }
+</style>
+</head>
+<body>
+<main aria-label="Whiskey, on the rocks">
+<canvas id="scene" tabindex="0" aria-label="A whiskey tumbler with slowly melting ice on a dark wooden bar. Use the arrow keys to orbit, plus and minus to zoom, and space to pause automatic orbit."></canvas>
+<div id="controls">
+<span id="hint">Drag to orbit · Scroll to zoom</span>
+<div id="actions">
+<button id="orbit" type="button" aria-pressed="true" title="Pause automatic orbit" aria-label="Pause automatic orbit"><svg viewBox="0 0 20 20" aria-hidden="true"><path class="pause" d="M7.3 4.7v10.6m5.4-10.6v10.6" stroke-width="2.1"/><path class="play" d="m6.5 4.2 8.7 5.8-8.7 5.8z"/></svg></button>
+<button id="fullscreen" type="button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3.7H3.7V7M13 3.7h3.3V7M16.3 13v3.3H13M3.7 13v3.3H7"/></svg></button>
+</div></div>
+<div id="status" role="status">Lighting the scene…</div>
+</main>
+<script type="x-shader/x-vertex" id="vert">#version 300 es
+precision highp float;
+out vec2 vUv;
+void main() {
+    vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);
+    vUv=p;
+    gl_Position=vec4(p*2.-1.,0.,1.);
+}
+</script>
+<script type="x-shader/x-fragment" id="world">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform float uTime;
+uniform vec3 uEye,uForward,uRight,uUp;
+uniform vec2 uView,uJitter;
+uniform sampler2D uPhotons,uNewPhotons,uReflection;
+uniform float uPhotonBlend;
+uniform bool uMirrorPass;
+uniform float uFocus;
+uniform vec2 uMirrorPixel;
+float rayDepth;
+
+vec3 photonFlux(vec2 p) {
+    vec2 uv=(p-vec2(-2.,-2.6))/8.;
+    if(any(lessThan(uv,vec2(0))) || any(greaterThan(uv,vec2(1)))) return vec3(0.);
+    vec3 a=texture(uPhotons,uv).rgb,b=texture(uNewPhotons,uv).rgb;
+    return exp(mix(a,b,uPhotonBlend)*2.56494936)-1.;
+}
+// The bar and its surroundings are sampled in linear radiance. The only emitter
+// is the warm rectangular key. The narrower strips are reflections off the room.
+vec3 lightPos() { return vec3(-3.8, 4.4, -2.0); }
+float envHash(vec2 p) {
+    vec3 h = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+    h += dot(h, h.yzx + 33.33);
+    return fract((h.x + h.y) * h.z);
+}
+float envNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(mix(envHash(i),envHash(i+vec2(1,0)),f.x),
+               mix(envHash(i+vec2(0,1)),envHash(i+1.),f.x), f.y);
+}
+float envGauss(float x) { return exp2(-x*x); }
+vec3 envReflected(vec3 d) {
+    vec3 dir = normalize(lightPos() - vec3(0.,1.,0.));
+    vec3 across = normalize(cross(vec3(0,1,0),dir));
+    vec3 up = cross(dir,across);
+    float facing = dot(d,dir);
+    vec2 keyUv = vec2(dot(d,across),dot(d,up));
+    // A little diffusion around the shade keeps bright edges photographic.
+    float key = (1.-smoothstep(.115,.17,abs(keyUv.x)))*(1.-smoothstep(.24,.31,abs(keyUv.y)));
+    float halo = exp2(-dot(keyUv*vec2(3.4,2.4),keyUv*vec2(3.4,2.4)));
+    float invHoriz = inversesqrt(max(.00001,dot(d.xz,d.xz)));
+    vec2 az = d.xz*invHoriz;
+    float horizon = envGauss((d.y+.035)*4.0);
+    float left = envGauss(dot(az,vec2(.87,.493))*8.2)*smoothstep(-.4,.25,dot(az,vec2(-.493,.87)));
+    float right = envGauss(dot(az,vec2(.29,.957))*13.)*smoothstep(-.4,.25,dot(az,vec2(.957,-.29)));
+    vec3 col = vec3(.016,.020,.022) + vec3(.028,.019,.010)*horizon;
+    // At table height the outer wall reflects lower portions of the room.
+    // The warm key illuminates this pale backing all the way down to the floor.
+    float cardHeight = smoothstep(-.94,-.58,d.y)*(1.-smoothstep(.63,.95,d.y));
+    float broadBounce = max(.0,dot(az,vec2(-.48,.877)));
+    broadBounce *= broadBounce*broadBounce;
+    col += cardHeight*(left*vec3(1.82,1.55,1.17)+right*vec3(.63,.60,.52)
+                     +broadBounce*vec3(.165,.104,.058));
+    return col + smoothstep(.25,.8,facing)*(key*vec3(12.0,8.0,4.6)+halo*vec3(.46,.29,.14));
+}
+vec3 envRoom(vec3 ro, vec3 rd) {
+    vec2 wallSize=vec2(12.3,9.8), side=sign(rd.xz+vec2(.00001));
+    vec2 travel=(wallSize-side*ro.xz)/max(abs(rd.xz),vec2(.005));
+    vec3 wall=ro+min(travel.x,travel.y)*rd;
+    bool sideWall=travel.x<travel.y;
+    float x=sideWall ? wall.z*side.x+21. : wall.x*side.y;
+    float y=wall.y;
+    float back=.5+.5*dot(normalize(rd.xz+vec2(.00001)),normalize(lightPos().xz));
+    float patina=envNoise(vec2(x*.18, y*.075+9.));
+    float velvet=envNoise(vec2(x*.53+2.,y*.19+13.));
+    vec3 col=vec3(.0064,.0069,.0086)+vec3(.019,.0081,.0036)*patina*patina;
+    float spill=envGauss((x+2.8)*.22)*envGauss((y-1.4)*.35)*(.40+.60*back);
+    col+=vec3(.041,.019,.0079)*spill*(.36+.64*velvet);
+    // Deep recesses break up the reflected light on the antique backbar.
+    float cabinet=abs(fract(x*.19+.15)-.5);
+    col*=.64+.36*smoothstep(.008,.16,cabinet);
+    float shelf=.6*envGauss((y+.51)*6.)+.26*envGauss((y-2.95)*4.9);
+    col=mix(col,vec3(.007,.0061,.0061),shelf);
+    col+=vec3(.037,.021,.009)*envGauss((y+.60)*12.)*(.13+.87*patina)*back;
+    // Only the catching edges of decanters resolve at this focus distance.
+    float fineCell=x*.89+45.;
+    float k=floor(fineCell), f=fract(fineCell)-.5;
+    vec2 id=vec2(k,sideWall?9.:12.);
+    float a=envHash(id+1.61),b=envHash(id+9.13);
+    float by=y+.48, height=.83+1.35*a;
+    float chord=(f+.19*(a-.5))+.20-.105*smoothstep(height*.49,height*.88,by);
+    float glancing=envGauss(chord*(9.+7.*b))*smoothstep(-.04,.27,by)*(1.-smoothstep(.62*height,1.04*height,by));
+    col+=vec3(.026,.016,.008)*glancing*pow(b,2.3)*(.32+.68*back);
+    // Small groups of copper and cream bokeh belong to polished bottle
+    // shoulders and brasswork. Their positions are independent of shelf pitch.
+    float cluster=floor(x/5.4), offset=x-(cluster+.5)*5.4;
+    vec2 groupSeed=vec2(cluster,sideWall?15.7:3.4);
+    float baseY=-.09+envHash(groupSeed+5.77)*1.78;
+    float groupLight=.41+.59*envHash(groupSeed+17.3);
+    for(int j=0;j<4;j++) {
+        float n=float(j);
+        vec2 seed=groupSeed+vec2(1.73*n,8.13*n+.8);
+        vec2 center=vec2((envHash(seed)-.5)*3.78, baseY+(envHash(seed+2.62)-.5)*1.55);
+        vec2 delta=vec2(offset,y)-center;
+        delta.x*=.91+.21*envHash(seed+23.1);
+        float dist=length(delta);
+        float rad=.025+.112*pow(envHash(seed+7.58),.8)+.042*float(j==0);
+        float blur=.033+.060*envHash(seed+5.19);
+        float disc=1.-smoothstep(max(.0,rad-blur*.74),rad+blur,dist);
+        float feather=envGauss(dist/(rad*1.72+blur));
+        float gain=(.048+.55*pow(envHash(seed+19.81),2.1))*groupLight;
+        vec3 tone=mix(vec3(1.,.46,.14),vec3(1.,.78,.49),envHash(seed+17.7));
+        col+=tone*(disc*.85+feather*.17)*gain;
+    }
+    return col;
+}
+// Long-grain walnut combines broad cathedral figure, dark summerwood and
+// much finer pores. At grazing angles the high frequencies dissolve first.
+vec3 envWood(vec2 p,float footprint, out float fibers) {
+    vec2 g=mat2(.996,.085,-.085,.996)*p;
+    const float width=2.24;
+    float board=floor((g.y+1.17)/width), across=mod(g.y+1.17,width);
+    vec2 seed=vec2(board,5.11);
+    float a=envHash(seed), b=envHash(seed+8.63);
+    float coarse=envNoise(g*vec2(.24,.81)+board*.73);
+    float mid=envNoise(g*vec2(.70,2.8)+seed+18.);
+    float small=envNoise(g*vec2(1.31,6.5)+12.);
+    // A tangential cut through the annual rings creates broad walnut cathedrals.
+    float x=g.x-(a-.5)*6.6;
+    float y=across-width*(.20+.62*b)+.18*(coarse-.5)+.12*sin(g.x*.83+board*3.);
+    float depth=.23+.040*x*x+.11*sin(x*.94+board*2.1)+.14*coarse;
+    float phase=length(vec2(y,depth))*(7.2+2.1*b)+.34*mid+.113*small;
+    float irregular=envNoise(vec2(phase*.69+seed.y,g.x*.28+.42*mid));
+    phase+=.77*irregular+.18*envNoise(vec2(phase*1.57,g.x*.51+board));
+    float layer=floor(phase);
+    float late=envHash(vec2(layer,board+3.92));
+    float line=abs(fract(phase)-(.42+.12*(late-.5)));
+    float contrast=1./(1.+footprint*19.);
+    float striae=envNoise(vec2(g.x*.72+mid*.64,g.y*15.1+phase*.59));
+    float darkBand=envGauss(line/(.054+.073*late))*contrast*(.12+.88*mid)*(.24+.76*late);
+    float softBand=envGauss((line-.11)*3.7)*contrast;
+    float ripple=envNoise(vec2(g.x*1.15+mid*.5,g.y*49.+phase*.87));
+    float pore=envNoise(vec2(g.x*5.9+phase*.15, g.y*143.+phase*2.7+small*1.2));
+    float grainMask=.39+.61*envNoise(g*vec2(.46,3.9)+2.8);
+    float grainFine=1./(1.+footprint*84.);
+    fibers=((ripple-.5)*contrast*.73 + (pore-.5)*grainFine*.66)*grainMask;
+    float burl=envNoise(g*vec2(.29,1.1)+seed+16.);
+    float lightness=.50+.37*coarse+.24*burl+.15*mid+.38*striae-.30*darkBand-.067*softBand+.65*fibers;
+    float seam=min(across,width-across);
+    lightness*=1.-.28*envGauss(seam/(.005+footprint*.23))/(1.+footprint*44.);
+    float warmth=.86+.20*a+.17*burl;
+    return vec3(.118*warmth,.063,.035/warmth)*lightness;
+}
+// The brightest folds follow the refracted envelope of the tumbler. Inside
+// that envelope, smaller folds from the ice break up and drift independently.
+vec3 envCaustic(vec2 p) {
+    vec2 axis=normalize(-lightPos().xz);
+    vec2 q=vec2(dot(p,axis),dot(p,vec2(-axis.y,axis.x)));
+    if(q.x<-.99 || q.x>3.65 || abs(q.y)>1.82) return vec3(0.);
+    float t=uTime*.085;
+    vec2 w=q-vec2(.88,.0);
+    float warp=sin(w.x*3.7-w.y*2.2+t*.28)*.044+sin(w.y*6.3+w.x*2.2-t*.19)*.031;
+    float oval=length(vec2(w.x/1.47,w.y/.94));
+    float fold=oval-.92+warp+.066*sin(q.y*3.7+q.x*2.5+.4);
+    float breaks=.28+.72*smoothstep(-.64,.84,sin(q.x*4.37+q.y*3.03)+.66*cos(q.y*7.-q.x*1.2));
+    float rim=(.98*envGauss(fold*29.)+.28*envGauss(fold*10.))*breaks;
+    float mesh=sin(q.x*4.42+sin(q.y*5.6+t*.32)*1.36)+.73*cos(q.y*6.22-q.x*1.77+t*.26);
+    float fold2=envGauss(mesh*7.3)*(1.-smoothstep(.59,1.12,oval))*(.4+.6*breaks);
+    float wet = envGauss((length(p)-.968+warp*.24)*42.)*.17*pow(breaks,2.)*smoothstep(.93,.99,cos(atan(p.y,p.x)*4.+.5));
+    float pool=(1.-smoothstep(.36,1.21,oval))*(.49+.51*breaks);
+    float forward=smoothstep(-.75,.85,q.x);
+    return vec3(.96,.415,.094)*(rim*.32+fold2*.16)*forward + vec3(.25,.092,.019)*pool + vec3(.51,.31,.14)*wet;
+}
+vec3 envTable(vec3 p, vec3 rd, float distanceToTable) {
+    float footprint=.00068*min(24.,distanceToTable)/max(.14,abs(rd.y));
+    float fiber;
+    vec3 wood=envWood(p.xz,footprint,fiber);
+    vec3 toLight=lightPos()-p;
+    float d2=dot(toLight,toLight);
+    vec3 l=toLight*inversesqrt(d2);
+    float spill=19./(d2+1.7)*smoothstep(.05,.95,l.y);
+    // Remove the incident beam intercepted by the silhouette before adding
+    // the redirected photons. A clear part of the shadow then recovers the
+    // brightness of the uncovered wood without drawing a second pool of light.
+    vec2 path=(lightPos().xz-p.xz)*(2.12/lightPos().y);
+    float closest=clamp(-dot(p.xz,path)/max(.0001,dot(path,path)),0.,1.);
+    float border=length(p.xz+closest*path)-mix(.88,1.05,closest);
+    float penumbra=.025+.13*closest;
+    float visibility=smoothstep(-penumbra,penumbra,border);
+    float radius=length(p.xz);
+    float contact=.40+.60*smoothstep(.77,1.14,radius);
+    vec3 lampSpectrum=vec3(1.03,.82,.63);
+    vec3 diff=wood*(vec3(.112,.119,.134)*contact+lampSpectrum*spill*visibility);
+    vec3 halfvec=normalize(l-rd);
+    float rough=.21+.024*fiber;
+    float spec=exp((halfvec.y-1.)/(rough*rough));
+    float fres=.038+.48*pow(clamp(1.+rd.y,0.,1.),4.);
+    diff+=vec3(1.,.70,.43)*spec*spill*fres*(.72+.46*fiber)*visibility;
+    vec3 photons=photonFlux(p.xz);
+    // Photons are normalized to the unobstructed beam on this same plane.
+    vec3 transmitted=lampSpectrum*spill*photons;
+    float glancing=.065+.55*pow(1.+rd.y,3.);
+    float contactTransmission=.25+.75*smoothstep(.81,1.09,radius);
+    float concentration=smoothstep(1.1,4.5,max(photons.r,max(photons.g,photons.b)));
+    vec3 finish=vec3(.072,.075,.073)*concentration*(.72+.65*fres);
+    diff+=(transmitted*(wood*(1.38+.48*concentration)+glancing*.06+finish)+envCaustic(p.xz)*(.050+.62*wood))*contactTransmission;
+    float edgeOcclusion=.10*envGauss((radius-.985)*16.)+.09*(1.-smoothstep(.78,1.17,radius));
+    return diff*(1.-edgeOcclusion);
+}
+vec3 environment(vec3 ro, vec3 rd) {
+    if(rd.y<-.0003 && ro.y>-.001) {
+        float t=-ro.y/rd.y;
+        vec3 p=ro+rd*t;
+        // A finite slab leaves a sightline to the backbar below the horizon.
+        vec2 uv=mat2(.993,.118,-.118,.993)*p.xz;
+        float edge=min(14.-abs(uv.x),4.4-abs(uv.y));
+        if(t>=0. && edge>-.13) {
+            vec3 wood=envTable(p,rd,t);
+            if(edge>.13) return wood;
+            return mix(envRoom(ro,rd),wood,smoothstep(-.13,.13,edge));
+        }
+    }
+    return envRoom(ro,rd);
+}
+
+// The glass samples the practical at its actual position. Its bright frosted
+// face and the softer reflections in the bar give curved surfaces an HDR range.
+vec3 practical(vec3 p, vec3 d) {
+    vec3 light=lightPos();
+    vec3 n=normalize(vec3(0.,1.07,0.)-light);
+    float den=dot(d,n);
+    if(den>=-.02)return vec3(0.);
+    float t=dot(light-p,n)/den;
+    if(t<0.)return vec3(0.);
+    vec3 offset=p+t*d-light;
+    vec3 across=normalize(cross(n,vec3(0,1,0))), up=cross(across,n);
+    vec2 uv=vec2(dot(offset,across),dot(offset,up));
+    vec2 normalized=abs(uv)/vec2(.82,1.18);
+    float edge=max(normalized.x,normalized.y);
+    float softbox=1.-smoothstep(.91,1.015,edge);
+    float core=exp(-dot(uv*vec2(1.2,.97),uv*vec2(1.2,.97)));
+    return softbox*(vec3(7.6,4.95,2.67)+vec3(12.4,9.75,6.55)*core);
+}
+// Bronze and pale timber catch the single key. Their crisp edges and dark
+// mullions appear in both the glass and the image bent through the ice.
+vec3 bouncedLight(vec3 d){
+    vec2 az=d.xz/max(.0001,length(d.xz));
+    vec2 wing=vec2(-.64,.768);
+    float face=dot(az,wing);
+    float x=dot(az,vec2(wing.y,-wing.x));
+    float y=d.y;
+    float broad=(1.-smoothstep(.20,.34,abs(x+.020)))*smoothstep(.1,.75,face);
+    float slat=(1.-smoothstep(.012,.034,abs(x+.067)));
+    float edge=exp(-abs(x-.145)*83.)+.30*exp(-abs(x+.205)*142.);
+    float vertical=smoothstep(-.78,-.39,y)*(1.-smoothstep(.48,.77,y));
+    vec3 diffuse=(vec3(.73,.68,.56)*(.4+.6*smoothstep(-.31,.30,y))+
+                  vec3(3.,2.76,2.16)*edge)*broad*(1.-.80*slat);
+    vec2 wall=vec2(.997,.075);
+    float q=dot(az,wall);
+    float panel=exp(-abs(q-.04)*15.5)*smoothstep(.25,.81,dot(az,vec2(-wall.y,wall.x)));
+    return vertical*(diffuse+panel*vec3(.26,.25,.225));
+}
+vec3 transmittedScene(vec3 p,vec3 d){
+    vec3 room=environment(p,d);
+    float seesRoom=1.;
+    if(d.y<-.0001 && p.y>0.){
+        vec2 floorP=p.xz-d.xz*p.y/d.y;
+        vec2 b=mat2(.993,.118,-.118,.993)*floorP;
+        seesRoom=1.-smoothstep(-.05,.15,min(14.-abs(b.x),4.4-abs(b.y)));
+    }
+    return room+practical(p,d)+bouncedLight(d)*seesRoom;
+}
+
+// Condensation lives in cylindrical surface coordinates, so every bead stays registered
+// to the turning glass. The small normal lens is resolved by the glass transport pass.
+vec3 dewRandom(vec2 cell) {
+    vec3 p = fract(vec3(cell.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.xxy + p.yzz) * p.zyx);
+}
+
+// xy are the normal slopes in the tangent frame; z is antialiased wet coverage.
+vec3 dewCap(vec2 delta, vec2 axes, float taper) {
+    vec2 q = delta / axes;
+    q.x *= 1.0 + taper * clamp(q.y, -0.8, 1.0);
+    float r2 = dot(q, q);
+    if (r2 >= 1.38) return vec3(0.0);
+    float edge = clamp(0.0023 / min(axes.x, axes.y), 0.055, 0.48);
+    float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, sqrt(r2));
+    vec2 slope = q * (0.90 / sqrt(max(0.145, 1.0 - 0.855 * min(r2, 1.0))));
+    slope.y *= axes.x / axes.y;
+    return vec3(slope, alpha);
+}
+
+vec3 dewStationary(vec2 uv, float circumference, float columns, float cellHeight,
+                   vec2 radii, float abundance, vec2 salt) {
+    vec2 grid = vec2(uv.x * columns, uv.y / cellHeight);
+    vec2 cell = floor(grid);
+    cell.x = mod(cell.x, columns);
+    vec3 h = dewRandom(cell + salt);
+    if (h.z > abundance) return vec3(0.0);
+    vec2 local = fract(grid) - mix(vec2(0.22), vec2(0.78), h.xy);
+    vec2 offset = local * vec2(circumference / columns, cellHeight);
+    vec3 h2 = dewRandom(cell.yx + salt + 29.0);
+    float growth = 0.77 + 0.23 * sin(uTime * (0.017 + 0.019 * h2.y) + 6.28318 * h2.z);
+    float rad = mix(radii.x, radii.y, h2.x * h2.x) * growth;
+    return dewCap(offset, rad * vec2(1.0, 1.05 + 0.25 * h2.z), 0.11);
+}
+
+vec4 condensation(vec3 p, vec3 outwardNormal) {
+    if (p.y <= 0.18 || p.y >= 2.065 || abs(outwardNormal.y) > 0.25)
+        return vec4(outwardNormal, 0.0);
+    const float tau = 6.28318530718;
+    float u = atan(p.z, p.x) / tau + 0.5;
+    float circumference = tau * length(p.xz);
+    vec2 uv = vec2(u, p.y);
+    float az = tau * u;
+    float clusterDensity = 0.5 + 0.24 * sin(3.0 * az + 2.8 * p.y + 0.7)
+                      + 0.16 * sin(7.0 * az - 4.2 * p.y);
+    float chilled = 1.0 - 0.65 * smoothstep(1.45, 1.96, p.y);
+    float edgeFade = smoothstep(0.18, 0.27, p.y) * (1.0 - smoothstep(1.98, 2.065, p.y));
+
+    vec3 drop = dewStationary(uv, circumference, 30.0, 0.169, vec2(0.012, 0.037),
+                              chilled * (0.23 + 0.41 * clusterDensity), vec2(2.0, 13.0));
+    vec3 tiny = dewStationary(uv, circumference, 72.0, 0.086, vec2(0.0037, 0.0105),
+                              chilled * (0.075 + 0.26 * clusterDensity), vec2(37.0, 101.0));
+    if (tiny.z > drop.z) drop = tiny;
+    vec3 speck=dewStationary(uv,circumference,131.,.049,vec2(.002,.0066),
+        chilled*smoothstep(.39,.74,clusterDensity)*.34,vec2(14.5,75.));
+    if(speck.z>drop.z)drop=speck;
+
+    // At any moment just a few drops have collected enough water to break free.
+    float laneCoord = u * 20.0;
+    float lane = mod(floor(laneCoord), 20.0);
+    vec3 h = dewRandom(vec2(lane + 61.0, 21.0));
+    if (h.x < 0.49) {
+        vec3 h2 = dewRandom(vec2(lane + 4.0, 93.0));
+        float phase = fract(uTime / (24.0 + 14.0 * h2.z) + h.y);
+        float falling = smoothstep(0.32, 0.77, phase);
+        float top = 1.19 + 0.64 * h2.x;
+        float bottom = 0.3 + 0.37 * h2.y;
+        float headY = mix(top, bottom, falling);
+        float laneOffset = (fract(laneCoord) - (0.29 + 0.42 * h.z)) * (circumference / 20.0);
+        float curve = 0.013 * sin(8.0 * p.y + 8.0 * h.z) + 0.005 * sin(16.0 * p.y + 6.0 * h2.x);
+        vec2 offset = vec2(laneOffset - curve, p.y - headY);
+        float volume = smoothstep(0.0, 0.32, phase) * (1.0 - smoothstep(0.82, 1.0, phase));
+        float radius = mix(0.002, 0.035 + 0.008 * h2.y, volume);
+        vec3 head = dewCap(offset, radius * vec2(0.93, 1.09 + 0.25 * sin(3.14159 * falling)), 0.23);
+        head.z *= smoothstep(0.01, 0.15, volume);
+
+        float trailHeight = p.y - headY;
+        float trailLength = min(top - headY, 0.13 + 0.43 * volume);
+        if (trailHeight > 0.0 && trailHeight < trailLength) {
+            float trailFade = volume * (1.0 - smoothstep(0.0, trailLength, trailHeight));
+            float width = 0.004 + 0.005 * trailFade;
+            float q = offset.x / width;
+            float wet = (1.0 - smoothstep(0.55, 1.22, abs(q))) * trailFade;
+            drop *= 1.0 - wet;
+            if (0.38 * wet > drop.z) drop = vec3(0.28 * q, 0.03, 0.38 * wet);
+        }
+        if (head.z > drop.z) drop = head;
+    }
+
+    vec3 tangent = normalize(vec3(-p.z, 0.0, p.x));
+    vec3 up = normalize(cross(tangent, outwardNormal));
+    vec3 wetNormal = normalize(outwardNormal + tangent * drop.x + up * drop.y);
+    return vec4(wetNormal, drop.z * edgeFade);
+}
+
+// The unresolved bead footprint receives a narrow sliver of the key refracted to
+// its far edge, with an opposing contact crescent where the lens samples the room.
+vec4 dewLighting(vec3 p, vec3 normal, vec3 lens, vec3 ray) {
+    vec3 light = normalize(lightPos() - p);
+    vec3 tangentLight = light - normal * dot(normal, light);
+    tangentLight /= max(length(tangentLight), 0.001);
+    vec3 bend = lens - normal * dot(lens, normal);
+    float steep = length(bend);
+    float side = dot(bend, tangentLight) / max(0.001, steep);
+    float foot = smoothstep(0.45, 0.86, steep);
+    float lowerArc = foot * pow(max(0.0, -side), 3.0);
+    float upperArc = foot * smoothstep(-0.2, 0.75, side);
+    vec3 reflected = reflect(ray, lens);
+    float alignment = max(0.0, dot(reflected, light));
+    float glint = pow(alignment, 92.0) + 0.12 * pow(alignment, 17.0);
+    vec3 color = vec3(1.0, 0.81, 0.58) * (0.31 * lowerArc + 1.05 * glint);
+    return vec4(color, 1.0 - 0.39 * upperArc - 0.16 * foot);
+}
+
+// Nested interfaces of the heavy tumbler, spirit and four pieces of ice.
+// Distances are in glass radii. Optical coefficients are in inverse radii.
+const float oaNear = 0.00065;
+const float oaFar = 10000.0;
+const float oaLevel = 1.36;
+const int oaCubeCount = 4;
+uniform mat3 oaFrame[oaCubeCount];
+uniform vec3 oaCenter[oaCubeCount], oaExtent[oaCubeCount];
+uniform float oaRound[oaCubeCount];
+
+float oaHash(float n) {
+    return fract(sin(n*72.913+13.54)*43758.5453);
+}
+struct OaHit { float t; vec3 n; int nextMat; int kind; };
+void oaOffer(inout OaHit h,float t,vec3 n,vec3 d,int medium,int inside,int outside,int kind) {
+    if(t<oaNear || t>=h.t) return;
+    bool escaping=dot(n,d)>0.;
+    int from=escaping ? inside:outside;
+    if(from!=medium) return;
+    h.t=t; h.n=n; h.nextMat=escaping ? outside:inside; h.kind=kind;
+}
+void oaConeRoot(inout OaHit h,vec3 ro,vec3 rd,float t,vec2 a,vec2 b,float slope,bool inner,int medium,int kind) {
+    if(t<oaNear || t>=h.t)return;
+    vec3 p=ro+t*rd;
+    if(p.y<a.y-.00001 || p.y>b.y+.00001)return;
+    vec2 v=p.xz/max(.001,length(p.xz));
+    vec3 n=normalize(vec3(v.x,-slope,v.y))*(inner ? -1.:1.);
+    float meniscus=oaLevel+.022;
+    oaOffer(h,t,n,rd,medium,1,inner && p.y<meniscus ? 2:0,kind);
+}
+void oaBand(inout OaHit h,vec3 ro,vec3 rd,vec2 a,vec2 b,bool inner,int medium,int kind) {
+    float slope=(b.x-a.x)/(b.y-a.y);
+    float radius=a.x+slope*(ro.y-a.y);
+    float da=slope*rd.y;
+    float aa=dot(rd.xz,rd.xz)-da*da;
+    float bb=dot(ro.xz,rd.xz)-radius*da;
+    float cc=dot(ro.xz,ro.xz)-radius*radius;
+    float det=bb*bb-aa*cc;
+    if(det<0.)return;
+    if(abs(aa)<.000001){
+        if(abs(bb)>.000001)oaConeRoot(h,ro,rd,-cc/(2.*bb),a,b,slope,inner,medium,kind);
+        return;
+    }
+    float s=sqrt(det);
+    oaConeRoot(h,ro,rd,(-bb-s)/aa,a,b,slope,inner,medium,kind);
+    oaConeRoot(h,ro,rd,(-bb+s)/aa,a,b,slope,inner,medium,kind);
+}
+void oaDisc(inout OaHit h,vec3 ro,vec3 rd,float y,float lo,float hi,float signY,int medium,int outside,int kind) {
+    if(abs(rd.y)<.00001)return;
+    float t=(y-ro.y)/rd.y;
+    if(t<oaNear || t>=h.t)return;
+    vec2 q=ro.xz+t*rd.xz;
+    float r2=dot(q,q);
+    if(r2>=lo*lo && r2<=hi*hi)
+        oaOffer(h,t,vec3(0,signY,0),rd,medium,1,outside,kind);
+}
+// Profile of the polished heel, gently tapered walls, and rolled rim.
+void oaGlass(inout OaHit h,vec3 ro,vec3 rd,int medium) {
+    if(medium!=2){
+        oaBand(h,ro,rd,vec2(.817,.019),vec2(.865,.036),false,medium,2);
+        oaBand(h,ro,rd,vec2(.865,.036),vec2(.892,.078),false,medium,2);
+        oaBand(h,ro,rd,vec2(.892,.078),vec2(.900,.17),false,medium,2);
+        oaBand(h,ro,rd,vec2(.900,.17),vec2(1.05,2.08),false,medium,1);
+        oaBand(h,ro,rd,vec2(1.05,2.08),vec2(1.051,2.094),false,medium,2);
+        oaBand(h,ro,rd,vec2(1.051,2.094),vec2(1.046,2.109),false,medium,2);
+        oaBand(h,ro,rd,vec2(1.046,2.109),vec2(1.031,2.12),false,medium,2);
+        oaDisc(h,ro,rd,.019,0.,.817,-1.,medium,0,2);
+        oaDisc(h,ro,rd,2.12,1.016,1.031,1.,medium,0,2);
+    }
+    oaBand(h,ro,rd,vec2(.754,.257),vec2(.811,.281),true,medium,3);
+    oaBand(h,ro,rd,vec2(.811,.281),vec2(.840,.345),true,medium,3);
+    oaBand(h,ro,rd,vec2(.840,.345),vec2(.990,2.08),true,medium,3);
+    if(medium!=2){
+        oaBand(h,ro,rd,vec2(.990,2.08),vec2(.994,2.103),true,medium,3);
+        oaBand(h,ro,rd,vec2(.994,2.103),vec2(1.002,2.115),true,medium,3);
+        oaBand(h,ro,rd,vec2(1.002,2.115),vec2(1.016,2.12),true,medium,3);
+    }
+    oaDisc(h,ro,rd,.257,0.,.754,1.,medium,2,3);
+}
+float oaWaterHeight(vec2 p){
+    float wallRadius=.928;
+    float rise=exp(-max(0.,wallRadius-length(p))*36.);
+    return oaLevel+.022*rise+.0026*sin(5.*p.x+3.*p.y+.27*uTime)*cos(3.*p.y-.17*uTime);
+}
+void oaSurface(inout OaHit h,vec3 ro,vec3 rd,int medium) {
+    if(abs(rd.y)<.0003) return;
+    float t=(oaLevel-ro.y)/rd.y;
+    if(t<-.03/abs(rd.y) || t>h.t+.03/abs(rd.y)) return;
+    for(int j=0;j<2;j++) t=(oaWaterHeight(ro.xz+rd.xz*t)-ro.y)/rd.y;
+    vec2 p=ro.xz+rd.xz*t;
+    float rad=length(p);
+    if(t<oaNear || t>=h.t || rad>.932)return;
+    vec2 grad=.792*exp(-max(0.,.928-rad)*36.)*p/max(rad,.01);
+    grad+=.009*vec2(cos(5.*p.x+3.*p.y+.27*uTime),sin(3.*p.y-.17*uTime));
+    oaOffer(h,t,normalize(vec3(-grad.x,1.,-grad.y)),rd,medium,2,0,4);
+}
+
+// Broken corners and gently scalloped faces give each piece a molded-ice profile.
+const vec3 oaChipA=vec3(.768,.552,-.325);
+const vec3 oaChipB=vec3(-.403,.315,.859);
+float oaRoundedBox(vec3 p,vec3 extent,float radius) {
+    vec3 d=abs(p)-extent+radius;
+    return length(max(d,0.))+min(max(d.x,max(d.y,d.z)),0.)-radius;
+}
+vec2 oaChips(vec3 p,vec3 extent) {
+    return vec2(dot(oaChipA,p)-dot(abs(oaChipA),extent)+.133,
+                dot(oaChipB,p)-dot(abs(oaChipB),extent)+.100);
+}
+float oaBoxDistance(vec3 p,vec3 extent,float radius) {
+    vec2 chips=oaChips(p,extent);
+    float faceted=max(oaRoundedBox(p,extent,radius),max(chips.x,chips.y));
+    float dimple=.009*(1.+sin(dot(p,vec3(9.,12.,3.)))*cos(dot(p,vec3(2.,-7.,10.))));
+    return faceted+dimple;
+}
+void oaIceHit(inout OaHit h,vec3 ro,vec3 rd,int medium,int id){
+    bool leaving=(medium==id+3);
+    if(medium>=3 && !leaving)return;
+    mat3 w=oaFrame[id];
+    vec3 o=(ro-oaCenter[id])*w,d=rd*w;
+    vec3 e=oaExtent[id]; float r=oaRound[id];
+    vec3 sd=mix(vec3(-1.),vec3(1.),greaterThanEqual(d,vec3(0.)))/max(abs(d),vec3(.000001));
+    vec3 a=(-e-o)*sd,b=(e-o)*sd;
+    vec3 t0=min(a,b),t1=max(a,b);
+    float lo=max(t0.x,max(t0.y,t0.z)),hi=min(t1.x,min(t1.y,t1.z));
+    if(hi<max(lo,oaNear)|| max(lo,oaNear)>h.t)return;
+    float t=leaving ? hi:max(lo,oaNear);
+    float way=leaving ? -1.:1.;
+    vec3 q=o+t*d;
+    for(int j=0;j<8;j++){
+        float dist=oaBoxDistance(q,e,r);
+        if(dist<.0007) break;
+        t+=dist*way;
+        if(t<oaNear || t>hi+.00001 || t<lo-.00001 || t>=h.t)return;
+        q=o+t*d;
+    }
+    if(t<oaNear || t>=h.t || abs(oaBoxDistance(q,e,r))>.0045)return;
+    vec3 bevel=max(abs(q)-e+r,vec3(0.))*sign(q);
+    vec3 face=normalize(bevel+vec3(.0000001));
+    vec2 chips=oaChips(q,e);
+    float roundBox=oaRoundedBox(q,e,r);
+    face=mix(face,oaChipA,smoothstep(-.009,.009,chips.x-roundBox));
+    face=mix(face,oaChipB,smoothstep(-.009,.009,chips.y-max(chips.x,roundBox)));
+    vec3 ca=vec3(9.,12.,3.),cb=vec3(2.,-7.,10.);
+    float pa=dot(q,ca),pb=dot(q,cb);
+    face+=.009*(ca*cos(pa)*cos(pb)-cb*sin(pa)*sin(pb));
+    vec3 n=normalize(w*face);
+    vec3 p=ro+rd*t;
+    if(leaving) {
+        if(dot(n,rd)<=0.)return;
+        h.t=t;h.n=n;h.nextMat=p.y>oaWaterHeight(p.xz) ? 0:2;h.kind=5;
+    }else{
+        oaOffer(h,t,n,rd,medium,id+3,medium,5);
+    }
+}
+float oaIndex(int medium){return medium==0 ? 1.:medium==1 ? 1.515:medium==2 ? 1.354:1.309;}
+vec3 oaFlutedNormal(vec3 p,vec3 n) {
+    // Fine, shallow thumb cuts fade into the uninterrupted upper wall.
+    float angle=atan(p.z,p.x), a=angle*16.;
+    float cut=.5+.5*cos(a);
+    float envelope=smoothstep(.09,.19,p.y)*(1.-smoothstep(.35+.23*cut,.59+.20*cut,p.y));
+    vec3 tangent=vec3(-n.z,0.,n.x);
+    float waviness=.004*sin(11.*angle+2.*p.y)+.003*cos(18.*angle-3.*p.y);
+    return normalize(n+tangent*(.21*sin(a)*envelope+waviness)+vec3(0.,.010*cut*envelope,0.));
+}
+vec3 oaIceNormal(vec3 p,vec3 n,int id){
+    vec3 q=(p-oaCenter[id])*oaFrame[id];
+    vec3 wave=sin(q.yzx*14.+q.zxy*7.+float(id))*cos(q.zxy*12.-q.xyz*5.);
+    wave+=.41*sin(q.xyz*39.+q.yzx*24.);
+    return normalize(n+oaFrame[id]*wave*.030);
+}
+// Plane inclusions, trapped gas and a cloudy core are evaluated inside the ice.
+vec3 oaIceInclusions(vec3 p,vec3 d,float span,int id,out float veil) {
+    vec3 o=(p-oaCenter[id])*oaFrame[id];
+    vec3 v=d*oaFrame[id];
+    float fi=float(id), opacity=0.;
+    vec3 glow=vec3(0.);
+    for(int j=0;j<3;j++){
+        float k=float(j)+fi*3.;
+        vec3 n=normalize(vec3(sin(2.71*k+.6),cos(1.82*k+.3),sin(4.1*k+2.1)));
+        float den=dot(v,n);
+        if(abs(den)<.015)continue;
+        float t=(.17*(oaHash(k+5.)-.5)-dot(o,n))/den;
+        if(t<.0001 || t>span)continue;
+        vec3 q=o+t*v;
+        vec3 tangent=normalize(cross(n,vec3(.13,1.,.07)));
+        vec2 uv=vec2(dot(q,tangent),dot(q,cross(tangent,n)));
+        uv-=.09*vec2(sin(k*1.7),cos(k*2.2));
+        // Thin branching fissures terminate at intersecting crystalline planes.
+        float jag=.010*sin(uv.x*35.+k)+.004*sin(uv.x*84.-k);
+        float spine=uv.y-.37*uv.x-jag;
+        float split=uv.y+.44*uv.x-.026+.005*sin(62.*uv.x+k);
+        float ends=smoothstep(-.28,-.065,uv.x)*(1.-smoothstep(.09,.24,uv.x));
+        float major=exp(-abs(spine)*300.)*ends;
+        float fork=exp(-abs(split)*390.)*smoothstep(-.024,.026,uv.x)*(1.-smoothstep(.027,.12,uv.x));
+        float z=spine*sign(sin(k+.4));
+        float plane=ends*smoothstep(-.002,.007,z)*(1.-smoothstep(.012,.075,z));
+        float striae=.5+.5*sin(uv.y*238.+uv.x*76.+2.4*sin(uv.x*24.+k));
+        float signal=(.078*major+.048*fork+.034*plane*(.42+.58*striae))
+                    *(.49+.90*pow(1.-abs(den),1.4));
+        // An internal cleavage plane traps a feather of air. Resolve a few
+        // narrow reflective facets, with fine gas inclusions tapering off near
+        // the edge of the fissure rather than an opaque outline.
+        vec2 hub=uv+vec2(.105,.014);
+        float feather=atan(hub.y,hub.x);
+        float ridge=envNoise(uv*vec2(32.,68.)+k);
+        float endLen=.19+.057*ridge+.013*sin(40.*feather+k);
+        float taper=1.-smoothstep(.025,endLen,length(hub));
+        float spread=(1.-smoothstep(.20,.73,abs(feather-.15*sin(k))))*taper;
+        float splinters=pow(.5+.5*cos(48.*feather+6.*ridge),8.);
+        float micro=envHash(floor(uv*460.)+k);
+        float gas=spread*(.08+.92*pow(micro,5.))*smoothstep(.24,.74,ridge);
+        float reflecting=spread*splinters*(.35+.65*ridge);
+        vec3 wn=oaFrame[id]*normalize(n+tangent*(ridge-.5)*.085);
+        vec3 reflectDir=reflect(d,wn);
+        vec3 high=vec3(.12,.145,.15)+.27*bouncedLight(reflectDir)+.17*practical(p+t*d,reflectDir);
+        glow+=reflecting*high+gas*vec3(.54,.56,.55);
+        opacity+=signal*.32+.23*gas+.17*reflecting;
+        glow+=signal*vec3(.84,.86,.82);
+    }
+    for(int j=0;j<8;j++){
+        float k=float(j)+fi*11.;
+        vec3 c=vec3(oaHash(k+41.2),oaHash(k+71.7),oaHash(k+120.8))-.5;
+        c=c*vec3(.42,.49,.39)+vec3(.025,0.,-.03);
+        float t=clamp(dot(c-o,v),0.,span);
+        vec3 dv=o+t*v-c;
+        float r=mix(.0044,.012,oaHash(k+86.));
+        float z=length(dv)/r;
+        float bubble=(1.-smoothstep(.85,1.15,z))*(.20+.73*smoothstep(.40,.89,z));
+        glow+=bubble*vec3(.46,.47,.43);
+        opacity+=bubble*.3;
+    }
+    float closeT=clamp(-dot(o,v),0.,span);
+    vec3 nearCore=(o+v*closeT)*vec3(1.1,.78,1.3);
+    float cloud=exp(-dot(nearCore,nearCore)*26.)*(1.-exp(-span*2.2));
+    // A narrow layer of frozen microbubbles follows a warped plane through the
+    // core. Integrated along the transmitted ray, it has real parallax.
+    float bloom=0.;
+    for(int j=0;j<4;j++){
+        vec3 q=o+v*((float(j)+.47)*span*.25);
+        float folded=q.z+.45*q.x-.27*q.y+.038*sin(11.*q.y+fi)+.014*sin(27.*q.x-13.*q.y+fi);
+        float thread=exp(-abs(folded)*26.)*exp(-dot(q.xy*vec2(1.18,.82),q.xy*vec2(1.18,.82))*12.);
+        vec2 grains=q.xy*58.+q.z*vec2(21.,-49.)+fi;
+        float granularity=envNoise(grains);
+        float detail=.26+.76*granularity*granularity+.17*sin(dot(q,vec3(26.,65.,13.))+fi);
+        bloom+=thread*detail*span*.25;
+    }
+    glow+=bloom*vec3(.60,.69,.71);
+    veil=clamp(opacity+.09*cloud+.61*bloom,0.,.59);
+    return glow+cloud*vec3(.053,.068,.071);
+}
+vec3 oaWhiskeyGlow(vec3 p,vec3 d,float t){
+    vec3 mid=p+.5*t*d;
+    vec3 lightDir=normalize(lightPos()-mid);
+    float forward=.58+.42*pow(max(0.,dot(lightDir,d)),2.);
+    vec2 beam=normalize(lightDir.xz);
+    float along=dot(mid.xz,beam);
+    float across2=max(0.,dot(mid.xz,mid.xz)-along*along);
+    float pathToKey=max(0.,sqrt(max(.003,.897*.897-across2))-along);
+    vec3 penetration=exp(-pathToKey*vec3(.94,1.85,3.6));
+    float low=exp(-max(0.,mid.y-.25)*3.0);
+    float stripe=.5+.5*cos(11.*mid.x+4.2*mid.z+1.2*sin(6.*mid.z-2.*mid.x));
+    vec3 scatter=vec3(.25,.146,.029)*penetration*(.25+.75*forward);
+    scatter+=vec3(.089,.035,.005)*low*(.23+.77*stripe);
+    vec2 orth=vec2(-beam.y,beam.x);
+    float projected=dot(mid.xz,orth);
+    float shafts=sin(8.2*projected+mid.y*2.2+.81*sin(4.7*mid.y-1.42*along));
+    float lightBand=exp(-9.*shafts*shafts)*(.37+.63*low);
+    scatter+=lightBand*penetration*vec3(.085,.045,.007);
+    return scatter*(1.-exp(-1.65*t));
+}
+vec3 renderDrink(vec3 ro,vec3 rd,vec3 bg) {
+    vec3 delta=ro-vec3(0.,1.065,0.);
+    float proj=dot(delta,rd);
+    if(proj>0. || dot(delta,delta)-proj*proj>2.30)return bg;
+    vec3 origin=ro,dir=rd,gain=vec3(1.),radiance=vec3(0.);
+    int medium=0;
+    for(int bounce=0;bounce<12;bounce++){
+        OaHit h=OaHit(oaFar,vec3(0,1,0),0,0);
+        if(medium<3){
+            oaGlass(h,origin,dir,medium);
+            if(medium!=1)oaSurface(h,origin,dir,medium);
+        }
+        if(medium!=1){
+            for(int id=0;id<oaCubeCount;id++)oaIceHit(h,origin,dir,medium,id);
+        }
+        if(h.t>=oaFar-.1){
+            if(bounce==0)return bg;
+            break;
+        }
+        if(bounce==0)rayDepth=h.t;
+        vec3 p=origin+h.t*dir;
+        if(medium==2){
+            radiance+=gain*oaWhiskeyGlow(origin,dir,h.t);
+            gain*=exp(-vec3(.33,1.09,3.75)*h.t);
+        }else if(medium>=3){
+            float veil=0.;
+            vec3 scattering=oaIceInclusions(origin,dir,h.t,medium-3,veil);
+            radiance+=gain*scattering;
+            gain*=vec3(.989,.996,.996)*(1.-veil);
+        }
+        vec3 outward=h.n;
+        if(h.kind==1)outward=oaFlutedNormal(p,outward);
+        if((h.kind==2 || h.kind==3) && p.y>2.0801) {
+            float radius=length(p.xz);
+            vec2 radial=p.xz/radius;
+            vec3 rim=normalize(vec3(radial.x*(radius-1.021),max(.0002,p.y-2.087),radial.y*(radius-1.021)));
+            outward=normalize(mix(h.n,rim,.82));
+        }
+        if(h.kind==5)outward=oaIceNormal(p,outward,max(medium,h.nextMat)-3);
+        vec3 n=dot(h.n,dir)<0. ? outward:-outward;
+        vec3 geomN=dot(h.n,dir)<0. ? h.n:-h.n;
+        vec3 wetN=n;float wet=0.;
+        if(bounce==0 && h.kind==1){
+            vec4 drop=condensation(p,h.n);
+            wet=drop.w;
+            wetN=normalize(mix(n,drop.xyz,wet));
+        }
+        float eta=oaIndex(medium)/oaIndex(h.nextMat);
+        vec3 bent=refract(dir,n,eta);
+        if(wet>.002){
+            vec3 throughDrop=refract(dir,wetN,1./1.333);
+            if(dot(throughDrop,throughDrop)>.5){
+                vec3 throughWall=refract(throughDrop,n,1.333/1.515);
+                if(dot(throughWall,throughWall)>.5)bent=normalize(mix(bent,throughWall,wet));
+            }
+        }
+        float cosine=clamp(-dot(dir,wetN),0.,1.);
+        // Both polarization terms approach unity continuously at the critical angle.
+        float co=clamp(-dot(dir,n),.00001,1.);
+        float ct=sqrt(max(0.,1.-eta*eta*(1.-co*co)));
+        float rs=(eta*co-ct)/max(.00001,eta*co+ct);
+        float rp=(co-eta*ct)/max(.00001,co+eta*ct);
+        float fresnel=.5*(rs*rs+rp*rp);
+        fresnel=mix(fresnel,.0204+.9796*pow(1.-cosine,5.),wet);
+        vec3 reflected=reflect(dir,wetN);
+        if(dot(bent,bent)<.5){
+            dir=normalize(reflect(dir,n));
+            if(dot(dir,geomN)<.0001)dir=reflect(reflect(dir,n),geomN);
+            origin=p+geomN*.0014;
+            gain*=.988;
+            continue;
+        }
+        // The room seen in a surface reflection is already softened by its distance.
+        if(fresnel>.001 || h.kind==5){
+            vec3 lighting=envReflected(reflected)*.67 + practical(p,reflected) + bouncedLight(reflected);
+            vec3 toLamp=normalize(lightPos()-p);
+            float shine=pow(max(0.,dot(reflected,toLamp)),h.kind==5 ? 96.:170.);
+            lighting+=vec3(7.6,5.25,3.4)*shine;
+            if(wet>.002){
+                vec4 dewLight=dewLighting(p,n,wetN,dir);
+                radiance+=gain*wet*dewLight.rgb;
+                gain*=mix(1.,dewLight.a,wet);
+            }
+            if(medium==2)lighting*=vec3(.74,.38,.12);
+            if(h.kind==5){
+                float clearSide=(medium==0||h.nextMat==0) ? 1.:.32;
+                float frost=(.015+.045*pow(1.-cosine,2.))*clearSide;
+                radiance+=gain*frost*vec3(.76,.82,.80);
+            }
+            radiance+=gain*fresnel*lighting;
+        }
+        gain*=1.-fresnel;
+        dir=normalize(bent);
+        if(dot(dir,geomN)>.0001){
+            vec3 physical=refract(reflect(reflected,wetN),geomN,eta);
+            if(dot(physical,physical)>.5)dir=physical;
+        }
+        origin=p-geomN*.00135;
+        bool exterior=(h.kind==1||h.kind==2) && medium==1 && h.nextMat==0;
+        medium=h.nextMat;
+        if(exterior || max(gain.r,max(gain.g,gain.b))<.01)break;
+    }
+    return radiance+gain*transmittedScene(origin,dir);
+}
+
+vec3 packRadiance(vec3 x) { x=clamp(x,0.,100.); return sqrt(x/(1.+x)); }
+void main(){
+    vec2 xy=((vUv+(uMirrorPass?vec2(0.):uJitter))*2.-1.)*uView;
+    vec3 ray=normalize(uForward+xy.x*uRight+xy.y*uUp);
+    rayDepth=100.;
+    if(uMirrorPass){
+        if(ray.y>-.0001){frag=vec4(0.);return;}
+        vec3 point=uEye+ray*(-uEye.y/ray.y);
+        if(dot(point.xz,point.xz)>11.){frag=vec4(0.);return;}
+        vec3 c=renderDrink(point+vec3(0,.0011,0),ray*vec3(1,-1,1),vec3(-1.));
+        frag=c.r<0.?vec4(0.):vec4(packRadiance(c),1.);
+        return;
+    }
+    vec3 bg=environment(uEye,ray);
+    if(ray.y<-.0001) {
+        float t=-uEye.y/ray.y;
+        vec3 p=uEye+ray*t;
+        vec2 board=mat2(.993,.118,-.118,.993)*p.xz;
+        if(abs(board.x)<14. && abs(board.y)<4.4){
+            rayDepth=t;
+            // A thin oil finish reflects the subject with a broad, grain-disturbed lobe.
+            if(dot(p.xz,p.xz)<12.0){
+                float fib=envNoise(p.xz*vec2(3.1,48.));
+                vec2 bend=uMirrorPixel*vec2(1.2,2.0)*(fib-.5);
+                vec2 width=uMirrorPixel*(1.5+7.*smoothstep(.50,2.4,length(p.xz)));
+                vec4 mirror=texture(uReflection,vUv+bend)*.24;
+                const vec2 po[8]=vec2[](vec2(.31,-.76),vec2(-.38,.89),vec2(.98,.22),vec2(-.94,-.34),vec2(-.42,.25),vec2(.52,.36),vec2(.10,.97),vec2(-.02,-.45));
+                for(int i=0;i<8;i++) mirror+=texture(uReflection,vUv+bend+po[i]*width)*.095;
+                if(mirror.a>.002){
+                    vec3 reflected=mirror.rgb/mirror.a; reflected*=reflected;
+                    reflected=reflected/max(vec3(.002),1.-reflected);
+                    float f=.12+.76*pow(1.-abs(ray.y),4.);
+                    bg=mix(bg,reflected*vec3(.97,.91,.84),clamp(f*mirror.a,0.,.65));
+                }
+            }
+        }
+    }
+    vec3 col=renderDrink(uEye,ray,bg);
+    float axialDepth=rayDepth*dot(ray,uForward);
+    float defocus=clamp(1.-uFocus/max(axialDepth,.001),-1.,1.);
+    frag=vec4(packRadiance(col),.5+.5*defocus);
+}
+</script>
+<script type="x-shader/x-fragment" id="resolve">#version 300 es
+precision highp float;
+in vec2 vUv;out vec4 frag;
+uniform sampler2D uImage,uPrevious;
+uniform vec3 uOrigin,uPrevOrigin;
+uniform mat3 uAxes,uPrevAxes;
+uniform vec2 uView,uPrevView,uPixel,uJitter;
+uniform float uFocus,uWeight;
+void main(){
+    vec4 cur=texture(uImage,vUv);
+    vec3 ray=uAxes*vec3(((vUv+uJitter)*2.-1.)*uView,1.);
+    float z=min(100.,uFocus/max(.005,2.-2.*cur.a));
+    vec3 inPrevious=transpose(uPrevAxes)*(uOrigin-uPrevOrigin+z*ray);
+    vec2 uv=.5+.5*inPrevious.xy/(max(.01,inPrevious.z)*uPrevView);
+    if(uWeight<.01 || any(lessThan(uv,vec2(.001))) || any(greaterThan(uv,vec2(.999)))){
+        frag=cur;return;
+    }
+    vec3 low=cur.rgb,high=low;
+    for(int i=0;i<4;i++){
+        vec2 o=i==0?vec2(1,0):i==1?vec2(-1,0):i==2?vec2(0,1):vec2(0,-1);
+        vec3 q=texture(uImage,vUv+o*uPixel).rgb;
+        low=min(low,q);high=max(high,q);
+    }
+    vec4 hist=textureLod(uPrevious,uv,0.);
+    vec3 old=clamp(hist.rgb,low-.014,high+.014);
+    float confidence=exp(-7.*length(old-cur.rgb))*(1.-smoothstep(.028,.09,abs(hist.a-cur.a)));
+    frag=vec4(mix(cur.rgb,old,uWeight*(.55+.45*confidence)),cur.a);
+}
+</script>
+<script type="x-shader/x-fragment" id="blur">#version 300 es
+precision highp float;
+in vec2 vUv;out vec4 frag;
+uniform sampler2D uImage;
+uniform vec2 uStep;
+uniform bool uExtract;
+vec3 sampleL(vec2 uv){
+    vec3 c=texture(uImage,uv).rgb;
+    if(!uExtract) return c;
+    c=c*c; c=c/max(vec3(.001),1.-c);
+    float l=dot(c,vec3(.25,.62,.13));
+    return min(c*max(0.,l-.7)/(l+.01),vec3(12.))*.0833333;
+}
+void main(){
+    vec3 c=sampleL(vUv)*.20;
+    c+=(sampleL(vUv+uStep*vec2(1,1))+sampleL(vUv+uStep*vec2(-1,1))+
+        sampleL(vUv+uStep*vec2(1,-1))+sampleL(vUv-uStep))*.12;
+    c+=(sampleL(vUv+uStep*vec2(2.5,0))+sampleL(vUv-uStep*vec2(2.5,0))+
+        sampleL(vUv+uStep*vec2(0,2.5))+sampleL(vUv-uStep*vec2(0,2.5)))*.08;
+    frag=vec4(c,1.);
+}
+</script>
+<script type="x-shader/x-fragment" id="grade">#version 300 es
+precision highp float;
+in vec2 vUv;out vec4 frag;
+uniform sampler2D uImage,uGlow,uHalo;
+uniform vec2 uTexel;
+uniform float uFrame;
+// A short directional reconstruction pass keeps the thin lip and ice edges continuous.
+float luma(vec3 c){return dot(c,vec3(.299,.587,.114));}
+vec3 reconstruct(vec2 uv) {
+    vec3 m=texture(uImage,uv).rgb;
+    float l=luma(m),w=luma(texture(uImage,uv-vec2(uTexel.x,0)).rgb),
+          e=luma(texture(uImage,uv+vec2(uTexel.x,0)).rgb),
+          n=luma(texture(uImage,uv+vec2(0,uTexel.y)).rgb),
+          s=luma(texture(uImage,uv-vec2(0,uTexel.y)).rgb);
+    float range=max(max(n,s),max(e,w))-min(min(n,s),min(e,w));
+    if(range<.06) return m;
+    vec2 dir=vec2(n-s,w-e);
+    dir=dir/max(.001,max(abs(dir.x),abs(dir.y)));
+    vec3 filtered=.5*(texture(uImage,uv+dir*uTexel*.54).rgb+texture(uImage,uv-dir*uTexel*.54).rgb);
+    return mix(m,filtered,.46*smoothstep(.058,.19,range));
+}
+void main(){
+    float coc=texture(uImage,vUv).a*2.-1.;
+    vec3 c=reconstruct(vUv);
+    // Disc of confusion from axial depth. Reject nearer taps across silhouettes.
+    float radius=max(0.,abs(coc)-.055)*.024;
+    if(radius>uTexel.y*.58){
+        vec2 pixelRadius=radius*vec2(uTexel.x/uTexel.y,1.);
+        vec3 accum=c*c*.55; float weights=.55;
+        const float spiral=2.3999632;
+        for(int i=0;i<20;i++){
+            float j=float(i)+.5;
+            vec2 disc=sqrt(j/20.)*vec2(cos(j*spiral),sin(j*spiral));
+            float footprint=max(0.,log2(1.+.28*radius/uTexel.y));
+            vec4 tap=textureLod(uImage,vUv+disc*pixelRadius,footprint);
+            float z=tap.a*2.-1.;
+            float w=smoothstep(-.18,-.025,z-coc);
+            accum+=tap.rgb*tap.rgb*w;weights+=w;
+        }
+        c=mix(c,sqrt(accum/weights),smoothstep(.4,1.3,radius/uTexel.y));
+    }
+    c*=c; c/=max(vec3(.001),1.-c);
+    c+=12.*(.065*texture(uGlow,vUv).rgb+.085*texture(uHalo,vUv).rgb);
+    vec2 frame=(vUv-.5)*vec2(1.10,.90);
+    c*=1.04*(1.-.37*dot(frame,frame));
+    // A gentle shoulder compresses the practical's highlights while retaining their color.
+    c=max(vec3(0),c-vec3(.002));
+    c=(c*(2.30*c+.041))/(c*(2.20*c+.55)+.145);
+    c=pow(clamp(c,0.,1.),vec3(1./2.2));
+    float grain=fract(52.9829189*fract(dot(gl_FragCoord.xy+mod(uFrame,127.),vec2(.06711056,.00583715))))-.5;
+    frag=vec4(c+grain*(.0034+.002*(1.-c.g)),1.);
+}
+</script>
+<script id="photons" type="text/plain">
+// The same stratified incident beam is reused throughout the pour. Each photon
+// transports three spectral weights through the glass, moving ice and whiskey.
+const photonSize = 320, photonBeam = 620, photonExtent = 8, photonX = -2, photonZ = -2.6;
+const photonIor = [1, 1.515, 1.354, 1.309, 1.309, 1.309, 1.309];
+const photonEps = .000065;
+const photonWalls = [];
+function photonWallProfile(points, inner) {
+  for (let i=1; i<points.length; i++) {
+    const [r0,lo]=points[i-1], [r1,hi]=points[i];
+    const slope=(r1-r0)/(hi-lo);
+    photonWalls.push({lo,hi,slope,b:r0-slope*lo, inner, sign:inner?-1:1, flutes:lo===.17});
+  }
+}
+photonWallProfile([[.817,.019],[.865,.036],[.892,.078],[.900,.17],[1.05,2.08],[1.051,2.094],[1.046,2.109],[1.031,2.12]],false);
+photonWallProfile([[.754,.257],[.811,.281],[.840,.345],[.990,2.08],[.994,2.103],[1.002,2.115],[1.016,2.12]],true);
+const photonDiscs = [[.019,0,.817**2,-1,0],[2.12,1.016**2,1.031**2,1,0],[.257,0,.754**2,1,2]];
+const photonIceShapes = [
+  [-.38,1.41,.17,.36,.395,.354,.27,.16,-.23,.083],
+  [.38,1.35,.14,.336,.38,.337,-.22,-.33,.27,.079],
+  [-.03,1.47,-.44,.365,.363,.297,-.26,.34,-.11,.072],
+  [-.08,.722,.01,.358,.375,.36,.08,.62,-.15,.095]
+];
+function photonLayout(time) {
+  const melt=time/(time+210), shrink=1-.17*melt;
+  return photonIceShapes.map(([x,y,z,ex,ey,ez,ax,ay,az,r],i)=>{
+    const f=i+1, sway=time*(.032+.004*f)+f*2.73;
+    x+=.019*Math.sin(sway); y+=.010*Math.cos(sway*1.71)-.065*melt; z+=.017*Math.cos(sway*.93);
+    ax+=.025*Math.sin(sway); ay+=.045*Math.cos(sway*.87); az+=.020*Math.sin(sway*1.3);
+    const ca=Math.cos(ax),sa=Math.sin(ax),cb=Math.cos(ay),sb=Math.sin(ay),cc=Math.cos(az),sc=Math.sin(az);
+    const m=[cc*cb,sc*cb,-sb,cc*sb*sa-sc*ca,sc*sb*sa+cc*ca,cb*sa,cc*sb*ca+sc*sa,sc*sb*ca-cc*sa,cb*ca];
+    ex*=shrink; ey*=shrink; ez*=shrink;
+    return {x,y,z,ex,ey,ez,r:r+.046*melt,m,
+      limit:ex*ex+ey*ey+ez*ez,
+      chipA:.133-.768*ex-.552*ey-.325*ez, chipB:.100-.403*ex-.315*ey-.859*ez};
+  });
+}
+function photonSmooth(a,b,x) { const t=Math.max(0,Math.min(1,(x-a)/(b-a))); return t*t*(3-2*t); }
+function photonLevel(x,z,t) {
+  const rise=Math.exp(-Math.max(0,.928-Math.sqrt(x*x+z*z))*36);
+  return 1.36+.022*rise+.0026*Math.sin(5*x+3*z+.27*t)*Math.cos(3*z-.17*t);
+}
+function photonOffer(hit,t,nx,ny,nz,next,kind) {
+  hit.t=t; hit.nx=nx; hit.ny=ny; hit.nz=nz; hit.next=next; hit.kind=kind;
+}
+function photonGlass(ray,hit,time) {
+  const {x,y,z,dx,dy,dz,mat}=ray, lateral=dx*dx+dz*dz, proj=x*dx+z*dz, radial=x*x+z*z;
+  for (const wall of photonWalls) {
+    if(mat===2&&!wall.inner)continue;
+    const slope=wall.slope, k=slope*dy, radius=slope*y+wall.b;
+    const aa=lateral-k*k, bb=proj-k*radius, cc=radial-radius*radius;
+    const delta=bb*bb-aa*cc;
+    if(delta<0)continue;
+    const sqrt=Math.sqrt(delta);
+    for(let root=0;root<2;root++) {
+      const t=Math.abs(aa)<.000001 ? -cc/(2*bb) : (-bb+(root?sqrt:-sqrt))/aa;
+      if(!(t>photonEps&&t<hit.t))continue;
+      const hy=y+dy*t;
+      if(hy<wall.lo || hy>wall.hi)continue;
+      const hx=x+dx*t,hz=z+dz*t,sign=wall.sign;
+      const nx=hx*sign, ny=-slope*(hy*slope+wall.b)*sign, nz=hz*sign;
+      const outside=wall.inner&&hy<1.382 ? 2 : 0, leaving=nx*dx+ny*dy+nz*dz>0;
+      if(mat!==(leaving?1:outside))continue;
+      photonOffer(hit,t,nx,ny,nz,leaving?outside:1,wall.flutes?1:0);
+    }
+  }
+  if(Math.abs(dy)<1e-6)return;
+  for(const disc of photonDiscs) {
+    const t=(disc[0]-y)/dy, leaving=disc[3]*dy>0;
+    if(!(t>photonEps&&t<hit.t) || mat!==(leaving?1:disc[4]))continue;
+    const hx=x+t*dx,hz=z+t*dz, r=hx*hx+hz*hz;
+    if(r>=disc[1] && r<=disc[2])photonOffer(hit,t,0,disc[3],0,leaving?disc[4]:1,0);
+  }
+  if(mat===1 || (dy>0?mat!==2:mat!==0))return;
+  let t=(1.36-y)/dy;
+  if(t<-.03/Math.abs(dy)||t>hit.t+.03/Math.abs(dy))return;
+  for(let i=0;i<2;i++)t=(photonLevel(x+t*dx,z+t*dz,time)-y)/dy;
+  if(!(t>photonEps&&t<hit.t))return;
+  const hx=x+t*dx,hz=z+t*dz, r=Math.sqrt(hx*hx+hz*hz);
+  if(r>.932)return;
+  const grad=.792*Math.exp(-Math.max(0,.928-r)*36)/Math.max(.01,r);
+  const gx=grad*hx+.009*Math.cos(5*hx+3*hz+.27*time), gz=grad*hz+.009*Math.sin(3*hz-.17*time);
+  const exiting=(-gx*dx+dy-gz*dz)>0;
+  if(mat===(exiting?2:0))photonOffer(hit,t,-gx,1,-gz,exiting?0:2,0);
+}
+function photonBox(qx,qy,qz,cube) {
+  const x=Math.abs(qx)-cube.ex+cube.r,y=Math.abs(qy)-cube.ey+cube.r,z=Math.abs(qz)-cube.ez+cube.r;
+  const xx=Math.max(0,x),yy=Math.max(0,y),zz=Math.max(0,z);
+  const box=Math.sqrt(xx*xx+yy*yy+zz*zz)+Math.min(0,Math.max(x,y,z))-cube.r;
+  const chip1=.768*qx+.552*qy-.325*qz+cube.chipA, chip2=-.403*qx+.315*qy+.859*qz+cube.chipB;
+  return Math.max(box,chip1,chip2)+.009*(1+Math.sin(9*qx+12*qy+3*qz)*Math.cos(2*qx-7*qy+10*qz));
+}
+function photonIce(ray,hit,cube,id,time) {
+  const leaving=ray.mat===id+3;
+  const x=ray.x-cube.x,y=ray.y-cube.y,z=ray.z-cube.z, {dx,dy,dz}=ray;
+  const closest=Math.max(0,-(x*dx+y*dy+z*dz));
+  if((x+closest*dx)**2+(y+closest*dy)**2+(z+closest*dz)**2>cube.limit)return;
+  const m=cube.m,ox=m[0]*x+m[1]*y+m[2]*z,oy=m[3]*x+m[4]*y+m[5]*z,oz=m[6]*x+m[7]*y+m[8]*z;
+  const vx=m[0]*dx+m[1]*dy+m[2]*dz,vy=m[3]*dx+m[4]*dy+m[5]*dz,vz=m[6]*dx+m[7]*dy+m[8]*dz;
+  const ax=(-cube.ex-ox)/vx,bx=(cube.ex-ox)/vx,ay=(-cube.ey-oy)/vy,by=(cube.ey-oy)/vy,az=(-cube.ez-oz)/vz,bz=(cube.ez-oz)/vz;
+  const lo=Math.max(Math.min(ax,bx),Math.min(ay,by),Math.min(az,bz));
+  const hi=Math.min(Math.max(ax,bx),Math.max(ay,by),Math.max(az,bz));
+  if(hi<Math.max(lo,photonEps)||Math.max(lo,photonEps)>=hit.t)return;
+  let t=leaving?hi:Math.max(lo,photonEps), qx,qy,qz,dist;
+  for(let step=0;step<9;step++) {
+    if(t<photonEps||t>=hit.t||t>hi+.00001||t<lo-.00001)return;
+    qx=ox+t*vx;qy=oy+t*vy;qz=oz+t*vz;
+    dist=photonBox(qx,qy,qz,cube);
+    if(dist<.0007||step===8)break;
+    t+=leaving?-dist:dist;
+  }
+  if(Math.abs(dist)>.0045)return;
+  let nx=Math.max(0,Math.abs(qx)-cube.ex+cube.r)*Math.sign(qx);
+  let ny=Math.max(0,Math.abs(qy)-cube.ey+cube.r)*Math.sign(qy);
+  let nz=Math.max(0,Math.abs(qz)-cube.ez+cube.r)*Math.sign(qz);
+  const length=Math.sqrt(nx*nx+ny*ny+nz*nz);
+  const rounded=length+Math.min(0,Math.max(Math.abs(qx)-cube.ex+cube.r,Math.abs(qy)-cube.ey+cube.r,Math.abs(qz)-cube.ez+cube.r))-cube.r;
+  const inv=1/Math.max(1e-7,length);nx*=inv;ny*=inv;nz*=inv;
+  const chipA=.768*qx+.552*qy-.325*qz+cube.chipA,chipB=-.403*qx+.315*qy+.859*qz+cube.chipB;
+  const c1=photonSmooth(-.009,.009,chipA-rounded),c2=photonSmooth(-.009,.009,chipB-Math.max(rounded,chipA));
+  nx=(nx*(1-c1)+.768*c1)*(1-c2)-.403*c2;ny=(ny*(1-c1)+.552*c1)*(1-c2)+.315*c2;nz=(nz*(1-c1)-.325*c1)*(1-c2)+.859*c2;
+  const pa=9*qx+12*qy+3*qz,pb=2*qx-7*qy+10*qz,cc=.009*Math.cos(pa)*Math.cos(pb),ss=.009*Math.sin(pa)*Math.sin(pb);
+  nx+=9*cc-2*ss;ny+=12*cc+7*ss;nz+=3*cc-10*ss;
+  nx+=.030*(Math.sin(14*qy+7*qz+id)*Math.cos(12*qz-5*qx)+.41*Math.sin(39*qx+24*qy));
+  ny+=.030*(Math.sin(14*qz+7*qx+id)*Math.cos(12*qx-5*qy)+.41*Math.sin(39*qy+24*qz));
+  nz+=.030*(Math.sin(14*qx+7*qy+id)*Math.cos(12*qy-5*qz)+.41*Math.sin(39*qz+24*qx));
+  const outward=nx*vx+ny*vy+nz*vz;
+  if(leaving?outward<=0:outward>=0)return;
+  const wx=m[0]*nx+m[3]*ny+m[6]*nz,wy=m[1]*nx+m[4]*ny+m[7]*nz,wz=m[2]*nx+m[5]*ny+m[8]*nz;
+  const next=leaving?(ray.y+t*dy>photonLevel(ray.x+t*dx,ray.z+t*dz,time)?0:2):id+3;
+  photonOffer(hit,t,wx,wy,wz,next,2);
+}
+function photonSeedRays() {
+  const buffer=[],ids=[];
+  let seed=7219;
+  function jitter(){seed=(Math.imul(1664525,seed)+1013904223)>>>0;return seed/4294967296;}
+  for(let j=0;j<photonBeam;j++)for(let i=0;i<photonBeam;i++) {
+    const x=-3.8+.22*(jitter()-.5), y=4.4+.14*(jitter()-.5), z=-2+.16*(jitter()-.5);
+    let dx=photonX+(i+jitter())*photonExtent/photonBeam-x,dy=-y,dz=photonZ+(j+jitter())*photonExtent/photonBeam-z;
+    const inv=1/Math.sqrt(dx*dx+dy*dy+dz*dz);dx*=inv;dy*=inv;dz*=inv;
+    const aa=dx*dx+dz*dz,bb=x*dx+z*dz,cc=x*x+z*z-1.054**2,delta=bb*bb-aa*cc;
+    if(delta<0)continue;
+    const root=Math.sqrt(delta),enter=Math.max((-bb-root)/aa,(2.122-y)/dy),exit=Math.min((-bb+root)/aa,(.017-y)/dy);
+    if(exit<enter)continue;
+    const t=Math.max(0,enter-.001);
+    buffer.push(x+t*dx,y+t*dy,z+t*dz,dx,dy,dz);ids.push(j*photonBeam+i);
+  }
+  return {rays:new Float64Array(buffer),ids:new Uint32Array(ids)};
+}
+let photonSamples;
+function bakePhotons(simulatedTime) {
+  const time=Number.isFinite(simulatedTime)?Math.max(0,simulatedTime):0;
+  const cubes=photonLayout(time),area=photonSize*photonSize,flux=new Float32Array(area*3);
+  photonSamples ??= photonSeedRays();
+  const {rays,ids}=photonSamples, uScale=photonSize/photonExtent;
+  const ray={x:0,y:0,z:0,dx:0,dy:0,dz:0,mat:0},hit={t:0,nx:0,ny:0,nz:0,next:0,kind:0};
+  for(let i=0,n=0;i<rays.length;i+=6,n++) {
+    ray.x=rays[i];ray.y=rays[i+1];ray.z=rays[i+2];ray.dx=rays[i+3];ray.dy=rays[i+4];ray.dz=rays[i+5];ray.mat=0;
+    let red=1,green=1,blue=1,touched=false;
+    for(let depth=0;depth<15;depth++) {
+      hit.t=ray.dy<-.00001?-ray.y/ray.dy:1e6;
+      const floor=hit.t;
+      if(ray.mat<3)photonGlass(ray,hit,time);
+      if(ray.mat===0||ray.mat===2) {
+        for(let c=0;c<cubes.length;c++)photonIce(ray,hit,cubes[c],c,time);
+      } else if(ray.mat>=3)photonIce(ray,hit,cubes[ray.mat-3],ray.mat-3,time);
+      if(hit.t===floor) {
+        if(touched&&ray.mat===0&&floor>0&&floor<1e5) {
+          const u=(ray.x+floor*ray.dx-photonX)*uScale-.5,v=(ray.z+floor*ray.dz-photonZ)*uScale-.5;
+          const ix=Math.floor(u),iz=Math.floor(v);
+          if(ix>=0&&iz>=0&&ix+1<photonSize&&iz+1<photonSize) {
+            const fx=u-ix,fz=v-iz,base=(iz*photonSize+ix)*3;
+            for(let k=0;k<4;k++){
+              const idx=base+3*(k&1)+3*photonSize*(k>>1),w=(k&1?fx:1-fx)*(k>>1?fz:1-fz);
+              flux[idx]+=red*w;flux[idx+1]+=green*w;flux[idx+2]+=blue*w;
+            }
+          }
+        }
+        break;
+      }
+      const t=hit.t;
+      if(ray.mat===2) {red*=Math.exp(-.33*t);green*=Math.exp(-1.09*t);blue*=Math.exp(-3.75*t);}
+      else if(ray.mat>=3) {red*=Math.exp(-.021*t);green*=Math.exp(-.010*t);blue*=Math.exp(-.009*t);}
+      ray.x+=ray.dx*t;ray.y+=ray.dy*t;ray.z+=ray.dz*t;
+      let nx=hit.nx,ny=hit.ny,nz=hit.nz;
+      if(hit.kind===1) {
+        const angle=Math.atan2(ray.z,ray.x),cut=.5+.5*Math.cos(16*angle);
+        const envelope=photonSmooth(.09,.19,ray.y)*(1-photonSmooth(.35+.23*cut,.59+.20*cut,ray.y));
+        const twist=.21*Math.sin(16*angle)*envelope+.004*Math.sin(11*angle+2*ray.y)+.003*Math.cos(18*angle-3*ray.y);
+        const oldX=nx;nx-=nz*twist;nz+=oldX*twist;ny+=.010*cut*envelope;
+      }
+      const norm=1/Math.sqrt(nx*nx+ny*ny+nz*nz);nx*=norm;ny*=norm;nz*=norm;
+      let dot=ray.dx*nx+ray.dy*ny+ray.dz*nz;
+      if(dot>0){nx=-nx;ny=-ny;nz=-nz;dot=-dot;}
+      const eta=photonIor[ray.mat]/photonIor[hit.next], cos=Math.min(1,-dot),sin2=eta*eta*(1-cos*cos);
+      const ct=Math.sqrt(Math.max(0,1-sin2)),s=(eta*cos-ct)/Math.max(.000001,eta*cos+ct),p=(cos-eta*ct)/Math.max(.000001,cos+eta*ct);
+      const reflect=.5*(s*s+p*p);
+      // Stochastic Fresnel branching keeps specular reflection and total
+      // internal reflection energy. The hash stays fixed as the ice shifts.
+      let branch=Math.imul(ids[n]^Math.imul(depth+1,0x9e3779b9),0x85ebca6b);branch=Math.imul(branch^(branch>>>16),0xc2b2ae35);
+      if(sin2>=1||((branch^(branch>>>13))>>>0)/4294967296<reflect) {
+        ray.dx-=2*dot*nx;ray.dy-=2*dot*ny;ray.dz-=2*dot*nz;
+      } else {
+        const bend=eta*dot+ct;
+        ray.dx=eta*ray.dx-bend*nx;ray.dy=eta*ray.dy-bend*ny;ray.dz=eta*ray.dz-bend*nz;ray.mat=hit.next;
+      }
+      touched=true;
+      const inv=1/Math.sqrt(ray.dx*ray.dx+ray.dy*ray.dy+ray.dz*ray.dz);ray.dx*=inv;ray.dy*=inv;ray.dz*=inv;
+      ray.x+=ray.dx*.00048;ray.y+=ray.dy*.00048;ray.z+=ray.dz*.00048;
+    }
+  }
+  const kernel=[Math.exp(-2.8),Math.exp(-.7),1,Math.exp(-.7),Math.exp(-2.8)];
+  const norm=kernel.reduce((a,b)=>a+b,0)**2,scale=(photonSize/photonBeam)**2/norm;
+  const first=new Float32Array(flux.length),packed=new Uint8Array(area*4);
+  for(let z=0;z<photonSize;z++)for(let x=0;x<photonSize;x++) {
+    const i=(z*photonSize+x)*3;
+    for(let k=-2;k<=2;k++) {
+      const src=(z*photonSize+Math.max(0,Math.min(photonSize-1,x+k)))*3,w=kernel[k+2];
+      first[i]+=w*flux[src];first[i+1]+=w*flux[src+1];first[i+2]+=w*flux[src+2];
+    }
+  }
+  const encode=255/Math.log(13);
+  for(let z=0;z<photonSize;z++)for(let x=0;x<photonSize;x++) {
+    const i=(z*photonSize+x)*4;
+    for(let c=0;c<3;c++) {
+      let v=0;
+      for(let k=-2;k<=2;k++) v+=kernel[k+2]*first[(Math.max(0,Math.min(photonSize-1,z+k))*photonSize+x)*3+c];
+      packed[i+c]=Math.min(255,Math.round(encode*Math.log1p(v*scale)));
+    }
+    packed[i+3]=255;
+  }
+  return {size:photonSize,packed};
+}
+self.onmessage=event=>{
+  const result=bakePhotons(event.data);
+  self.postMessage(result,[result.packed.buffer]);
+};
+
+</script>
+<script>
+'use strict';
+(() => {
+  const canvas=document.querySelector('#scene'), status=document.querySelector('#status');
+  const controls=document.querySelector('#controls'), orbitButton=document.querySelector('#orbit');
+  const fullButton=document.querySelector('#fullscreen'), reduced=matchMedia('(prefers-reduced-motion: reduce)');
+  if(matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints>1)
+    document.querySelector('#hint').textContent='Drag to orbit · Pinch to zoom';
+  const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:'high-performance'});
+  if(!gl){ status.textContent='This scene needs WebGL 2. Enable hardware acceleration in your browser to view it.';controls.hidden=true;return; }
+  const source=id=>document.getElementById(id).textContent;
+  function shader(type,code) {
+    const object=gl.createShader(type); gl.shaderSource(object,code); gl.compileShader(object);
+    return object;
+  }
+  const vertex=shader(gl.VERTEX_SHADER,source('vert'));
+  function program(id){
+    const fs=shader(gl.FRAGMENT_SHADER,source(id)), prog=gl.createProgram();
+    gl.attachShader(prog,vertex); gl.attachShader(prog,fs); gl.linkProgram(prog);
+    return {p:prog,fs,loc:{}};
+  }
+  function location(program,key) {return program.loc[key] ??= gl.getUniformLocation(program.p,key);}
+  const world=program('world'), resolve=program('resolve'),blur=program('blur'), grade=program('grade');
+  const programs=[world,resolve,blur,grade], parallel=gl.getExtension('KHR_parallel_shader_compile');
+  const clamp=(v,lo,hi)=>Math.min(hi,Math.max(lo,v));
+  let width=1,height=1,scale=.96,frameId=0,raf=0,quietTimer,worker;
+  let view=null,glow=null,halo=null,mirror=null,photonMap=null,blackMap=null;
+  let newPhotonMap=null,bakeBusy=false,bakeStart=-20,nextBake=10,firstBake=true;
+  let samples=[null,null],history=0,previousPose=null,pose=null;
+  const subpixels=[[0,-1/6],[-.25,1/6],[.25,-7/18],[-.375,-1/18],[.125,5/18],[-.125,-5/18],[.375,1/18],[-.4375,7/18]];
+  let yaw=-.73,pitch=.294,distance=6.02,desiredPitch=pitch,desiredDistance=distance,desiredYaw=yaw;
+  let autoOrbit=!reduced.matches, autoSpeed=0, lastInput=-10000, lastTime=0,simTime=0,sinceSample=0;
+  let frameTimes=[],lastResize=-100;
+  const pointers=new Map();
+  function wakeControls(){ controls.classList.remove('quiet');clearTimeout(quietTimer);quietTimer=setTimeout(()=>controls.classList.add('quiet'),3300); }
+  function userMoved(){lastInput=performance.now(); autoSpeed=0; wakeControls();}
+  function syncOrbit(){
+    const title=autoOrbit?'Pause automatic orbit':'Resume automatic orbit';
+    orbitButton.setAttribute('aria-pressed',String(autoOrbit));orbitButton.setAttribute('aria-label',title);orbitButton.title=title;
+  }
+  function toggleOrbit(){autoOrbit=!autoOrbit;autoSpeed=0;lastInput=-10000;syncOrbit();wakeControls();}
+  orbitButton.onclick=toggleOrbit;syncOrbit();
+  reduced.addEventListener('change',e=>{autoOrbit=!e.matches;syncOrbit();});
+  if(!document.fullscreenEnabled) fullButton.hidden=true;
+  else {
+    fullButton.onclick=()=>{(document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()).catch(()=>{});};
+    document.addEventListener('fullscreenchange',()=>{
+      const label=document.fullscreenElement?'Exit fullscreen':'Enter fullscreen';
+      fullButton.title=label;fullButton.setAttribute('aria-label',label);wakeControls();
+    });
+  }
+  function zoom(factor){desiredDistance=clamp(desiredDistance*factor,3.55,9.5);}
+  function gesture(){
+    const points=[...pointers.values()], a=points[0], b=points[1];
+    return b?{x:(a.x+b.x)*.5,y:(a.y+b.y)*.5,span:Math.hypot(a.x-b.x,a.y-b.y)}:{x:a.x,y:a.y,span:0};
+  }
+  canvas.onpointerdown=e=>{
+    if(e.pointerType==='mouse' && e.button!==0)return;
+    canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});userMoved();
+  };
+  canvas.onpointermove=e=>{
+    if(!pointers.has(e.pointerId)){if(e.pointerType==='mouse')wakeControls();return;}
+    const old=gesture();pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});const cur=gesture();
+    const sensitivity=Math.PI*1.55/Math.max(310,Math.min(innerWidth,innerHeight));
+    desiredYaw-=(cur.x-old.x)*sensitivity;
+    desiredPitch=clamp(desiredPitch+(cur.y-old.y)*sensitivity*.68,.015,.74);
+    if(old.span>4&&cur.span>4)zoom(old.span/cur.span);
+    userMoved();
+  };
+  function release(e){if(pointers.delete(e.pointerId))userMoved();}
+  canvas.onlostpointercapture=release;canvas.onpointerup=release;canvas.onpointercancel=release;
+  canvas.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?innerHeight:1);
+    zoom(Math.exp(clamp(delta,-800,800)*.00125));userMoved();
+  },{passive:false});
+  canvas.onkeydown=e=>{
+    switch(e.key) {
+      case 'ArrowLeft': desiredYaw-=.12;break; case 'ArrowRight':desiredYaw+=.12;break;
+      case 'ArrowUp':desiredPitch=clamp(desiredPitch+.055,.015,.74);break;
+      case 'ArrowDown':desiredPitch=clamp(desiredPitch-.055,.015,.74);break;
+      case '+':case '=':zoom(.9);break;case '-':case '_':zoom(1.11);break;
+      case ' ':toggleOrbit();e.preventDefault();return;
+      default:return;
+    }
+    userMoved();e.preventDefault();
+  };
+  function camera(dt,now) {
+    const elapsed=(now-lastInput)*.001;
+    const target=autoOrbit&&!pointers.size&&elapsed>3.4 ? .033 : 0;
+    autoSpeed+=(target-autoSpeed)*(1-Math.exp(-dt*1.35));
+    desiredYaw+=autoSpeed*dt;
+    const follow=1-Math.exp(-dt*16);
+    yaw+=(desiredYaw-yaw)*follow;pitch+=(desiredPitch-pitch)*follow;distance+=(desiredDistance-distance)*follow;
+    const sy=Math.sin(yaw),cy=Math.cos(yaw),sp=Math.sin(pitch),cp=Math.cos(pitch);
+    const aspect=canvas.width/canvas.height;
+    const fov=.278*Math.max(1,.92/aspect);
+    const centerY=.94, drift=reduced.matches?0:.008*Math.sin(simTime*.19);
+    const eye=[sy*cp*distance,centerY+sp*distance+drift,cy*cp*distance];
+    const actualPitch=Math.atan2(eye[1]-centerY,cp*distance);
+    const sa=Math.sin(actualPitch),ca=Math.cos(actualPitch);
+    gl.uniform3f(location(world,'uEye'),...eye);
+    gl.uniform3f(location(world,'uForward'),-sy*ca,-sa,-cy*ca);
+    gl.uniform3f(location(world,'uRight'),cy,0,-sy);
+    gl.uniform3f(location(world,'uUp'),-sy*sa,ca,-cy*sa);
+    gl.uniform2f(location(world,'uView'),fov*aspect,fov);
+    gl.uniform1f(location(world,'uFocus'),distance-.59);
+    pose={eye,axes:[cy,0,-sy,-sy*sa,ca,-cy*sa,-sy*ca,-sa,-cy*ca], view:[fov*aspect,fov],yaw,pitch,distance};
+    if(now-sinceSample>150) {
+      canvas.dataset.camera=JSON.stringify({yaw,pitch,distance,orbit:autoOrbit,autoSpeed,time:simTime});
+      sinceSample=now;
+    }
+  }
+  // All rays see the same gently shifting, shrinking stones in a frame.
+  const stones=[
+    [[-.38,1.41,.17],[.36,.395,.354],[.27,.16,-.23],.083],
+    [[.38,1.35,.14],[.336,.38,.337],[-.22,-.33,.27],.079],
+    [[-.03,1.47,-.44],[.365,.363,.297],[-.26,.34,-.11],.072],
+    [[-.08,.722,.01],[.358,.375,.36],[.08,.62,-.15],.095]
+  ];
+  const iceFrames=new Float32Array(36),iceCenters=new Float32Array(12),iceExtents=new Float32Array(12),iceRadii=new Float32Array(4);
+  function iceLayout(t){
+    const melt=t/(t+210.);
+    for(let i=0;i<4;i++){
+      const [center,extent,rot,radius]=stones[i],f=i+1,sway=t*(.032+.004*f)+f*2.73;
+      iceCenters.set([center[0]+.019*Math.sin(sway),center[1]+.010*Math.cos(sway*1.71)-.065*melt,center[2]+.017*Math.cos(sway*.93)],i*3);
+      iceExtents.set(extent.map(v=>v*(1-.17*melt)),i*3);iceRadii[i]=radius+.046*melt;
+      const x=rot[0]+.025*Math.sin(sway),y=rot[1]+.045*Math.cos(sway*.87),z=rot[2]+.020*Math.sin(sway*1.3);
+      const a=Math.cos(x),b=Math.sin(x),c=Math.cos(y),d=Math.sin(y),e=Math.cos(z),g=Math.sin(z);
+      iceFrames.set([e*c,g*c,-d,e*d*b-g*a,g*d*b+e*a,c*b,e*d*a+g*b,g*d*a-e*b,c*a],i*9);
+    }
+    gl.uniformMatrix3fv(location(world,'oaFrame[0]'),false,iceFrames);
+    gl.uniform3fv(location(world,'oaCenter[0]'),iceCenters);gl.uniform3fv(location(world,'oaExtent[0]'),iceExtents);
+    gl.uniform1fv(location(world,'oaRound[0]'),iceRadii);
+  }
+  function texture(){
+    const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return tex;
+  }
+  function target(w,h,previous){
+    if(previous){gl.deleteTexture(previous.tex);gl.deleteFramebuffer(previous.fb);}
+    const tex=texture(),fb=gl.createFramebuffer();
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+    return {tex,fb,w,h};
+  }
+  function resize(){
+    const dpr=Math.min(devicePixelRatio||1,2);
+    const cw=Math.max(2,Math.round(canvas.clientWidth*dpr)),ch=Math.max(2,Math.round(canvas.clientHeight*dpr));
+    const renderRatio=Math.min(dpr,Math.sqrt(1450000/(canvas.clientWidth*canvas.clientHeight)))*scale;
+    const w=Math.max(2,Math.round(canvas.clientWidth*renderRatio)),h=Math.max(2,Math.round(canvas.clientHeight*renderRatio));
+    if(view && canvas.width===cw && canvas.height===ch && w===width && h===height)return;
+    canvas.width=cw;canvas.height=ch;width=w;height=h;
+    samples=samples.map(old=>target(w,h,old));previousPose=null;
+    view=target(w,h,view);mirror=target(Math.max(1,w>>2),Math.max(1,h>>2),mirror);glow=target(Math.max(1,w>>2),Math.max(1,h>>2),glow);halo=target(Math.max(1,w>>4),Math.max(1,h>>4),halo);
+  }
+  function drawTo(dst){gl.bindFramebuffer(gl.FRAMEBUFFER,dst?.fb??null);gl.viewport(0,0,dst?.w??canvas.width,dst?.h??canvas.height);}
+  function bind(prog,key,index,tex){
+    gl.activeTexture(gl.TEXTURE0+index);gl.bindTexture(gl.TEXTURE_2D,tex);gl.uniform1i(location(prog,key),index);
+  }
+  function doBlur(input,out,extract,step){
+    drawTo(out);bind(blur,'uImage',0,input.tex);
+    gl.uniform2f(location(blur,'uStep'),step/input.w,step/input.h);gl.uniform1i(location(blur,'uExtract'),extract);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+  }
+  function draw(now){
+    if(document.hidden)return;
+    const raw=lastTime?(now-lastTime)*.001:1/60,dt=Math.min(.12,raw);
+    simTime+=Math.min(raw,.20);lastTime=now;
+    if(raw<.5&&raw>0)frameTimes.push(raw);
+    if(frameTimes.length>=52&&now-lastResize>1700) {
+      const sorted=frameTimes.sort((a,b)=>a-b), median=sorted[sorted.length>>1];
+      if(median>.042 && scale>.48)scale=Math.max(.48,scale*.87);
+      else if(median<.021 && scale<.995)scale=Math.min(1,scale*1.065);
+      frameTimes=[];lastResize=now;
+    }
+    resize();gl.useProgram(world.p);drawTo(view);
+    camera(dt,now);gl.uniform1f(location(world,'uTime'),simTime);
+    const offset=subpixels[frameId%subpixels.length],jitter=[offset[0]/width,offset[1]/height];
+    gl.uniform2fv(location(world,'uJitter'),jitter);
+    iceLayout(simTime);
+    bind(world,'uPhotons',0,photonMap);bind(world,'uNewPhotons',2,newPhotonMap);
+    const blend=clamp((simTime-bakeStart)/5.,0,1);
+    gl.uniform1f(location(world,'uPhotonBlend'),blend*blend*(3.-2.*blend));
+    if(simTime>=nextBake&&!bakeBusy&&blend>=1.){bakeBusy=true;nextBake=simTime+10.;worker.postMessage(simTime+2.5);}
+    drawTo(mirror);
+    bind(world,'uReflection',1,blackMap);
+    gl.uniform1i(location(world,'uMirrorPass'),1);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    drawTo(view);
+    bind(world,'uReflection',1,mirror.tex);
+    gl.uniform2f(location(world,'uMirrorPixel'),1/mirror.w,1/mirror.h);
+    gl.uniform1i(location(world,'uMirrorPass'),0);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    const prev=previousPose||pose, accum=samples[1-history];
+    const movement=Math.abs(prev.yaw-yaw)+Math.abs(prev.pitch-pitch)+Math.abs(prev.distance-distance)*.25;
+    gl.useProgram(resolve.p);drawTo(accum);bind(resolve,'uImage',0,view.tex);bind(resolve,'uPrevious',1,samples[history].tex);
+    gl.uniform3fv(location(resolve,'uOrigin'),pose.eye);gl.uniform3fv(location(resolve,'uPrevOrigin'),prev.eye);
+    gl.uniformMatrix3fv(location(resolve,'uAxes'),false,pose.axes);gl.uniformMatrix3fv(location(resolve,'uPrevAxes'),false,prev.axes);
+    gl.uniform2fv(location(resolve,'uView'),pose.view);gl.uniform2fv(location(resolve,'uPrevView'),prev.view);
+    gl.uniform2f(location(resolve,'uPixel'),1/width,1/height);gl.uniform2fv(location(resolve,'uJitter'),jitter);
+    gl.uniform1f(location(resolve,'uFocus'),distance-.59);
+    gl.uniform1f(location(resolve,'uWeight'),previousPose ? .80*Math.exp(-22*movement) : 0);
+    gl.drawArrays(gl.TRIANGLES,0,3);history=1-history;previousPose=pose;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.bindTexture(gl.TEXTURE_2D,accum.tex);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.useProgram(blur.p);doBlur(accum,glow,1,1.3);doBlur(glow,halo,0,2.2);
+    gl.useProgram(grade.p);drawTo(null);bind(grade,'uImage',0,accum.tex);bind(grade,'uGlow',1,glow.tex);bind(grade,'uHalo',2,halo.tex);
+    gl.uniform2f(location(grade,'uTexel'),1/width,1/height);gl.uniform1f(location(grade,'uFrame'),frameId++);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    if(frameId===1){status.hidden=true;canvas.dataset.ready='true';wakeControls();}
+    raf=requestAnimationFrame(draw);
+  }
+  function preparePhotons(){
+    blackMap=texture();
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array(4));
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+    function empty(){const tex=texture();gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array(4));return tex;}
+    photonMap=empty();newPhotonMap=empty();
+    const url=URL.createObjectURL(new Blob([source('photons')],{type:'text/javascript'}));
+    worker=new Worker(url);
+    worker.onmessage=e=>{
+      const {size,packed}=e.data;
+      const old=photonMap;photonMap=newPhotonMap;newPhotonMap=old;
+      gl.bindTexture(gl.TEXTURE_2D,newPhotonMap);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,size,size,0,gl.RGBA,gl.UNSIGNED_BYTE,packed);
+      bakeStart=firstBake ? -10 : simTime;
+      if(firstBake)URL.revokeObjectURL(url);
+      firstBake=false;bakeBusy=false;canvas.dataset.caustics='ready';
+    };
+    bakeBusy=true;worker.postMessage(0);
+
+  }
+  function start(){
+    if(parallel && !programs.every(prog=>gl.getProgramParameter(prog.p,parallel.COMPLETION_STATUS_KHR))){setTimeout(start,30);return;}
+    for(const prog of programs) if(!gl.getProgramParameter(prog.p,gl.LINK_STATUS)){
+      status.textContent='The scene could not start on this graphics device.';
+      console.error(gl.getShaderInfoLog(prog.fs),gl.getProgramInfoLog(prog.p));return;
+    }
+    preparePhotons(); gl.bindVertexArray(gl.createVertexArray());gl.disable(gl.DEPTH_TEST);
+    raf=requestAnimationFrame(draw);
+    document.addEventListener('visibilitychange',()=>{cancelAnimationFrame(raf);lastTime=0;if(!document.hidden)raf=requestAnimationFrame(draw);});
+  }
+  canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();cancelAnimationFrame(raf);status.hidden=false;status.textContent='Restoring the scene…';});
+  canvas.addEventListener('webglcontextrestored',()=>window.location.reload());
+  start();
+})();
+</script>
+</body>
+</html>

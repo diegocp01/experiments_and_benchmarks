@@ -1,0 +1,1656 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101318">
+<title>Wildfire Ridge</title>
+<style>
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0c0f14;color:#e5e0d9;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{position:relative;width:100%;height:100%;isolation:isolate}
+canvas{width:100%;height:100%;display:block;touch-action:none;cursor:grab;outline:none}
+canvas.dragging{cursor:grabbing}
+.controls{position:absolute;bottom:max(21px,env(safe-area-inset-bottom));right:max(23px,env(safe-area-inset-right));display:flex;align-items:center;gap:4px;transition:opacity 1.5s;color:#e3dfd6}
+body.resting .controls{opacity:0;pointer-events:none}
+.controls:focus-within,body.resting .controls:hover{opacity:1;pointer-events:auto}
+.hint{font-size:11px;letter-spacing:.025em;color:#d7d4cf;text-shadow:0 1px 5px #070706;margin-right:9px;user-select:none}
+button{border:1px solid #c5b49d3d;background:#19191bc4;color:inherit;backdrop-filter:blur(8px);border-radius:50%;width:34px;height:34px;display:grid;place-items:center;padding:7px;cursor:pointer}
+button:hover,button:focus-visible{border-color:#ded1c3b0;color:white}
+button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round}
+#notice{position:absolute;inset:0;display:grid;place-content:center;line-height:1.6;font-size:15px;padding:28px;text-align:center}
+#notice[hidden],.controls[hidden]{display:none}
+@media(max-width:600px){.controls{bottom:max(13px,env(safe-area-inset-bottom));right:14px}.hint{font-size:10px}button{width:32px;height:32px}}
+</style>
+</head>
+<body>
+<main aria-label="Wildfire Ridge">
+<canvas id="scene" tabindex="0" aria-label="An animated view from a forested valley toward a burning mountain ridge. Drag or use the arrow keys to look around, scroll or pinch to zoom, and press Home to face the fire."></canvas>
+<div class="controls" aria-label="Scene controls">
+<span class="hint" id="hint">Drag to look · Scroll to zoom</span>
+<button id="home" aria-label="Face the fire" title="Face the fire (Home)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6.3a7 7 0 1 1-.5 6.6M4 2.9v4.6h4.6"/></svg></button>
+<button id="full" aria-label="Enter fullscreen" title="Fullscreen (F)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7V3h4m6 0h4v4m0 6v4h-4m-6 0H3v-4"/></svg></button>
+</div>
+<div id="notice" role="status" hidden></div>
+</main>
+<script>
+'use strict';
+(() => {
+const canvas = document.querySelector('#scene');
+const notice = document.querySelector('#notice');
+const gl = canvas.getContext('webgl2', {alpha:false,antialias:false,depth:true,powerPreference:'high-performance'});
+if (!gl) {
+  notice.textContent='Open this file in a browser with WebGL 2 graphics enabled to explore the ridge.';
+  notice.hidden=false; document.querySelector('.controls').hidden=true; return;
+}
+const TAU=Math.PI*2;
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(v,b));
+const mix=(a,b,v)=>a+(b-a)*v;
+const smooth=(a,b,v)=>{v=clamp((v-a)/(b-a));return v*v*(3-2*v)};
+function rng(seed){return ()=>{seed|=0; seed=seed+0x6D2B79F5|0;let k=Math.imul(seed^seed>>>15,1|seed);k=k+Math.imul(k^k>>>7,61|k)^k;return ((k^k>>>14)>>>0)/4294967296}}
+function lattice(x,z){
+  let n=Math.imul(x,374761393)+Math.imul(z,668265263)|0;
+  n=Math.imul(n^(n>>>13),1274126177);return ((n^(n>>>16))>>>0)/4294967296;
+}
+function noise2(x,z){
+  const i=Math.floor(x),j=Math.floor(z);let u=x-i,v=z-j;
+  u*=u*(3-2*u);v*=v*(3-2*v);
+  return mix(mix(lattice(i,j),lattice(i+1,j),u),mix(lattice(i,j+1),lattice(i+1,j+1),u),v);
+}
+function fireZ(x){return -155-x*.10+13*Math.sin(x*.021+.35)+7*Math.sin(x*.059-.9)+3.4*Math.sin(x*.109)}
+function fireIntensity(x){
+  const crown=.52+.25*Math.sin(x*.042+.6)+.16*Math.sin(x*.103+1)+.15*Math.sin(x*.016-.8)+.12*Math.sin(x*.235);
+  return clamp(crown,.045,1)*smooth(-295,-251,x)*(1-smooth(246,292,x));
+}
+const creekX=z=>-5.7+5.8*Math.sin(z*.042+.4)+3.3*Math.sin(z*.069-1)+.056*(95-z);
+const creekWidth=z=>2.8+1.05*Math.sin(z*.064+.5)+.55*Math.sin(z*.122-.85)+smooth(20,95,z)*.85;
+const waterLevel=z=>.0055*(98-z);
+function terrain(x,z){
+  const n=noise2(x*.041,z*.041), n2=noise2(x*.112+43,z*.112+22);
+  const crestZ=fireZ(x)-4-26*Math.pow(.5+.5*Math.sin(x*.036-.6),1.5);
+  const dz=z-crestZ;
+  // Eroded ridgeline and steep, asymmetric ravines on its valley face.
+  const crestHeight=54+17*Math.sin(x*.013-.3)+10*Math.sin(x*.039+.7)+4.6*Math.sin(x*.083)+13*noise2(x*.044,-14.6);
+  const shoulder=dz>0?65+9*Math.sin(x*.024):49;
+  const t=dz/shoulder;
+  const face=Math.exp(-Math.pow(Math.abs(t),1.52));
+  const spur=12*(noise2(x*.035+z*.014,z*.018)-.46)+6*(n-.48)+2.2*(n2-.48);
+  const finger=noise2(x*.033+dz*.011, z*.016)+.45*noise2(x*.096+dz*.026,z*.037);
+  const incision=(finger-.71)*26*smooth(2,37,dz)*(1-smooth(43,146,dz));
+  const rock=(noise2(x*.13+z*.072,z*.084)-.50)*4.6+(noise2(x*.34,z*.21)-.5)*1.1;
+  const ridge=(crestHeight+spur+rock)*face+incision;
+  const banks=smooth(23,155,Math.abs(x-8*Math.sin(z*.022)));
+  const flanks=banks*(14+10*Math.sin(z*.024+.7)+13*noise2(x*.033,z*.025))+smooth(84,240,Math.abs(x))*(11+22*noise2(x*.016,z*.021));
+  const valleyEnd=38*smooth(144,270,z)*(1+.45*Math.sin(x*.034)+.2*Math.sin(x*.09))+18*smooth(115,240,z)*n;
+  const riverD=Math.abs(x-creekX(z))-creekWidth(z);
+  const terrace=(.73+1.75*n+.41*n2+1.7*noise2(x*.014,z*.015))*smooth(-.8,10,riverD)-.9;
+  const alluvium=smooth(-.9,16,riverD)*(.7+2.1*noise2(x*.065,z*.056)+.6*n2);
+  // Broken high country closes the panorama beyond the valley.
+  const radius=Math.hypot(x*.94,z-17);
+  const ang=Math.atan2(x,17-z);
+  const distant=smooth(291,570,radius)*(58+41*Math.sin(ang*3+.6)+31*Math.sin(ang*7-1.2)+17*Math.cos(ang*13)+40*noise2(x*.012,z*.012));
+  const crags=28*noise2(x*.019,z*.020)+15*noise2(x*.047,z*.051)+4.5*noise2(x*.127,z*.116);
+  const rearCrest=-382+.29*x+32*Math.sin(x*.016)+16*Math.sin(x*.052);
+  const highland=Math.exp(-Math.pow(Math.abs((z-rearCrest)/76),1.4))*(26+41*Math.pow(.5+.5*Math.cos(x*.015+1.4),2)+crags);
+  const gravel=(n2-.5)*.43+(noise2(x*.33,z*.28)-.5)*.30;
+  return waterLevel(z)+terrace+alluvium+gravel+ridge+flanks+valleyEnd+distant+highland;
+}
+function program(vs,fs){
+  const p=gl.createProgram();
+  for(const [type,source] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){
+    const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p,s);gl.deleteShader(s);
+  }
+  gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;
+}
+const api={program,terrain,fireZ,fireIntensity,rng};
+const screenVertex=`#version 300 es
+precision highp float;out vec2 uv;
+void main(){vec2 s=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=s;gl_Position=vec4(s*2.-1.,0,1);}`;
+const noiseGL=`
+float h2(vec2 p){vec3 q=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}
+float n2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(h2(i),h2(i+vec2(1,0)),f.x),mix(h2(i+vec2(0,1)),h2(i+vec2(1)),f.x),f.y);}
+float fb(vec2 p){mat2 m=mat2(1.65,1.11,-1.11,1.65);float a=.54*n2(p);p=m*p+28.26;a+=.265*n2(p);p=m*p+19.41;a+=.13*n2(p);return a+.065*n2(m*p);}
+`;
+const fireGL=`
+float fz(float x){return -155.-x*.10+13.*sin(x*.021+.35)+7.*sin(x*.059-.9)+3.4*sin(x*.109);}
+float powerAt(float x){return clamp(.52+.25*sin(x*.042+.6)+.16*sin(x*.103+1.)+.15*sin(x*.016-.8)+.12*sin(x*.235),.045,1.)*smoothstep(-295.,-251.,x)*(1.-smoothstep(246.,292.,x));}
+`;
+const skyProgram=program(screenVertex,`#version 300 es
+precision highp float;
+in vec2 uv;out vec4 outputColor;
+uniform vec3 rightDir,upDir,forward;uniform vec2 lens;uniform float time;
+${noiseGL}
+void main(){
+  vec2 ndc=(uv*2.-1.)*lens;
+  vec3 d=normalize(forward+rightDir*ndc.x+upDir*ndc.y);
+  float y=max(0.,d.y),az=atan(d.x,-d.z);
+  float toward=exp(-pow(abs(az)/.96,3.));
+  vec3 c=mix(vec3(.112,.145,.175),vec3(.023,.044,.081),smoothstep(-.06,.76,y));
+  float haze=exp(-pow((y-.188)/.166,2.))*toward;
+  c+=vec3(.319,.105,.012)*haze+vec3(.035,.012,0)*toward*exp(-y*3.3);
+  // High, thin cloud sheets catch scattered light above the inversion.
+  vec2 cloud=d.xz/(.14+y)*2.;
+  float cover=fb(cloud*1.26+vec2(time*.002,13.7));
+  float wisps=smoothstep(.40,.76,cover)*smoothstep(-.02,.21,y);
+  c=mix(c,c*.56+vec3(.006,.008,.012),wisps*.84);
+  float dust=fb(d.xz/(.24+y)*vec2(5.9,17.3)+47.);
+  c+=vec3(.084,.047,.022)*(dust-.41)*haze;
+  // Star positions use octahedral coordinates to stay fixed in world space.
+  vec2 star=d.xz/(abs(d.x)+abs(d.y)+abs(d.z))*590.;
+  vec2 cell=floor(star),s=fract(star)-.12-.76*vec2(h2(cell+15.),h2(cell+85.));
+  float starMag=h2(cell+29.7);
+  float starLux=exp(-dot(s,s)*114.)*smoothstep(.981,1.,starMag)*smoothstep(.15,.52,y)*(1.-.9*wisps);
+  c+=vec3(.21,.225,.235)*starLux*(1.-toward*.68);
+  outputColor=vec4(c,1.);
+}`);
+function bindAttribute(index,size,stride,offset){gl.enableVertexAttribArray(index);gl.vertexAttribPointer(index,size,gl.FLOAT,false,stride*4,offset*4)}
+function meshData(values,indices,layout){
+  const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(values),gl.STATIC_DRAW);
+  const stride=layout.reduce((a,b)=>a+b,0);let offset=0;
+  layout.forEach((size,i)=>{bindAttribute(i,size,stride,offset);offset+=size});
+  if(indices){gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,gl.createBuffer());gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint32Array(indices),gl.STATIC_DRAW)}
+  gl.bindVertexArray(null);return {vao,count:indices?indices.length:values.length/stride};
+}
+const landProgram=program(`#version 300 es
+layout(location=0)in vec3 position;layout(location=1)in vec3 normal;uniform mat4 vp;out vec3 pos;out vec3 norm;void main(){pos=position;norm=normal;gl_Position=vp*vec4(position,1.);}`,`#version 300 es
+precision highp float;in vec3 pos,norm;out vec4 outputColor;uniform sampler2D soil;
+uniform vec3 camera;uniform float time;
+${noiseGL}
+${fireGL}
+void main(){
+  float dist=length(pos-camera);
+  vec3 normal=normalize(norm);
+  vec2 st=pos.xz;
+  vec2 strata=vec2(pos.x*.88+pos.z*.34, pos.y*1.31+pos.z*.06);
+  float grain=fb(st*.94+vec2(pos.y*.67,-pos.y*.33));
+  float flakes=fb(strata*vec2(.51,1.54)+grain*.41);
+  float facets=fb(strata*vec2(.25,.14)+vec2(grain*.38,17.5));
+  float shale=fb(st*.093+pos.y*.026+18.);
+  float rill=n2(st*vec2(.24,.049)+pos.y*.063);
+  normal=normalize(normal+vec3((grain-.48)*.26,0.,(rill-.5)*.22));
+  float skylight=clamp(normal.y*.72+normal.x*.20+normal.z*.23,.20,1.13);
+  float highSlope=smoothstep(.05,.52,1.-normal.y);
+  float seams=smoothstep(.39,.70,flakes*.52+facets*.48)*highSlope;
+  vec3 c=mix(vec3(.031,.048,.056),vec3(.134,.144,.137),shale*.72+facets*.12)*skylight;
+  c*=.76+.31*grain+.39*seams;
+  c+=vec3((grain-.49)*.032);
+  float dz=pos.z-fz(pos.x);
+  float br=powerAt(pos.x);
+  float wide=exp(-abs(dz)*.023)*(.20+br*1.19);
+  float under=exp(-abs(dz)*.121)*br;
+  float exposure=.42+.42*rill+.26*grain+.33*facets+.45*seams;
+  float channel=fb(st*vec2(.067,.027)+pos.y*vec2(.012,.022));
+  float blaze=wide*(.52+1.35*channel)*(.71+.48*max(-normal.z,0.)+.23*normal.y);
+  float flicker=.94+.04*sin(time*1.7+pos.x*.09)+.025*sin(time*3.31-pos.x*.17);
+  c+=(vec3(.337,.105,.019)*blaze+vec3(.36,.105,.013)*under)*exposure*flicker;
+  c+=vec3(.047,.028,.013)*seams*exp(-abs(dz)*.009);
+  vec2 soilUV=(st+vec2(pos.y*.63,pos.y*.23))*.29;
+  vec3 soilColor=mix(texture(soil,soilUV).rgb,texture(soil,mat2(.81,.57,-.57,.81)*soilUV*.69).rgb,.33);
+  c*=vec3(.60,.63,.68)+soilColor*vec3(1.04,1.0,.91);
+  c*=.83+.32*shale;
+  float air=(1.-exp(-dist*.00125));
+  c=mix(c,vec3(.091,.124,.159),air*.96);
+  float warmHaze=exp(-abs(pos.x)*.0058)*smoothstep(-55.,60.,dz)*(1.-smoothstep(100.,270.,dz));
+  c+=vec3(.039,.014,.001)*warmHaze;
+  float elevation=(pos.y-camera.y)/max(1.,dist);
+  float backscatter=smoothstep(1.,92.,-dz)*exp(-pow((elevation-.19)/.19,2.))*exp(-abs(pos.x)*.0027);
+  c=mix(c,vec3(.255,.150,.104),backscatter*.78);
+  outputColor=vec4(c,1);
+}`);
+function terrainMesh(){
+  const xAxis=[],zAxis=[];
+  function coords(center,arr){for(let i=-135;i<=135;i++){const a=Math.abs(i); arr.push(center+Math.sign(i)*(.97*a+.000365*a*a*a));}}
+  coords(0,xAxis);coords(38,zAxis);
+  const values=[],inds=[],n=xAxis.length;
+  for(let j=0;j<zAxis.length;j++)for(let i=0;i<n;i++){
+    let x=xAxis[i],z=zAxis[j];
+    const dx=i>0?(x-xAxis[i-1])*.20:0,dz=j>0?(z-zAxis[j-1])*.20:0;
+    x+=(lattice(i,j)-.5)*dx;z+=(lattice(i+935,j+18)-.5)*dz;
+    const y=terrain(x,z),e=Math.max(.52,(dx+dz)*.32);
+    let nx=terrain(x-e,z)-terrain(x+e,z),ny=2*e,nz=terrain(x,z-e)-terrain(x,z+e);
+    const len=Math.hypot(nx,ny,nz);values.push(x,y,z,nx/len,ny/len,nz/len);
+    if(i&&j){const m=j*n+i;inds.push(m-n-1,m-1,m,m-n-1,m,m-n);}
+  }
+  return meshData(values,inds,[3,3]);
+}
+function soilTexture(){
+  const tex=gl.createTexture(),r=rng(725311),n=512,a=new Uint8Array(n*n*4);
+  // A seamless material tile contains fine grit and weathered flakes of stone.
+  for(let i=0;i<a.length;i+=4){
+    const grain=Math.pow(r(),1.3);
+    const value=61+135*grain;
+    a[i]=value;a[i+1]=value*(.91+.14*r());a[i+2]=value*(.75+.28*r());a[i+3]=255;
+  }
+  function dab(x,y,b,scale){
+    const p=(((y&511)*512)+(x&511))*4;
+    a[p]=mix(a[p],b,scale);a[p+1]=mix(a[p+1],b*.95,scale);a[p+2]=mix(a[p+2],b*.87,scale);
+  }
+  for(let i=0;i<25400;i++){
+    const x=r()*n|0,y=r()*n|0,rad=.42+Math.pow(r(),3)*4.4,v=70+128*r(),flat=.45+r()*.54,twist=(r()-.5)*.7;
+    for(let dy=-Math.ceil(rad);dy<=Math.ceil(rad);dy++)for(let dx=-Math.ceil(rad);dx<=Math.ceil(rad);dx++){
+      const height=(dy+dx*twist)/flat,d=(dx*dx+height*height)/(rad*rad);
+      if(d>1)continue;const light=.67+.39*(1-d)+.24*(dx/rad)-.32*(height/rad);
+      dab(x+dx,y+dy,v*light,.89);
+    }
+  }
+  for(let i=0;i<4800;i++){
+    const x=r()*n,y=r()*n,len=2+r()*9,theta=r()*TAU,t=56+r()*95;
+    for(let k=0;k<len;k++)dab(x+Math.cos(theta)*k|0,y+Math.sin(theta)*k|0,t,.69);
+  }
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,n,n,0,gl.RGBA,gl.UNSIGNED_BYTE,a);
+  gl.generateMipmap(gl.TEXTURE_2D);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+  const ext=gl.getExtension('EXT_texture_filter_anisotropic');if(ext)gl.texParameterf(gl.TEXTURE_2D,ext.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(8,gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  return tex;
+}
+
+const soil=soilTexture();
+const land=terrainMesh();
+const waterProgram=program(`#version 300 es
+layout(location=0)in vec3 position;layout(location=1)in float across;
+uniform mat4 vp;out vec3 pos;out float lateral;
+void main(){pos=position;lateral=across;gl_Position=vp*vec4(position,1.);}`,`#version 300 es
+precision highp float;in vec3 pos;in float lateral;out vec4 outputColor;
+uniform vec3 camera;uniform float time;
+${noiseGL}
+${fireGL}
+void main(){
+  vec3 incident=normalize(pos-camera);
+  float dist=length(pos-camera);
+  vec2 p=pos.xz;
+  float bends=n2(p*.37);
+  vec2 waves=p*vec2(1.3,4.6)+vec2(bends*2.2,-time*.82);
+  float w=n2(waves),w2=n2(p*vec2(2.4,7.5)+vec2(time*.35,bends*3.-time*1.2));
+  float rip=sin(p.y*6.1+p.x*1.2+bends*10.-time*1.5);
+  vec3 normal=normalize(vec3((w-.5)*.125+(w2-.5)*.07,1.,(w-.5)*.17+rip*.033));
+  vec3 ray=reflect(incident,normal);
+  // Intersect the reflected ray with the burning face to break the reflected light into ripples.
+  float t=(-149.-pos.z)/min(ray.z,-.01);
+  vec3 hit=pos+ray*t;t=(fz(hit.x)-pos.z)/min(ray.z,-.01);hit=pos+ray*t;
+  float approx=54.+17.*sin(hit.x*.013-.3)+10.*sin(hit.x*.039+.7)+4.6*sin(hit.x*.083)+7.;
+  float diff=hit.y-approx;
+  float firePower=powerAt(hit.x);
+  float mir=smoothstep(.05,.55,-ray.z)*exp(-diff*diff/235.)*firePower;
+  float sheen=exp(-diff*diff/2500.)*(.35+.45*firePower)*smoothstep(.1,.65,-ray.z);
+  float banks=1.-smoothstep(.64,1.,abs(lateral));
+  vec3 c=vec3(.065,.088,.108)*(.53+.48*n2(p*.17)+.32*w);
+  c+=vec3(.105,.044,.019)*sheen+vec3(.48,.16,.033)*mir*(.20+1.52*max(w2-.22,0.))*banks;
+  c*=.85+.15*banks;
+  outputColor=vec4(c,1);
+}`);
+function creekMesh(){
+  const values=[],indices=[];
+  for(let j=0;j<=500;j++){
+    const z=-86+j*.60,c=creekX(z),w=creekWidth(z)+6.4;
+    for(let i=0;i<3;i++){const k=i-1;values.push(c+k*w,waterLevel(z)-.09,z,k);if(i&&j){const m=j*3+i;indices.push(m-4,m-1,m,m-4,m,m-3)}}
+  }
+  return meshData(values,indices,[3,1]);
+}
+const water=creekMesh();
+const detailProgram=program(`#version 300 es
+layout(location=0)in vec3 position;layout(location=1)in vec3 normal;layout(location=2)in vec3 albedo;
+uniform mat4 vp;out vec3 pos,norm,tint;
+void main(){pos=position;norm=normal;tint=albedo;gl_Position=vp*vec4(position,1.);}`,`#version 300 es
+precision highp float;in vec3 pos,norm,tint;out vec4 outputColor;
+${noiseGL}
+void main(){
+  vec3 n=normalize(norm);
+  float sky=.32+.69*max(0.,dot(n,vec3(-.31,.86,-.38)));
+  float warm=.14+.86*max(0.,dot(n,vec3(.04,.34,-.94)));
+  vec2 st=pos.xz+pos.y*vec2(.79,.48);
+  float grit=.62+.44*n2(st*21.)+.27*n2(st*4.)+.16*fb(st*2.21);
+  sky*=.87+.29*n2(st*7.24);
+  outputColor=vec4((tint*sky+vec3(.036,.012,.003)*warm)*grit,1.);
+}`);
+function valleyDetails(){
+  const a=[],r=rng(194521), stones=3500;
+  const rockColor=[.097,.112,.125],grassColor=[.064,.072,.064];
+  const put=(p,n,c)=>a.push(...p,...n,...c);
+  function tri(p,q,b,shade){
+    const v=q.map((n,i)=>n-p[i]),u=b.map((n,i)=>n-p[i]);
+    let n=[v[1]*u[2]-v[2]*u[1],v[2]*u[0]-v[0]*u[2],v[0]*u[1]-v[1]*u[0]];
+    if(n[1]<0)n=n.map(e=>-e);
+    let len=Math.hypot(...n)||1;n=n.map(e=>e/len);
+    put(p,n,shade);put(q,n,shade);put(b,n,shade);
+  }
+  for(let i=0;i<stones;i++){
+    let z=-60+r()*238, x=creekX(z)+(r()-.5)*(i%5===0?98:creekWidth(z)*4.4);
+    let y=terrain(x,z),w=.095+Math.pow(r(),4)*.92;
+    if(i<60)w=.6+1.1*r();
+    const h=w*(.28+.52*r()), l=w*(.65+1.05*r()), angle=r()*TAU;
+    const base=[],mid=[],cap=[],sides=7;
+    for(let k=0;k<sides;k++){
+      const ang=angle+(k+(r()-.5)*.36)/sides*TAU,dx=Math.cos(ang)*w,dz=Math.sin(ang)*l;
+      base.push([x+dx*.84,y-.23*h,z+dz*.92]);
+      mid.push([x+dx*(.84+.23*r()),y+h*(.15+.24*r()),z+dz]);
+      cap.push([x+dx*(.32+.37*r())+w*.09,y+h*(.65+.34*r()),z+dz*(.36+.3*r())]);
+    }
+    const peak=[x+.11*w,y+.96*h,z-.08*l],brightness=.53+.73*r();
+    const c=rockColor.map(e=>e*brightness);
+    for(let k=0;k<sides;k++){const j=(k+1)%sides;tri(base[k],base[j],mid[k],c);tri(mid[k],base[j],mid[j],c);tri(mid[k],mid[j],cap[k],c);tri(cap[k],mid[j],cap[j],c);tri(cap[k],cap[j],peak,c)}
+  }
+  for(let c=0;c<3900;c++){
+    const x=(r()-.5)*180,z=-29+r()*218,y=terrain(x,z);
+    if(y<waterLevel(z)+.22||noise2(x*.12,z*.12)<.26)continue;
+    const size=.34+r()*.64, shade=grassColor.map(v=>v*(.73+size*.48));
+    for(let i=0;i<4+Math.floor(size*5);i++){
+      const phi=r()*TAU,cx=Math.cos(phi),cz=Math.sin(phi),height=size*(.23+r()*.84);
+      const spread=size*r()*.5,dx=cx*spread,dz=cz*spread,wide=.018+.023*r();
+      const b=[x+dx,y-.05,z+dz],n=[cx*.76,.62,cz*.76];
+      put([b[0]+cz*wide,b[1],b[2]-cx*wide],n,shade);
+      put([b[0]-cz*wide,b[1],b[2]+cx*wide],n,shade);
+      put([b[0]+dx*.54+.09*height,b[1]+height,b[2]+dz*.54],n,shade);
+    }
+  }
+  return meshData(a,null,[3,3,3]);
+}
+const details=valleyDetails();
+const particleProgram=program(`#version 300 es
+precision highp float;
+layout(location=0)in vec3 anchor;layout(location=1)in vec4 traits;
+uniform mat4 vp;uniform vec3 camera,right,up;uniform float time;uniform vec2 resolution;out vec2 uv;out vec4 tint;flat out vec2 flake;
+void main(){
+  float s=traits.x, rate=traits.y,phase=traits.z,kind=traits.w;
+  uv=vec2(float(gl_VertexID&1),float(gl_VertexID>>1))*2.-1.;
+  vec3 p;vec2 dims;float alpha;vec3 color;
+  if(kind<.5){
+    float life=fract(time/rate+phase);
+    float age=life*rate;
+    float speed=2.3+3.*fract(s*8.2);
+    p=anchor+vec3(age*(.72+1.27*s)+(.21+age*.19)*sin(age*.76+phase*55.+s*.7),
+                  age*speed+age*.43*sin(age*.96+phase*25.),
+                  age*(.12+s*.21)+(.22+age*.17)*cos(age*.76+phase*37.));
+    float spark=smoothstep(0.,.035,life)*(1.-smoothstep(.39,1.,life));
+    float pulse=.57+.43*pow(.5+.5*sin(age*(2.+s*5.)+phase*25.),2.);
+    color=mix(vec3(.77,.164,.034),vec3(1.,.76,.34),s*spark*pulse);
+    alpha=spark*(.24+.83*pulse)*(.60+.55*s);
+    dims=vec2(.047+.205*pow(s,3.),.12+.47*pow(s,3.));
+  }else{
+    float cycle=mod(time*(.44+.39*s)+phase*33.,33.);
+    p=anchor+vec3(4.5*sin(cycle*.145+phase*28.)+cycle*.39,
+                  24.-cycle+sin(time*.35+phase*22.)*.5,
+                  1.6*cos(cycle*.39+phase*34.));
+    float spin=.25+.75*abs(sin(time*(2.+s*3.)+phase*236.));
+    float dist=distance(p,camera);
+    alpha=(.18+.50*s)*(.41+.59*spin)*smoothstep(2.,6.,dist)*(1.-smoothstep(65.,125.,dist))
+          *smoothstep(0.,2.,cycle)*(1.-smoothstep(29.,33.,cycle));
+    color=mix(vec3(.22,.25,.27),vec3(.59,.51,.42),s*spin);
+    float size=.007+.031*pow(s,3.);
+    dims=vec2(size*(.42+.58*spin),size*(.75+1.10*s));
+  }
+  vec4 clip=vp*vec4(p,1);
+  // Subpixel sparks retain their energy when seen from across the valley.
+  vec2 px=max(vec2(.00001),vec2(abs(vp[0][0])+abs(vp[2][0]),abs(vp[1][1]))*resolution/max(1.,clip.w)*.5);
+  vec2 radius=max(vec2(.60),dims*px);
+  alpha*=mix(.62,1.,smoothstep(.13,1.,dims.x*px.x));
+  vec2 corner=uv*radius;float slant=(kind<.5?.34:.43)*sin(phase*42.+time*(kind<.5?.54:1.6))+.21;
+  clip.xy+=(corner+vec2(corner.y*slant,0.))*2./resolution*clip.w;
+  gl_Position=clip;tint=vec4(color,alpha);flake=vec2(kind,phase);
+}`,`#version 300 es
+precision highp float;in vec2 uv;in vec4 tint;flat in vec2 flake;out vec4 outputColor;
+void main(){
+  vec2 p=uv;
+  if(flake.x>.5)p.x+=.17*sin(p.y*4.5+flake.y*44.);
+  float d=dot(p,p);float shape=1.-smoothstep(.12,1.,d);
+  outputColor=vec4(tint.rgb,tint.a*shape);
+}`);
+function particles(){
+  const arr=[],r=rng(32316);
+  for(let i=0;i<5700;i++){
+    const x=(r()-.5)*557,z=fireZ(x)+(r()-.4)*12,hot=fireIntensity(x);
+    if(r()>.20+.8*hot)continue;
+    arr.push(x,terrain(x,z)+2.1+5.7*r(),z,r(),2.1+Math.pow(r(),1.9)*8.4,r(),0);
+  }
+  const sparks=arr.length/7;
+  for(let i=0;i<4000;i++)arr.push((r()-.5)*175,1+r()*7,12+r()*169,r(),1,r(),1);
+  const vao=gl.createVertexArray();gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(arr),gl.STATIC_DRAW);
+  bindAttribute(0,3,7,0);bindAttribute(1,4,7,3);gl.vertexAttribDivisor(0,1);gl.vertexAttribDivisor(1,1);gl.bindVertexArray(null);
+  return {vao,count:arr.length/7,sparks};
+}
+function createGroundCover(gl,api){
+  const rand=api.rng(686029),atlas=document.createElement('canvas');
+  const tile=168,cols=4,rows=2;atlas.width=tile*cols;atlas.height=tile*rows;
+  const ctx=atlas.getContext('2d',{willReadFrequently:true});
+  for(let species=0;species<8;species++){
+    ctx.save();ctx.translate(species%cols*tile,Math.floor(species/cols)*tile);ctx.beginPath();ctx.rect(0,0,tile,tile);ctx.clip();
+    const bottom=163,cx=84;
+    ctx.lineCap='round';ctx.lineJoin='round';
+    // Fine-bladed sedges, bunchgrass, and woody willow scrub occupy different soils.
+    if(species<5){
+      for(let k=0;k<210;k++){
+        const angle=rand()*TAU,reach=Math.cos(angle)*(12+57*rand()),yy=bottom-1-rand()*5,bx=cx+(rand()-.5)*16;
+        const h=(18+119*Math.pow(rand(),.67))*(.7+.30*(1-Math.abs(reach)/75)),lift=.54+.43*rand();
+        const p=cx+reach,py=yy-h*lift+.38*Math.abs(reach);
+        const tone=Math.floor(38+rand()*113),warm=species%2?12:0;
+        ctx.fillStyle='rgb('+Math.floor(tone*.96+warm)+','+Math.floor(tone*.92+warm*.2)+','+Math.floor(tone*.73)+')';
+        const w=.38+rand()*1.9;
+        ctx.beginPath();ctx.moveTo(bx,yy);ctx.quadraticCurveTo(bx+reach*.19,yy-h*.82,p,py);
+        ctx.quadraticCurveTo(bx+reach*.23+w,yy-h*.73,bx+w,yy);ctx.fill();
+        if(k%15===0){
+          ctx.strokeStyle=ctx.fillStyle;ctx.lineWidth=.75;ctx.beginPath();ctx.moveTo(p,py);ctx.lineTo(p+reach*.06,py-7);ctx.stroke();
+          for(let b=0;b<5;b++){ctx.beginPath();ctx.ellipse(p+reach*.05+(b%2-.5)*2,py-b*1.65,1,2.1,(b%2-.5)*.75,0,TAU);ctx.fill()}
+        }
+      }
+    }else{
+      function twig(x,y,dx,dy,level,thick){
+        const ex=x+dx,ey=y+dy,bend=(rand()-.5)*7;
+        const tint=Math.floor(60+rand()*70);ctx.strokeStyle='rgb('+tint+','+Math.floor(tint*.90)+','+Math.floor(tint*.77)+')';
+        ctx.lineWidth=thick;ctx.beginPath();ctx.moveTo(x,y);ctx.quadraticCurveTo(x+dx*.37+bend,y+dy*.57,ex,ey);ctx.stroke();
+        if(level>0){for(let j=0;j<2;j++){const tilt=(j-.50)*(.52+rand()*.95),len=.49+rand()*.28;twig(ex,ey,(dx*Math.cos(tilt)-dy*Math.sin(tilt))*len,(dx*Math.sin(tilt)+dy*Math.cos(tilt))*len,level-1,Math.max(.48,thick*.61))}}
+        if(level<=1)for(let j=0;j<5;j++){
+          const f=rand(),lx=x+dx*f+(rand()-.5)*8,ly=y+dy*f+(rand()-.5)*7;
+          const g=Math.floor(35+rand()*99);ctx.fillStyle='rgb('+Math.floor(g*.85)+','+g+','+Math.floor(g*.78)+')';ctx.beginPath();ctx.ellipse(lx,ly,1.25+rand()*2.4,1+rand()*1.3,rand()*3.,0,TAU);ctx.fill();
+        }
+      }
+      for(let j=0;j<18;j++){const a=(rand()-.5)*2,sz=25+rand()*34;twig(cx+(rand()-.5)*18,bottom-2,Math.sin(a)*sz,-Math.cos(a)*sz,4,1.4+rand()*2)}
+    }
+    ctx.restore();
+  }
+  const tex=gl.createTexture();gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,atlas);gl.generateMipmap(gl.TEXTURE_2D);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  const a=[];
+  for(let i=0;i<33000;i++){
+    const z=-42+rand()*219,x=(rand()-.5)*175,y=terrain(x,z);
+    const distanceToBank=Math.abs(x-creekX(z))-creekWidth(z);
+    const patch=noise2(x*.089+5,z*.104)*.63+noise2(x*.26,z*.24)*.37;
+    if(y<waterLevel(z)+.18||patch<.41+rand()*.19)continue;
+    const brush=rand()<smooth(.51,.8,patch)*.20;
+    const height=brush?.52+rand()*1.24:.22+rand()*.47+Math.max(0.,patch-.55)*1.3;
+    const type=brush?5+Math.floor(rand()*3):Math.floor(rand()*5);
+    a.push(x,y-.11,z,height,type,rand()>.5?1:-1,.60+rand()*.75,Math.exp(-Math.abs(distanceToBank)*.11));
+  }
+  const p=program(`#version 300 es
+  layout(location=0)in vec4 root;layout(location=1)in vec4 data;
+  uniform mat4 vp;uniform vec3 right,camera;uniform float time;
+  out vec2 uv;out float ambient;out float distanceFromEye;
+  void main(){
+    vec2 st=vec2(float(gl_VertexID&1),float(gl_VertexID>>1));
+    vec3 v=root.xyz+vec3(0.,st.y*root.w,0.)+right*(st.x-.5)*root.w*data.y*1.25;
+    v.x+=(.042+.062*sin(root.x*.39+root.z*.22+time*1.22))*st.y*st.y*root.w;
+    uv=(vec2(mod(data.x,4.),floor(data.x/4.))+mix(vec2(.006),vec2(.994),vec2(st.x,1.-st.y)))/vec2(4.,2.);
+    ambient=data.z*(.77+.27*st.y);distanceFromEye=distance(v,camera);gl_Position=vp*vec4(v,1.);
+  }`,`#version 300 es
+  precision highp float;in vec2 uv;in float ambient,distanceFromEye;out vec4 outputColor;uniform sampler2D atlas;
+  void main(){
+    vec4 t=texture(atlas,uv);float a=smoothstep(.13,.72,t.a);if(a<.17)discard;
+    vec3 c=vec3(.010,.017,.018)+t.rgb*vec3(.229,.210,.152)*ambient;
+    c=mix(c,vec3(.088,.101,.113),1.-exp(-distanceFromEye*.0016));
+    outputColor=vec4(c,a);
+  }`);
+  const vao=gl.createVertexArray();gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(a),gl.STATIC_DRAW);bindAttribute(0,4,8,0);bindAttribute(1,4,8,4);gl.vertexAttribDivisor(0,1);gl.vertexAttribDivisor(1,1);gl.bindVertexArray(null);
+  return {draw(frame){gl.useProgram(p);gl.uniformMatrix4fv(loc(p,'vp'),false,frame.vp);gl.uniform3fv(loc(p,'right'),frame.right);gl.uniform3fv(loc(p,'camera'),frame.camera);gl.uniform1f(loc(p,'time'),frame.time);
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);gl.uniform1i(loc(p,'atlas'),0);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindVertexArray(vao);gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,a.length/8);gl.bindVertexArray(null);gl.disable(gl.BLEND);}};
+}
+
+const cover=createGroundCover(gl,api);
+const motes=particles();
+function createForest(gl, api) {
+  const seed = api.rng(46019);
+  const speciesCount = 20;
+  const w = 224, h = 384;
+  const texture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 8, gl.RGBA8, w, h, speciesCount);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const pen = canvas.getContext('2d', {willReadFrequently: true});
+  const pigment = (n, x = 0, z = 0) => 'rgb(' + n + ',' + Math.round(128 + 126*x) + ',' + Math.round(128 + 126*z) + ')';
+  for (let variant = 0; variant < speciesCount; variant++) {
+    const rand = api.rng(1343 + variant * 997);
+    const between = (lo, hi) => lo + (hi - lo) * rand();
+    const pine = variant % 4 === 1;
+    const snag = variant >= speciesCount - 2;
+    const base = h - 3, height = h - 13;
+    const leafStart = pine ? between(.24, .47) : between(.10, .34);
+    const lean = between(-9, 9), bend = between(-4, 4);
+    const center = t => w / 2 + lean * t * t + bend * Math.sin(4.2 * t);
+    pen.clearRect(0, 0, w, h);
+    pen.lineCap = 'round';
+    pen.lineJoin = 'round';
+    const trunkWidth = pine ? between(2.4, 4) : between(1.9, 3.2);
+    pen.fillStyle = pigment(99);
+    pen.beginPath();
+    for (let k = 0; k <= 16; k++) {
+      const t = k / 16;
+      pen.lineTo(center(t) - trunkWidth * Math.pow(1 - t, .74), base - height * t);
+    }
+    for (let k = 16; k >= 0; k--) {
+      const t = k / 16;
+      pen.lineTo(center(t) + trunkWidth * Math.pow(1 - t, .74), base - height * t);
+    }
+    pen.fill();
+    const tiers = pine ? Math.floor(between(25, 34)) : Math.floor(between(33, 44));
+    const spread = pine ? between(74, 98) : between(63, 95);
+    const twist = rand() * Math.PI * 2;
+    for (let tier = 1; tier < tiers; tier++) {
+      const t = .09 + .89 * (tier + between(-.30,.30)) / tiers;
+      const bare = t < leafStart || (snag && (t < .80 || rand() < .84));
+      const ct = Math.max(0, (t - leafStart) / (1 - leafStart));
+      const radius = spread * Math.pow(1 - ct, pine ? .59 : .86)
+        * (pine ? .64 + .40 * Math.sin(Math.PI * (ct + .05)) : .85 + .16 * Math.sin(Math.PI * ct));
+      const roots = Math.floor(between(4, 8));
+      const tierWeight = between(.69, 1.12);
+      for (let k = 0; k < roots; k++) {
+        if (bare && rand() < .75) continue;
+        if (!bare && rand() < (pine ? .12 : .13)) continue;
+        const angle = twist + tier * 2.39996 + (k + rand() * .38) * Math.PI * 2 / roots;
+        const projection = Math.cos(angle), depth = Math.sin(angle);
+        const length = radius * tierWeight * between(.64, 1.10) * (bare ? between(.18,.64) : 1);
+        const branchX = projection * length;
+        const x = center(t), y = base - t * height + between(-2, 2);
+        const lift = (pine || bare ? between(-.35, .12) : between(.05, .24)) * length;
+        const gravity = (pine ? .08 : .21) * length;
+        const trace = s => y + lift * s + (gravity + depth * .075 * length) * Math.sin(s * Math.PI);
+        const light = Math.round(between(64, 130) + 28 * (depth + 1) / 2);
+        pen.strokeStyle = pigment(light,projection,depth);
+        pen.lineWidth = Math.max(.65, (1 - ct) * (pine ? 1.85 : 1.25));
+        pen.beginPath();
+        pen.moveTo(x, y);
+        for (let j = 1; j <= 5; j++) pen.lineTo(x + branchX * j / 5, trace(j / 5));
+        pen.stroke();
+        if (bare) {
+          if (rand() > .48) {
+            pen.lineWidth = .74;
+            pen.beginPath();
+            pen.moveTo(x + branchX * .56,trace(.56));
+            pen.lineTo(x + branchX * .81,trace(.56) - length * between(.08,.21));
+            pen.stroke();
+          }
+          continue;
+        }
+        const density = pine ? between(.22,.31) : between(.24,.37);
+        const shoots = Math.max(3, Math.round(length * density));
+        for (let j = 0; j < shoots; j++) {
+          const s = (j + rand()) / shoots;
+          if (pine && s < .32 && rand() < .55) continue;
+          const px = x + branchX * s, py = trace(s);
+          const tuft = (pine ? 14 : 13) * (.30 + .70 * (1 - ct)) *
+            (pine ? .70 + s * .35 : 1.15 - .69 * s) * between(.44, 1.48);
+          const sign = branchX < 0 ? -1 : 1;
+          const shade = Math.max(30, Math.min(234, Math.round(light + between(-24,44))));
+          pen.fillStyle = pigment(shade,projection,depth);
+          if (pine) {
+            const tx = px + (rand() - .5) * tuft * .7, ty = py - rand() * tuft * .47;
+            const tw = tuft * between(.43,.78), th = tuft * between(.37,.75);
+            pen.beginPath();
+            for (let tip = 0; tip < 16; tip++) {
+              const phase = Math.PI * 2 * tip / 16;
+              const reach = tip % 2 ? between(.50,.81) : between(.79,1.20);
+              pen.lineTo(tx + Math.cos(phase)*tw*reach,ty+Math.sin(phase)*th*reach);
+            }
+            pen.closePath();
+            pen.fill();
+            continue;
+          }
+          const spreadX = Math.max(1.5, tuft * (.38 + .45 * Math.abs(projection)));
+          const tipX = px + sign * spreadX * between(.45, 1.30);
+          const tipY = py + (pine ? -tuft * between(.45,.93) : tuft * between(.46,1.20));
+          // Saw-toothed foliage sprays with projecting needle-tips and gaps between shoots.
+          pen.beginPath();
+          pen.moveTo(px - sign * spreadX * .45, py + 1);
+          pen.lineTo(px - sign * spreadX * .18, py - tuft * .38);
+          pen.lineTo(px + sign * spreadX * .08, py - tuft * .15);
+          pen.lineTo(px + sign * spreadX * .18, py - tuft * .57);
+          pen.lineTo(px + sign * spreadX * .43, py - tuft * .18);
+          pen.lineTo(tipX + sign * spreadX * .36, tipY - tuft * .28);
+          pen.lineTo(tipX, tipY);
+          pen.lineTo(px + sign * spreadX * .4, py + tuft * .26);
+          pen.lineTo(px + sign * spreadX * .07, py + tuft * .56);
+          pen.closePath();
+          pen.fill();
+        }
+      }
+    }
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, variant, w, h, 1, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  }
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+  const trees = [];
+  function plant(x, z, height, kind, widthFactor = 1) {
+    const fireDistance = Math.hypot(Math.max(0, Math.abs(x) - 267) * .9, z - api.fireZ(x));
+    const localHeat = .44*api.fireIntensity(x)+.28*(api.fireIntensity(x-31)+api.fireIntensity(x+31));
+    const light = Math.exp(-fireDistance/102)*(.21+localHeat*.93);
+    const width = height * w / h * (.74 + .46 * seed()) * widthFactor;
+    trees.push(x, api.terrain(x, z) - .14, z, height, seed() > .5 ? width : -width,
+      kind, .61 + seed() * .84, light);
+  }
+  const healthy = () => Math.floor(seed() * (speciesCount - 2));
+  function field(x,z) {
+    const hash = (i,j) => {
+      let v=Math.imul(i,2831941)^Math.imul(j,4076771);
+      v=Math.imul(v^(v>>>15),2246822519);
+      return ((v^(v>>>13))>>>0)/4294967296;
+    };
+    const i=Math.floor(x),j=Math.floor(z);
+    let a=x-i,b=z-j;
+    a*=a*(3-2*a);b*=b*(3-2*b);
+    const n=hash(i,j)*(1-a)+hash(i+1,j)*a;
+    const m=hash(i,j+1)*(1-a)+hash(i+1,j+1)*a;
+    return n*(1-b)+m*b;
+  }
+  // Interlocking stands share age and density across a slope. Exposed rock and the
+  // valley floor thin out into small groups and then isolated seedlings.
+  const spacing = 2.56;
+  for (let iz=-103;iz<16;iz++) {
+    for (let ix=-157;ix<158;ix++) {
+      const x=(ix+seed()*.95)*spacing, z=(iz+seed()*.95)*spacing;
+      const warp=field(x*.022+21,z*.027)*19;
+      const broad=field((x+warp)*.018+8,z*.021-9);
+      const local=field(x*.060+11,z*.056+3);
+      const mottling=.64*broad+.36*local;
+      const creek=Math.abs(x-(-5+6*Math.sin(z*.042+.4)+3*Math.sin(z*.069-1)+.055*(95-z)));
+      const openness=z>-51 ? Math.max(0,1-(Math.abs(x-4*Math.sin(z*.05))/49)) * .38 : 0;
+      const crownDistance=Math.abs(z-api.fireZ(x));
+      const exposed=Math.max(0,1-crownDistance/18);
+      const burnGaps=exposed*(.095+api.fireIntensity(x)*.21);
+      const density=Math.min(.91,Math.max(0,(mottling-.31-openness-burnGaps)*3.12));
+      if (seed()>density || (z>-65 && creek<4.9)) continue;
+      const age=field(x*.033+56,z*.028-16);
+      const edge=Math.min(1,Math.max(0,(mottling-.29)*2.85));
+      const h=(4.8+9.9*age)*(.54+.44*edge)*(.50+seed()*.86)*(1.-.33*exposed);
+      const snag=crownDistance<27 && seed()<.12+.27*exposed+.14*api.fireIntensity(x);
+      plant(x,z,h,snag?18+Math.floor(seed()*2):healthy(),.90+.25*age);
+    }
+  }
+  // Broken second-growth forest occupies both banks and continues around the camera.
+  for (let grove = 0; grove < 290; grove++) {
+    const x = (seed() * 2 - 1) * 300, z = 31 + seed() * 261;
+    if (Math.abs(x + 6 * Math.sin(z * .03)) < 22 + 6 * Math.sin(z * .04)) continue;
+    if (Math.hypot(x, z - 100) < 47) continue;
+    const radius = 5 + seed() * 12;
+    const count = 6 + Math.floor(seed() * 15);
+    const age = .66 + .52*seed();
+    for (let k = 0; k < count; k++) {
+      const a=seed()*Math.PI*2,r=Math.sqrt(seed())*radius;
+      plant(x+Math.cos(a)*r,z+Math.sin(a)*r,(5.0+seed()*11)*age,healthy());
+    }
+  }
+  for (const [x,z,height,variant] of [
+    [-27,66,18,5],[-30,61,13,12],[-22,59,11,9],[-35,73,16,7],[-31,47,9,4],
+    [31,64,16,14],[36,73,14,8],[27,54,9.5,6],[24,48,7,10],[38,57,15,15],
+    [-15,119,15,1],[19,126,13,3],[-32,105,12,0],[32,110,16,7],[-9,139,9,2]
+  ]) plant(x,z,height,variant);
+  const prog = api.program(`#version 300 es
+    precision highp float;
+    layout(location=0) in vec4 originHeight;
+    layout(location=1) in vec4 widthSpecies;
+    uniform mat4 vp;
+    uniform vec3 camera,right;
+    uniform float time;
+    out vec2 uv;
+    flat out float species;
+    out vec4 shading;
+    flat out vec2 lightDirection;
+    void main(){
+      float u=float(gl_VertexID & 1), v=float(gl_VertexID >> 1);
+      vec3 root=originHeight.xyz;
+      float flutter=sin(time*.58+root.x*.21+root.z*.13)*.006
+                  +sin(time*.84+root.z*.07)*.003;
+      vec3 position=root+vec3(0.,v*originHeight.w,0.);
+      position.x+=v*v*originHeight.w*(.009+flutter);
+      position+=vec3(right.x,0.,right.z)*((u-.5)*widthSpecies.x);
+      gl_Position=vp*vec4(position,1.);
+      vec2 light=normalize(vec2(-.15*root.x,-156.-root.z)+.001);
+      lightDirection=vec2(dot(light,right.xz)*sign(widthSpecies.x),dot(light,normalize(camera.xz-root.xz)));
+      uv=vec2(u,1.-v);
+      species=widthSpecies.y;
+      shading=vec4(widthSpecies.z,widthSpecies.w,distance(root,camera),v);
+    }`, `#version 300 es
+    precision highp float;
+    uniform highp sampler2DArray pines;
+    in vec2 uv;
+    flat in float species;
+    in vec4 shading;
+    flat in vec2 lightDirection;
+    out vec4 color;
+    void main(){
+      vec4 sampleColor=texture(pines,vec3(uv,species));
+      float a=smoothstep(.12,.83,sampleColor.a);
+      if(a<.15) discard;
+      float needles=smoothstep(.18,.79,sampleColor.r);
+      float fog=1.-exp(-shading.z*.0034);
+      float leaves=dot(sampleColor.gb*2.-1.,lightDirection);
+      float directional=smoothstep(-.37,.97,leaves);
+      float sky=shading.w*.65+.22;
+      vec3 ambient=mix(vec3(.012,.019,.022),vec3(.043,.049,.054),fog);
+      ambient+=vec3(.014,.020,.022)*sky*(.25+needles*.85)*shading.x;
+      float warm=shading.y*(.41+.65*fog);
+      vec3 veil=vec3(.115,.064,.047)*warm;
+      vec3 reflected=vec3(.21,.098,.048)*warm*(.11+1.04*directional)*(.13+.92*needles)*sky*shading.x;
+      // Crown tips and the fine edges of the near boughs catch a little sky and firelight.
+      if(shading.z<155.){
+        float nearLight=(1.-smoothstep(83.,155.,shading.z))*sky;
+        vec2 inset=vec2(.006*lightDirection.x,-.0052);
+        float gap=clamp(sampleColor.a-texture(pines,vec3(uv+inset,species)).a,0.,1.);
+        float overcastLight=.24+.76*max(.0,-sampleColor.b*2.+1.);
+        reflected+=nearLight*(vec3(.048,.045,.037)*needles*overcastLight+vec3(.095,.058,.036)*gap);
+      }
+      color=vec4(ambient+veil+reflected,a);
+    }`);
+  const uniforms = Object.fromEntries(['vp','camera','right','time','pines'].map(k=>[k,gl.getUniformLocation(prog,k)]));
+  const vao = gl.createVertexArray(), buffer = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(trees), gl.STATIC_DRAW);
+  for (let i = 0; i < 2; i++) {
+    gl.enableVertexAttribArray(i);
+    gl.vertexAttribPointer(i, 4, gl.FLOAT, false, 32, i * 16);
+    gl.vertexAttribDivisor(i, 1);
+  }
+  gl.bindVertexArray(null);
+  const count = trees.length / 8;
+  return {draw(frame) {
+    gl.useProgram(prog);
+    gl.uniformMatrix4fv(uniforms.vp,false,frame.vp);
+    gl.uniform3fv(uniforms.camera,frame.camera);
+    gl.uniform3fv(uniforms.right,frame.right);
+    gl.uniform1f(uniforms.time,frame.time);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY,texture);
+    gl.uniform1i(uniforms.pines,0);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindVertexArray(vao);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,count);
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY,null);
+  }};
+}
+
+
+function createFlames(gl, api) {
+  const {program, terrain, fireZ, fireIntensity} = api;
+  const random = api.rng(48171);
+  const clamp = (n, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, n));
+  // Persistent pockets of fuel give the advancing front its uneven rhythm.
+  function fuel(x) {
+    const pockets = .61 + .23 * Math.sin(.079 * x + 1.7 * Math.sin(.031 * x))
+      + .16 * Math.sin(.198 * x + 2.6);
+    return clamp((.16 + .84 * fireIntensity(x)) * (.28 + .88 * pockets));
+  }
+  function fireRow(x) {
+    return fireZ(x) + 1.1 * Math.sin(.51 * x + .53 * Math.sin(.10 * x));
+  }
+  const noise = `
+    float hash21(vec2 p){
+      vec3 p3=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));
+      p3+=dot(p3,p3.yzx+33.33);
+      return fract((p3.x+p3.y)*p3.z);
+    }
+    float nv(vec2 p){
+      vec2 i=floor(p), f=fract(p);
+      f=f*f*(3.-2.*f);
+      return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),
+                 mix(hash21(i+vec2(0,1)),hash21(i+1.),f.x),f.y);
+    }
+  `;
+  const flameProgram = program(`#version 300 es
+    precision highp float;
+    layout(location=0) in vec3 center;
+    layout(location=1) in vec4 shape; // width, height, independent phase, fuel
+    layout(location=2) in vec2 grade;
+    uniform mat4 vp;
+    uniform vec3 right;
+    out vec2 uv;
+    flat out vec4 flame;
+    void main(){
+      uv=vec2(float(gl_VertexID%2)*2.-1.,float(gl_VertexID/2));
+      vec3 offset=normalize(vec3(right.x,0.,right.z))*uv.x*shape.x*.5;
+      vec3 p=center+offset;
+      p.y+=uv.y*shape.y+dot(offset.xz,grade)*(1.-uv.y*.8);
+      gl_Position=vp*vec4(p,1.);
+      flame=shape;
+    }`, `#version 300 es
+    precision highp float;
+    in vec2 uv;
+    flat in vec4 flame;
+    uniform float time;
+    out vec4 pixel;
+    ${noise}
+    void main(){
+      float y=uv.y, s=flame.z;
+      float t=time*mix(1.60,.70,smoothstep(2.,16.,flame.y));
+      float turbulence=nv(vec2(y*2.8-t*.72,s))-.5;
+      float swing=nv(vec2(y*6.2-t*1.19,s+21.))-.5;
+      float curl=(.1+.76*y)*turbulence+(.04+.38*y)*swing;
+      float x=uv.x-curl-.37*y*y;
+      vec2 q=vec2(x*3.34+s, y*3.35-t+s*.13);
+      float eddy=nv(q+vec2(turbulence*1.65,0.));
+      float detail=nv(q*2.46+vec2(1.4*eddy,-t*.5));
+      float grain=nv(q*5.32+vec2(detail*1.1,-t*.71));
+      float streak=nv(vec2(x*5.1+s*.45+eddy*2.2+detail*.42,y*1.62-t*.70));
+      float ridges=1.-smoothstep(.015,.28,abs(streak-.49));
+      float field=.63-.99*y-pow(abs(x),1.3)*(.71+.27*y)
+              +.80*(eddy-.5)+.39*(detail-.5)+.14*(grain-.5)
+              +(.20+.24*y)*(streak-.48);
+      // Eddies shear apart before reaching the top of the billboard.
+      float tip=smoothstep(.56,.97,y);
+      field-=tip*(.17+.21*(1.-grain));
+      float edge=clamp(fwidth(field)*.62+.016+tip*.028,.031,.15);
+      float body=smoothstep(-edge*2.,edge*1.1,field);
+      float root=smoothstep(0.,max(.035,fwidth(y)*1.3),y);
+      float rolled=1.-smoothstep(.83,1.,abs(uv.x));
+      float heat=clamp(.06+.54*smoothstep(-.01,.49,field)+.37*ridges
+                 -.24*y+(.18*flame.w-.10)+.22*(detail-.5),0.,1.);
+      vec3 color=mix(vec3(.52,.073,.019),vec3(.97,.277,.036),smoothstep(.0,.40,heat));
+      color=mix(color,vec3(1.,.60,.13),smoothstep(.32,.77,heat));
+      color=mix(color,vec3(1.,.89,.56),smoothstep(.69,1.,heat));
+      float dissolve=1.-smoothstep(.60+.07*grain,.90+.07*grain,y);
+      float opacity=body*root*rolled*dissolve*(.83+.15*flame.w);
+      float air=.17*smoothstep(-.26,-.025,field)*(1.-body)*root*rolled*dissolve;
+      if(opacity+air<.003) discard;
+      pixel=vec4(color*opacity+vec3(.77,.151,.039)*air,opacity+air);
+    }`);
+  const fireVP = gl.getUniformLocation(flameProgram,'vp');
+  const fireRight = gl.getUniformLocation(flameProgram,'right');
+  const fireTime = gl.getUniformLocation(flameProgram,'time');
+  const flames = [];
+  function lick(x,z,w,h,amount) {
+    const y=terrain(x,z);
+    const dx=(terrain(x+.8,z)-terrain(x-.8,z))/1.6;
+    const dz=(terrain(x,z+.8)-terrain(x,z-.8))/1.6;
+    flames.push([x,y-.31,z,w,h,random()*170+1,amount,dx,dz]);
+  }
+  for (let x=-290; x<290; x+=.59+random()*1.08) {
+    const f=fuel(x);
+    if (random()>.21+.62*f) continue;
+    const z=fireRow(x)+(random()-.5)*4.0;
+    const size=(1.25+2.8*f)*(.73+.63*random());
+    lick(x,z,size*(1.30+random()*1.05),size*(1.0+random()*1.5),f);
+  }
+  // A torching stand runs up individual crowns, then spills fire to its neighbours.
+  for (let x=-283; x<286; x+=3+random()*5.4) {
+    const f=fuel(x);
+    if (random()>.10+.60*f) continue;
+    const z=fireRow(x)-1.4-2.2*random();
+    const h=(4.8+f*13)*(0.64+random()*.73);
+    lick(x,z,h*(.57+.40*random()),h,f);
+    if (random()<.70) {
+      const spread=(random()-.5)*5;
+      lick(x+spread,z+1.35,h*.39,h*(.44+.3*random()),f);
+    }
+  }
+  // Detached creeping lines follow shorter contours down the face.
+  for (let i=0;i<66;i++){
+    const x0=(random()-.5)*558;
+    const f=fuel(x0);
+    if(random()>.25+.73*f) continue;
+    const drift=4.5+Math.pow(random(),1.55)*31;
+    const length=1.3+random()*10;
+    const slope=(random()-.42)*.95;
+    for(let u=0;u<length;u+=.95+random()*1.8){
+      const x=x0+u;
+      const z=fireRow(x)+drift+u*slope+(random()-.5)*1.9;
+      const h=(1.1+random()*3.9)*(.58+.62*f);
+      lick(x,z,h*(1.15+random()*.6),h,f);
+    }
+  }
+  // Fire climbing a few branching draws gives the scar depth across the near face.
+  for(const [cx,length,depth,energy] of [[-137,22,22,.91],[-67,28,37,.86],[21,17,23,.72],[104,28,28,1.0],[156,14,15,.65]]){
+    for(let k=0;k<length;k+=.66+random()*1.5){
+      const f=k/length,x=cx+k,edge=Math.sin(f*Math.PI), z=fireRow(x)+6+depth*(1.-f)+3.0*Math.sin(f*5.)+2.5*(random()-.5);
+      if(random()>.54+.46*edge)continue;
+      const h=(1.4+Math.pow(random(),1.8)*6)*(.56+.92*edge)*energy;
+      lick(x,z,Math.min(5.6,h*(.88+random()*.52)),h,.45+.50*edge);
+      if(edge>.5&&random()<.17)lick(x+.44,z+1.4,3.0,h+3.6,.88);
+    }
+  }
+  flames.sort((a,b)=>a[2]-b[2]);
+  const fireVao=gl.createVertexArray();
+  gl.bindVertexArray(fireVao);
+  const instanceBuffer=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,instanceBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(flames.flat()),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,36,0);
+  gl.vertexAttribDivisor(0,1);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1,4,gl.FLOAT,false,36,12);
+  gl.vertexAttribDivisor(1,1);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2,2,gl.FLOAT,false,36,28);
+  gl.vertexAttribDivisor(2,1);
+  // Across taller fuel a continuous, contorted sheet links individual burning crowns.
+  // Its lower edge follows the stand in world space. Rising eddies tear holes
+  // in the luminous sheet and fold it into narrow hot ribbons.
+  const sheetProgram=program(`#version 300 es
+    precision highp float;
+    layout(location=0) in vec3 p;
+    layout(location=1) in vec4 field;
+    uniform mat4 vp;
+    out vec4 flow;
+    void main(){flow=field;gl_Position=vp*vec4(p,1.);}`,`#version 300 es
+    precision highp float;
+    in vec4 flow;
+    uniform float time;
+    out vec4 pixel;
+    ${noise}
+    void main(){
+      float h=flow.y, s=flow.x, fuel=flow.w, t=time*(.91+.16*fuel);
+      vec2 p=vec2(s*.235,h*2.9-t*.52);
+      float bend=nv(p*vec2(.54,.76)+vec2(8.2,-t*.12));
+      float roll=nv(p+vec2(2.6*bend-h*.73,-t*.13));
+      vec2 fold=vec2(s*.33+2.62*bend+1.44*roll-h*.77,h*2.54-t*.77);
+      float n=nv(fold);
+      float fine=nv(fold*2.67+vec2(2.08*n,-.29*t));
+      float fleck=nv(fold*6.07+vec2(fine,-.34*t));
+      float source=nv(vec2(s*.105,flow.w*2.82+.06*t));
+      float mass=.27+.33*fuel+.28*source-h
+        +(bend-.5)*.32+(roll-.5)*.44+(n-.5)*.65+(fine-.5)*.27+(fleck-.5)*.11
+        -(1.-flow.z)*.76;
+      float edge=clamp(fwidth(mass)*.78+.014,.031,.17);
+      float body=smoothstep(-edge*2.1,edge*1.7,mass);
+      float foldLight=1.-smoothstep(.035+edge*.18,.27,abs(n*.76+fine*.24-.50));
+      float hole=smoothstep(.39-.15*h,.87-.19*h,n*.59+roll*.26+fine*.15);
+      float heat=clamp(.04+.46*smoothstep(-.055,.38,mass)+.37*foldLight
+        +.21*fine-.18*h-.44*hole+.07*fuel,0.,1.);
+      vec3 fire=mix(vec3(.48,.075,.029),vec3(.99,.32,.054),smoothstep(0.,.45,heat));
+      fire=mix(fire,vec3(1.,.63,.18),smoothstep(.38,.78,heat));
+      fire=mix(fire,vec3(1.,.91,.62),smoothstep(.75,1.,heat));
+      float fade=smoothstep(0.,.06,flow.z)*smoothstep(0.,.035,h);
+      float alpha=body*(.97-.42*hole)*fade;
+      float haze=.23*smoothstep(-.27,-.04,mass)*(1.-body)*fade;
+      if(alpha+haze<.003)discard;
+      pixel=vec4(fire*alpha+vec3(.70,.17,.052)*haze,alpha+haze);
+    }`);
+  const sheets=[];
+  const sheetRandom=api.rng(71299);
+  for (let start=-285;start<286;){
+    const f=fuel(start), length=6+Math.pow(sheetRandom(),1.25)*(15+18*f);
+    const next=start+length+.7+Math.pow(sheetRandom(),1.7)*(5.4+5.6*(1.-f));
+    const offset=(sheetRandom()-.52)*5,phase=sheetRandom()*190;
+    const strength=.65+sheetRandom()*.51;
+    const count=Math.ceil(length/1.15);
+    function point(i,top) {
+      const u=i/count,x=start+u*length,locFuel=fuel(x);
+      const z=fireRow(x)+offset+.8*Math.sin(x*.38+phase);
+      const taper=clamp(Math.min(u,1.-u)*6.);
+      const height=(4.0+15.1*locFuel)*strength*(.91+.13*Math.sin(.11*x+phase));
+      return [x+.5*top,terrain(x,z)-.22+height*top,z, x+phase,top,taper,locFuel];
+    }
+    for(let i=0;i<count;i++){
+      const a=point(i,0),b=point(i+1,0),c=point(i,1),d=point(i+1,1);
+      sheets.push(...a,...b,...c,...c,...b,...d);
+    }
+    start=next;
+  }
+  const sheetVao=gl.createVertexArray();
+  gl.bindVertexArray(sheetVao);
+  const sheetBuffer=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,sheetBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(sheets),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,28,0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1,4,gl.FLOAT,false,28,12);
+  const sheetVP=gl.getUniformLocation(sheetProgram,'vp');
+  const sheetTime=gl.getUniformLocation(sheetProgram,'time');
+  // An ember bed conforms to the ground and remains visible through gaps in the flame.
+  const bedProgram = program(`#version 300 es
+    precision highp float;
+    layout(location=0) in vec3 p;
+    layout(location=1) in vec2 info;
+    uniform mat4 vp;
+    out vec2 world;
+    out vec2 bed;
+    void main(){world=p.xz;bed=info;gl_Position=vp*vec4(p,1.);}`, `#version 300 es
+    precision highp float;
+    in vec2 world;
+    in vec2 bed;
+    uniform float time;
+    out vec4 pixel;
+    ${noise}
+    void main(){
+      float pockets=nv(world*vec2(.21,.26));
+      float fracture=nv(world*vec2(.81,1.11)+pockets*1.72);
+      float grain=nv(world*vec2(2.37,2.95)+fracture);
+      float shore=1.-smoothstep(.20,1.,abs(bed.x)+(pockets-.55)*.48);
+      float base=shore*(.28+.72*bed.y);
+      float coals=base*(.63*pockets+.61*fracture+.24*grain);
+      float breathe=.95+.05*sin(time*1.85+world.x+fracture*6.);
+      float glint=smoothstep(.64,.84,.61*grain+.39*fracture);
+      float heat=smoothstep(.21,.86,coals*breathe)+glint*.28;
+      vec3 color=mix(vec3(.24,.044,.022),vec3(.82,.16,.016),heat);
+      color=mix(color,vec3(1.,.47,.065),smoothstep(.73,.99,coals+glint*.13));
+      float a=base*(.42+.55*heat);
+      pixel=vec4(color*a,a);
+    }`);
+  const bedVP=gl.getUniformLocation(bedProgram,'vp');
+  const bedTime=gl.getUniformLocation(bedProgram,'time');
+  const vertices=[];
+  function bedPoint(x,across) {
+    const f=fuel(x);
+    const width=2.2+5.4*f;
+    const z=fireRow(x)+across*width;
+    return [x,terrain(x,z)+.32,z,across,f];
+  }
+  for (let x=-290;x<290;x+=1.4){
+    for(let j=0;j<4;j++){
+      const u=-1+j*.5;
+      const a=bedPoint(x,u),b=bedPoint(x+1.4,u);
+      const c=bedPoint(x,u+.5),d=bedPoint(x+1.4,u+.5);
+      vertices.push(...a,...b,...c,...c,...b,...d);
+    }
+  }
+  // Smoldering duff breaks into irregular, flecked scars around spot fires.
+  const coalRandom=api.rng(2841);
+  for (let patch=0;patch<180;patch++){
+    const x0=(coalRandom()-.5)*565;
+    const z0=fireRow(x0)+2+Math.pow(coalRandom(),1.38)*37;
+    const length=.65+Math.pow(coalRandom(),1.1)*6.4;
+    const width=.44+coalRandom()*2.0, angle=(coalRandom()-.5)*1.8;
+    const c=Math.cos(angle),s=Math.sin(angle),f=.27+coalRandom()*.69;
+    function coalPoint(j,r){
+      const a=j*Math.PI/4;
+      const u=Math.cos(a)*length*r,v=Math.sin(a)*width*r;
+      const x=x0+u*c-v*s,z=z0+v*c+u*s;
+      return [x,terrain(x,z)+.36,z,r,f];
+    }
+    for(let j=0;j<8;j++){
+      const center=coalPoint(0,0),a=coalPoint(j,.55),b=coalPoint(j+1,.55);
+      const c=coalPoint(j,1),d=coalPoint(j+1,1);
+      vertices.push(...center,...a,...b,...a,...c,...b,...b,...c,...d);
+    }
+  }
+  const bedVao=gl.createVertexArray();
+  gl.bindVertexArray(bedVao);
+  const bedBuffer=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,bedBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(vertices),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,20,0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1,2,gl.FLOAT,false,20,12);
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER,null);
+  return {draw(frame){
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(bedProgram);
+    gl.uniformMatrix4fv(bedVP,false,frame.vp);
+    gl.uniform1f(bedTime,frame.time);
+    gl.bindVertexArray(bedVao);
+    gl.drawArrays(gl.TRIANGLES,0,vertices.length/5);
+    gl.useProgram(sheetProgram);
+    gl.uniformMatrix4fv(sheetVP,false,frame.vp);
+    gl.uniform1f(sheetTime,frame.time);
+    gl.bindVertexArray(sheetVao);
+    gl.drawArrays(gl.TRIANGLES,0,sheets.length/7);
+    gl.useProgram(flameProgram);
+    gl.uniformMatrix4fv(fireVP,false,frame.vp);
+    gl.uniform1f(fireTime,frame.time);
+    gl.uniform3fv(fireRight,frame.right);
+    gl.bindVertexArray(fireVao);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,flames.length);
+    gl.bindVertexArray(null);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  }};
+}
+
+
+function createSmoke(gl, api) {
+  // Build a static, soft density envelope for each fire column. The material inside
+  // the envelope is sampled in moving world coordinates, including the eroded edges.
+  const random = api.rng(385173);
+  const billows = [];
+  const add = (x, y, z, rx, ry, rz, amount, heat, rise) => {
+    billows.push({ x, y, z, rx, ry, rz, amount, heat, rise });
+  };
+  const crown = (x, center, span) => Math.exp(-(((x - center) / span) ** 2));
+  for (let origin = -290; origin < 290; origin += 8 + 10 * random()) {
+    const z = api.fireZ(origin) + (random() - .5) * 8;
+    const floor = api.terrain(origin, z);
+    const source = api.fireIntensity(origin);
+    const tower = Math.max(crown(origin, -68, 27), crown(origin, 82, 24) * .94,
+      crown(origin, 169, 34) * .73, crown(origin, -218, 23) * .68);
+    const height = 10 + 19 * source + 12 * random() + tower * (48 + 32 * random()) + 23 * crown(origin, -68, 21);
+    const phase = random() * 6.283;
+    const bend = (.7 + random() * .52);
+    const depthLean = random() * .18 - .23;
+    const size = .78 + random() * .55;
+    const energy = .76 + .28 * source;
+    for (let h = 2; h < height; ) {
+      const shape = h / height;
+      const rx = size * (6.5 + h * .205) * (.85 + .24 * random());
+      const ry = (8 + h * .133) * (.86 + random() * .35);
+      const rz = (7.2 + h * .17) * size;
+      const x = origin + bend * h * (.24 + .39 * shape)
+        + Math.sin(phase + shape * 6) * (1.5 + 3.8 * shape);
+      const pz = z + h * depthLean + 2.8 * Math.sin(phase * 1.3 + shape * 5);
+      const heat = energy * (.69 * Math.exp(-h / 44) + .31 * Math.exp(-h / 83));
+      add(x, floor + h, pz, rx, ry, rz, .87, heat, h);
+      if (shape > .43 && random() < .54) {
+        const lobe = random() * 6.283;
+        add(x + Math.cos(lobe) * rx * .48, floor + h + ry * .26, pz + Math.sin(lobe) * rz * .55,
+          rx * .66, ry * .73, rz * .71, .6, heat * .94, h + ry * .26);
+      }
+      h += ry * (.53 + random() * .23);
+    }
+    // The buoyant head rolls over as it reaches the faster wind aloft. A broad,
+    // low-density cap dissipates downwind while the upwind rim stays compact.
+    if (tower > .58 && origin < -25 && origin > -120) {
+      const top = height * .91, windX = origin + bend*top*.63;
+      const windZ = z + depthLean*top, radius = (7.5+top*.205)*size;
+      const hLight = energy*(.69*Math.exp(-top/44)+.31*Math.exp(-top/83));
+      add(windX + radius*.28, floor+height+1, windZ, radius*.94, radius*.54,
+          radius*.83, .89, hLight, height);
+      add(windX + radius*.94, floor+height+radius*.10, windZ-radius*.17,
+          radius*1.08, radius*.44, radius*.69, .58, hLight*.91, height);
+      add(windX + radius*1.75, floor+height+radius*.04, windZ-radius*.25,
+          radius*.93, radius*.30, radius*.60, .29, hLight*.84, height);
+    }
+    // Low smoke spilling off the hot front travels farther along the ground than the columns.
+    add(origin + 4, floor + 4, z - 2, 16 + random() * 8, 7 + random() * 3, 9,
+      .49, energy, 4);
+  }
+
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const s of billows) {
+    [s.x, s.y, s.z].forEach((c, i) => {
+      const r = [s.rx, s.ry, s.rz][i] + 11;
+      lo[i] = Math.min(lo[i], c - r);
+      hi[i] = Math.max(hi[i], c + r);
+    });
+  }
+  const dims = [192, 72, 56];
+  const step = dims.map((n, i) => (hi[i] - lo[i]) / n);
+  const length = dims[0] * dims[1] * dims[2];
+  const mass = new Float32Array(length), warmth = new Float32Array(length), heights = new Float32Array(length);
+  for (const s of billows) {
+    const centers = [s.x, s.y, s.z], radii = [s.rx, s.ry, s.rz];
+    const start = centers.map((v, i) => Math.max(0, Math.floor((v - radii[i] - lo[i]) / step[i])));
+    const end = centers.map((v, i) => Math.min(dims[i] - 1, Math.ceil((v + radii[i] - lo[i]) / step[i])));
+    for (let k = start[2]; k <= end[2]; k++) {
+      const dz = (lo[2] + (k + .5) * step[2] - s.z) / s.rz;
+      for (let j = start[1]; j <= end[1]; j++) {
+        const dy = (lo[1] + (j + .5) * step[1] - s.y) / s.ry;
+        const base = (k * dims[1] + j) * dims[0];
+        for (let i = start[0]; i <= end[0]; i++) {
+          const dx = (lo[0] + (i + .5) * step[0] - s.x) / s.rx;
+          const r = 1 - dx * dx - dy * dy - dz * dz;
+          if (r <= 0) continue;
+          const density = s.amount * r * r;
+          const p = base + i;
+          mass[p] += density; warmth[p] += density * s.heat; heights[p] += density * s.rise;
+        }
+      }
+    }
+  }
+  const density = new Uint8Array(length * 4);
+  for (let i = 0; i < length; i++) {
+    if (!mass[i]) continue;
+    const d = 1 - Math.exp(-mass[i] * 1.3);
+    density[i * 4] = Math.round(d * 255);
+    density[i * 4 + 1] = Math.round(d * warmth[i] / mass[i] * 248);
+    density[i * 4 + 2] = Math.round(d * Math.min(1, heights[i] / (mass[i] * 110)) * 255);
+    density[i * 4 + 3] = 255;
+  }
+
+  // Periodic value noise and cellular distance, baked in a small 3D tile. Lighting
+  // and animation use the same density coordinates, so details are stable while looking around.
+  const noiseSide = 64;
+  const noise = new Uint8Array(noiseSide ** 3 * 4);
+  const grid = (n) => Float32Array.from({ length: n ** 3 }, random);
+  const fine = grid(16), middle = grid(8), coarse = grid(4), warp = grid(4), warp2 = grid(4);
+  const points = Array.from({ length: 64 }, () => [.14 + .72 * random(), .14 + .72 * random(), .14 + .72 * random()]);
+  function lattice(a, mask, x, y, z) {
+    const side = mask + 1;
+    return a[((z & mask) * side + (y & mask)) * side + (x & mask)];
+  }
+  function value(a, side, x, y, z) {
+    x *= side; y *= side; z *= side;
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    const smooth = (t) => t * t * (3 - 2 * t);
+    const u = smooth(x - ix), v = smooth(y - iy), w = smooth(z - iz);
+    const mix = (a, b, t) => a + (b - a) * t;
+    const m = side - 1;
+    return mix(
+      mix(mix(lattice(a,m,ix,iy,iz), lattice(a,m,ix+1,iy,iz), u),
+          mix(lattice(a,m,ix,iy+1,iz), lattice(a,m,ix+1,iy+1,iz), u), v),
+      mix(mix(lattice(a,m,ix,iy,iz+1), lattice(a,m,ix+1,iy,iz+1), u),
+          mix(lattice(a,m,ix,iy+1,iz+1), lattice(a,m,ix+1,iy+1,iz+1), u), v), w);
+  }
+  function cell(x, y, z) {
+    x *= 4; y *= 4; z *= 4;
+    const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+    let near = 4;
+    for (let k = iz - 1; k <= iz + 1; k++) for (let j = iy - 1; j <= iy + 1; j++) {
+      for (let i = ix - 1; i <= ix + 1; i++) {
+        const p = points[((k & 3) * 4 + (j & 3)) * 4 + (i & 3)];
+        const dx = i + p[0] - x, dy = j + p[1] - y, dz = k + p[2] - z;
+        near = Math.min(near, dx * dx + dy * dy + dz * dz);
+      }
+    }
+    return Math.max(0, 1 - Math.sqrt(near) * 1.1);
+  }
+  for (let k = 0; k < noiseSide; k++) for (let j = 0; j < noiseSide; j++) for (let i = 0; i < noiseSide; i++) {
+    const x = (i + .5) / noiseSide, y = (j + .5) / noiseSide, z = (k + .5) / noiseSide;
+    const p = ((k * noiseSide + j) * noiseSide + i) * 4;
+    const mid = value(middle,8,x,y,z), small = value(fine,16,x,y,z);
+    noise[p] = Math.round(255 * (.58 * cell(x,y,z) + .29 * mid + .13 * small));
+    noise[p + 1] = Math.round(255 * (.8 * value(warp,4,x,y,z) + .2 * small));
+    noise[p + 2] = Math.round(255 * (.78 * value(warp2,4,x,y,z) + .22 * mid));
+    noise[p + 3] = Math.round(255 * (.58 * value(coarse,4,x,y,z) + .29 * mid + .13 * small));
+  }
+  function volume(data, sizes, wrap) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    for (const cap of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T,gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, cap, wrap);
+    gl.texImage3D(gl.TEXTURE_3D,0,gl.RGBA8,...sizes,0,gl.RGBA,gl.UNSIGNED_BYTE,data);
+    return t;
+  }
+  // Spatial derivatives of the density and advected noise give every rolling
+  // surface a consistent orientation for skylight and illumination from below.
+  function gradientVolume(bytes, sizes, wrap, units, field, gain) {
+    const [nx,ny,nz] = sizes;
+    const grad = new Uint8Array(nx*ny*nz*4);
+    const valueAt = (x,y,z) => {
+      x = wrap ? (x+nx)%nx : Math.max(0,Math.min(nx-1,x));
+      y = wrap ? (y+ny)%ny : Math.max(0,Math.min(ny-1,y));
+      z = wrap ? (z+nz)%nz : Math.max(0,Math.min(nz-1,z));
+      return field(bytes,((z*ny+y)*nx+x)*4);
+    };
+    const pack = n => Math.round(127.5*(1+Math.max(-1,Math.min(1,n))));
+    for(let z=0;z<nz;z++) for(let y=0;y<ny;y++) for(let x=0;x<nx;x++) {
+      const n=((z*ny+y)*nx+x)*4;
+      grad[n  ]=pack((valueAt(x+1,y,z)-valueAt(x-1,y,z))*.5*gain/units[0]);
+      grad[n+1]=pack((valueAt(x,y+1,z)-valueAt(x,y-1,z))*.5*gain/units[1]);
+      grad[n+2]=pack((valueAt(x,y,z+1)-valueAt(x,y,z-1))*.5*gain/units[2]);
+      grad[n+3]=255;
+    }
+    return volume(grad,sizes,wrap?gl.REPEAT:gl.CLAMP_TO_EDGE);
+  }
+  const smoothGradient=gradientVolume(density,dims,false,step,(a,p)=>a[p]/255,5.);
+  const noiseGradient=gradientVolume(noise,[noiseSide,noiseSide,noiseSide],true,[1,1,1],(a,p)=>(.79*a[p]+.21*a[p+3])/255,6.);
+  const envelope = volume(density, dims, gl.CLAMP_TO_EDGE);
+  const turbulence = volume(noise, [noiseSide,noiseSide,noiseSide], gl.REPEAT);
+  gl.bindTexture(gl.TEXTURE_3D, null);
+
+  const vertex = `#version 300 es
+    precision highp float;
+    uniform mat4 uVP;
+    uniform vec3 uEye;
+    out vec2 uv;
+    out vec3 ray;
+    out vec4 nearH;
+    out vec4 farH;
+    void main() {
+      vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+      uv = corner;
+      vec2 xy = corner * 2. - 1.;
+      mat4 invVP = inverse(uVP);
+      nearH = invVP * vec4(xy,-1.,1.);
+      farH = invVP * vec4(xy,1.,1.);
+      ray = farH.xyz/farH.w - uEye;
+      gl_Position = vec4(xy,0.,1.);
+    }`;
+  const march = api.program(vertex, `#version 300 es
+    precision highp float;
+    precision highp sampler3D;
+    in vec2 uv;
+    in vec3 ray;
+    in vec4 nearH;
+    in vec4 farH;
+    uniform vec3 uEye, uLow, uHigh;
+    uniform float uTime, uQuality;
+    uniform sampler3D uEnvelope,uNoise,uSmoothGrad,uNoiseGrad;
+    uniform highp sampler2D uTerrain;
+    uniform bool uHasTerrain;
+    layout(location=0) out vec4 smoke;
+    layout(location=1) out vec4 front;
+    float clamp01(float n) { return clamp(n,0.,1.); }
+    void main() {
+      smoke = vec4(0.); front = vec4(1.);
+      vec3 dir = normalize(ray);
+      vec3 a = (uLow - uEye) / dir, b = (uHigh - uEye) / dir;
+      vec3 mn = min(a,b), mx = max(a,b);
+      float enter = max(0., max(mn.x,max(mn.y,mn.z)));
+      float leave = min(mx.x,min(mx.y,mx.z));
+      if (leave <= enter) return;
+      if (uHasTerrain) {
+        vec2 d = 1. / vec2(textureSize(uTerrain,0));
+        float z = max(max(texture(uTerrain,uv + d * vec2(-1.,-1.)).r,texture(uTerrain,uv + d * vec2(1.,-1.)).r),
+                      max(texture(uTerrain,uv + d * vec2(-1.,1.)).r,texture(uTerrain,uv + d).r));
+        vec4 h = mix(nearH,farH,z);
+        leave = min(leave, dot(h.xyz/h.w-uEye,dir));
+      }
+      if (leave <= enter) return;
+      float dt = max(mix(3.8,2.45,uQuality),(leave-enter)/63.);
+      float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy,vec2(.06711056,.00583715))));
+      float t = enter + dt * (.15 + .7 * jitter);
+      vec3 invSize = 1./(uHigh-uLow);
+      vec3 lightDirection = vec3(-.29,-1.,-.16);
+      float first = leave;
+      for (int i=0; i<65; i++) {
+        if (t > leave || smoke.a > .987) break;
+        vec3 p = uEye + t * dir;
+        vec3 v = (p - uLow) * invSize;
+        vec3 flow = p - uTime * vec3(1.12,1.58,-.18);
+        vec3 warp = texture(uNoise,flow*.0063 + vec3(.18,.13,.44)).gba - .5;
+        vec3 fold = texture(uNoise,flow*.016 + warp*.22).gba - .5;
+        vec3 shifted = v + (warp * vec3(24.,18.,21.) + fold * vec3(9.,8.,9.)) * invSize;
+        vec3 e = texture(uEnvelope,shifted).rgb;
+        if (e.r > .035) {
+          float heat = clamp01(e.g/max(.002,e.r));
+          float rise = clamp01(e.b/max(.002,e.r));
+          vec3 q = flow * .015 + warp*.236 + fold*.057;
+          vec4 detail = texture(uNoise,q);
+          vec4 fine = texture(uNoise,q*2.57 + warp.brg*.16 - vec3(.0,uTime*.0031,0.));
+          float material = detail.r*.52 + detail.a*.18 + fine.r*.30;
+          float field = e.r + (material-.51) * 1.62 + (fine.a-.5)*.28;
+          float dust = smoothstep(.18,.66,field) * (.76 + .57*material);
+          float alpha = 1. - exp(-dt*dust*.22);
+          if (alpha > .002) {
+            if (smoke.a < .015) first = t;
+            vec3 macroGrad = (texture(uSmoothGrad,shifted).rgb*2.-1.)*.2;
+            vec3 broadGrad = (texture(uNoiseGrad,q).rgb*2.-1.)*(64./6.)*.015;
+            vec3 fineGrad = (texture(uNoiseGrad,q*2.57 + warp.brg*.16 - vec3(.0,uTime*.0031,0.)).rgb*2.-1.)*(64./6.)*.03855;
+            vec3 normal = normalize(-macroGrad - 1.12*broadGrad - .51*fineGrad + .0005);
+            vec3 moonDir = normalize(vec3(-.61,.79,.36));
+            vec3 flameDir = normalize(vec3(-.25,-.87,-.43));
+            float skyDepth = texture(uEnvelope,shifted+moonDir*14.*invSize).r;
+            float flameDepth = texture(uEnvelope,shifted+flameDir*10.*invSize).r;
+            float openSky = exp(-skyDepth*2.0);
+            float openFire = exp(-flameDepth*2.5);
+            float upward = max(dot(normal,moonDir),0.);
+            float downward = max(dot(normal,flameDir),0.);
+            float edge = 1.-smoothstep(.27,.8,field);
+            float grain = clamp01(.48 + (material-.47)*1.35);
+            float cool = (.20+.80*upward)*(.28+.72*openSky)*(.81+.19*grain);
+            vec3 skylight = vec3(.054,.059,.075) + vec3(.185,.201,.227)*cool;
+            float flare = .965 + .022*sin(p.x*.081 + uTime*1.4) + .013*sin(p.z*.22 + uTime*2.15);
+            float lamp = pow(heat,.81)*(.24 + .91*downward + .64*openFire + .16*edge) * (.83 + .28*grain)*flare;
+            vec3 lit = skylight*(1.-.58*heat) + lamp*mix(vec3(.72,.306,.125),vec3(.95,.45,.15),heat);
+            float weight = (1.-smoke.a)*alpha;
+            smoke.rgb += lit*weight; smoke.a += weight;
+          }
+        }
+        t += dt;
+      }
+      // A 16-bit range preserves the intersection with foreground trees during upsampling.
+      float encodedRange = clamp01(first/1200.)*255.;
+      front = vec4(floor(encodedRange)/255.,fract(encodedRange),0.,1.);
+    }`);
+  const combine = api.program(vertex, `#version 300 es
+    precision highp float;
+    in vec2 uv;
+    in vec3 ray;
+    uniform vec3 uEye;
+    uniform mat4 uVP;
+    uniform sampler2D uSmoke, uFront;
+    out vec4 outColor;
+    void main() {
+      vec4 c = texture(uSmoke, uv);
+      if (c.a < .004) discard;
+      vec2 z = texture(uFront,uv).rg;
+      float range = dot(z, vec2(1.,1./255.))*1200.;
+      vec4 h = uVP*vec4(uEye + normalize(ray)*range,1.);
+      gl_FragDepth = h.z/h.w*.5+.5;
+      outColor = c;
+    }`);
+  const uniforms = (p,names) => Object.fromEntries(names.split(' ').map(n=>[n,gl.getUniformLocation(p,n)]));
+  const u = uniforms(march,'uVP uEye uLow uHigh uTime uQuality uEnvelope uNoise uTerrain uHasTerrain uSmoothGrad uNoiseGrad');
+  const c = uniforms(combine,'uVP uEye uSmoke uFront');
+  const vao = gl.createVertexArray(), fbo = gl.createFramebuffer();
+  const targets = [gl.createTexture(),gl.createTexture()];
+  for (const target of targets) {
+    gl.bindTexture(gl.TEXTURE_2D,target);
+    for (const opt of [gl.TEXTURE_MAG_FILTER,gl.TEXTURE_MIN_FILTER]) gl.texParameteri(gl.TEXTURE_2D,opt,gl.LINEAR);
+    for (const opt of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,opt,gl.CLAMP_TO_EDGE);
+  }
+  // A complete dummy texture avoids sampler errors for hosts using a depth renderbuffer.
+  const empty = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,empty);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,255,255,255]));
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.bindTexture(gl.TEXTURE_2D,null);
+  let w = 0, h = 0;
+  return {draw(frame) {
+    const target = frame.framebuffer;
+    const view = [0,0,frame.resolution[0],frame.resolution[1]];
+    const quality = Math.max(0,Math.min(1,frame.quality ?? 1));
+    const scale = Math.min(.53 + quality*.10, (820 + 160*quality)/view[2], (480+70*quality)/view[3]);
+    const nw = Math.max(1,Math.ceil(view[2]*scale)), nh = Math.max(1,Math.ceil(view[3]*scale));
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,fbo);
+    if (nw !== w || nh !== h) {
+      w = nw; h = nh;
+      targets.forEach((tex,i)=>{
+        gl.bindTexture(gl.TEXTURE_2D,tex);
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+        gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,tex,0);
+      });
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
+    }
+    gl.viewport(0,0,w,h); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+    gl.disable(gl.DEPTH_TEST); gl.depthMask(false); gl.bindVertexArray(vao);
+    gl.useProgram(march);
+    gl.uniformMatrix4fv(u.uVP,false,frame.vp); gl.uniform3fv(u.uEye,frame.camera);
+    gl.uniform3fv(u.uLow,lo); gl.uniform3fv(u.uHigh,hi);
+    gl.uniform1f(u.uTime,frame.time); gl.uniform1f(u.uQuality,quality);
+    const bind = (unit,type,tex,loc) => {
+      gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(type,tex); gl.uniform1i(loc,unit);
+    };
+    bind(0,gl.TEXTURE_3D,envelope,u.uEnvelope); bind(1,gl.TEXTURE_3D,turbulence,u.uNoise);
+    bind(3,gl.TEXTURE_3D,smoothGradient,u.uSmoothGrad); bind(4,gl.TEXTURE_3D,noiseGradient,u.uNoiseGrad);
+    bind(2,gl.TEXTURE_2D,frame.depthTexture || empty,u.uTerrain); gl.uniform1i(u.uHasTerrain,frame.depthTexture ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.bindTexture(gl.TEXTURE_2D,null);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,target); gl.viewport(...view);
+    gl.useProgram(combine); gl.uniformMatrix4fv(c.uVP,false,frame.vp); gl.uniform3fv(c.uEye,frame.camera);
+    bind(0,gl.TEXTURE_2D,targets[0],c.uSmoke); bind(1,gl.TEXTURE_2D,targets[1],c.uFront);
+    gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.disable(gl.BLEND); gl.depthMask(true); gl.bindVertexArray(null); gl.activeTexture(gl.TEXTURE0);
+  }};
+}
+
+const forest=createForest(gl,api), flames=createFlames(gl,api), smoke=createSmoke(gl,api);
+const blurProgram=program(screenVertex,`#version 300 es
+precision highp float;in vec2 uv;out vec4 color;
+uniform sampler2D source;uniform vec2 axis;uniform int extract;
+vec3 readLight(vec2 pos){vec3 c=texture(source,pos).rgb;return extract==1?c*smoothstep(.37,.89,max(c.r,max(c.g,c.b))):c;}
+void main(){
+  vec3 c=readLight(uv)*.227027;
+  c+=(readLight(uv+axis*1.384615)+readLight(uv-axis*1.384615))*.316216;
+  c+=(readLight(uv+axis*3.230769)+readLight(uv-axis*3.230769))*.070270;
+  color=vec4(c,1);
+}`);
+function ridgeProfile(){
+  const samples=new Uint8Array(512*4);
+  for(let i=0;i<512;i++){
+    const x=(i+.5)/512*640-320,z=fireZ(x);
+    samples[4*i]=clamp(terrain(x,z)/225)*255;samples[4*i+1]=fireIntensity(x)*255;samples[4*i+3]=255;
+  }
+  const t=gl.createTexture();tex(0,t);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,512,1,0,gl.RGBA,gl.UNSIGNED_BYTE,samples);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  return t;
+}
+const profile=ridgeProfile();
+const finishProgram=program(screenVertex,`#version 300 es
+precision highp float;in vec2 uv;out vec4 color;uniform sampler2D scene,bloom,scatter,profile;uniform highp sampler2D depthMap;
+uniform float time;uniform vec2 resolution,lens;uniform vec3 camera,rightDir,upDir,forward;
+${noiseGL}
+${fireGL}
+void main(){
+  vec2 coord=uv;
+  vec2 screen=(uv*2.-1.)*lens;
+  vec3 ray=forward+rightDir*screen.x+upDir*screen.y;
+  // Refraction is confined to hot air behind the nearest opaque surface.
+  if(ray.z<-.48){
+    float t=(-155.-camera.z)/ray.z;
+    t=(fz(camera.x+ray.x*t)-camera.z)/ray.z;
+    vec3 hit=camera+ray*t;
+    vec2 front=texture(profile,vec2((hit.x+320.)/640.,.5)).rg;
+    float h=hit.y-front.r*225.;
+    float z=texture(depthMap,uv).r;
+    float viewDepth=(.18*1800.)/(1800.-z*(1800.-.18));
+    float hot=(.20+.80*front.g)*smoothstep(-4.,5.,h)*(1.-smoothstep(9.,40.,h))*smoothstep(t-13.,t+1.,viewDepth);
+    vec2 air=vec2(n2(hit.xy*.49+vec2(time*.64,-time*3.1)),n2(hit.xy*.33+vec2(4.7,-time*2.5)))-.5;
+    coord+=air*hot*vec2(.0018,.0012);
+  }
+  vec3 c=texture(scene,coord).rgb,b=texture(bloom,coord).rgb,halo=texture(scatter,uv).rgb;
+  c+=(b*vec3(.50,.45,.29)+halo*vec3(1.12,.77,.40))*(1.-c);
+  c+=.032*smoothstep(.18,.72,c.r)*vec3(.74,.63,.39);
+  vec2 d=(uv-.5)*vec2(1.02,.84);c*=1.-.33*dot(d,d);
+  float grain=fract(52.9829189*fract(dot(gl_FragCoord.xy+floor(time*18.)*vec2(.67,.29),vec2(.06711056,.00583715))));
+  c+=vec3((grain-.5)*.009);
+  color=vec4(c,1.);
+}`);
+const locations=new Map();
+function loc(p,k){let u=locations.get(p);if(!u)locations.set(p,u=new Map());if(!u.has(k))u.set(k,gl.getUniformLocation(p,k));return u.get(k)}
+function tex(slot,t){gl.activeTexture(gl.TEXTURE0+slot);gl.bindTexture(gl.TEXTURE_2D,t)}
+function target(depth){
+  const texture=gl.createTexture(),fbo=gl.createFramebuffer();
+  function setup(t,filter){tex(0,t);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE)}
+  setup(texture,gl.LINEAR);
+  const depthTexture=depth?gl.createTexture():null;if(depth)setup(depthTexture,gl.NEAREST);
+  return {texture,depthTexture,fbo,w:1,h:1,resize(w,h){
+    this.w=w;this.h=h;gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+    tex(0,texture);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);
+    if(depth){tex(0,depthTexture);gl.texImage2D(gl.TEXTURE_2D,0,gl.DEPTH_COMPONENT24,w,h,0,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,null);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,depthTexture,0)}
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Scene framebuffer could not be initialized.');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  }};
+}
+const scene=target(true),bloomX=target(false),bloomY=target(false),hazeX=target(false),hazeY=target(false),empty=gl.createVertexArray();
+let quality=1,qualityCooldown=0,frameAverage=16.7,slowFrames=0,fastFrames=0;
+function resize(){
+  const w=canvas.clientWidth,h=canvas.clientHeight;
+  const pixelRatio=Math.min(devicePixelRatio||1,1.6,Math.sqrt(1960000/Math.max(1,w*h)))*quality;
+  const W=Math.max(2,Math.round(w*pixelRatio)),H=Math.max(2,Math.round(h*pixelRatio));
+  if(W===canvas.width&&H===canvas.height&&scene.w===W)return;
+  canvas.width=W;canvas.height=H;scene.resize(W,H);bloomX.resize(Math.max(2,W>>2),Math.max(2,H>>2));bloomY.resize(bloomX.w,bloomX.h);hazeX.resize(Math.max(2,W>>4),Math.max(2,H>>4));hazeY.resize(hazeX.w,hazeX.h);
+}
+function cameraMatrix(pos,right,up,forward,tan,aspect,near,far){
+  const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const q=(far+near)/(far-near),r=-2*far*near/(far-near);
+  return new Float32Array([right[0]/(tan*aspect),up[0]/tan,forward[0]*q,forward[0],
+    right[1]/(tan*aspect),up[1]/tan,forward[1]*q,forward[1],
+    right[2]/(tan*aspect),up[2]/tan,forward[2]*q,forward[2],
+    -dot(right,pos)/(tan*aspect),-dot(up,pos)/tan,-dot(forward,pos)*q+r,-dot(forward,pos)]);
+}
+const pointers=new Map();
+const narrowView=()=>1-smooth(.53,1.1,canvas.clientWidth/canvas.clientHeight);
+const openingYaw=()=>.034-.115*narrowView(),openingFov=()=>(52+12*narrowView())*Math.PI/180;
+let yaw=openingYaw(),pitch=.217,wantedYaw=yaw,wantedPitch=pitch,fov=openingFov(),wantedFov=fov;
+let lastInput=-10000,driftTime=0,returnTime=0,lastPinch=0,uiTimer=0;
+const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const defaultPitch=.217;
+function reveal(){document.body.classList.remove('resting');clearTimeout(uiTimer);uiTimer=setTimeout(()=>document.body.classList.add('resting'),3400)}
+function interact(){lastInput=performance.now();returnTime=0;reveal()}
+function home(){interact();wantedYaw+=Math.atan2(-Math.sin(wantedYaw-openingYaw()),Math.cos(wantedYaw-openingYaw()));wantedPitch=defaultPitch;wantedFov=openingFov()}
+function zoom(factor){wantedFov=clamp(2*Math.atan(Math.tan(wantedFov/2)*factor),20*Math.PI/180,83*Math.PI/180)}
+function look(dx,dy){const sensitivity=2*Math.tan(wantedFov/2)/Math.max(280,canvas.clientHeight);wantedYaw-=dx*sensitivity;wantedPitch=clamp(wantedPitch+dy*sensitivity,-1.46,1.46)}
+const pinch=()=>{const pts=[...pointers.values()];return pts.length>1?Math.hypot(pts[0][0]-pts[1][0],pts[0][1]-pts[1][1]):0};
+canvas.addEventListener('pointerdown',e=>{
+  if(e.pointerType==='mouse'&&e.button!==0)return;
+  interact();canvas.focus({preventScroll:true});pointers.set(e.pointerId,[e.clientX,e.clientY]);canvas.setPointerCapture(e.pointerId);lastPinch=pinch();canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointermove',e=>{
+  const old=pointers.get(e.pointerId);
+  if(!old){if(e.pointerType==='mouse')reveal();return}
+  const dx=e.clientX-old[0],dy=e.clientY-old[1];pointers.set(e.pointerId,[e.clientX,e.clientY]);interact();
+  if(pointers.size===1)look(dx,dy);
+  else{const distance=pinch();if(distance>3&&lastPinch>3)zoom(lastPinch/distance);lastPinch=distance;look(dx*.5,dy*.5)}
+});
+function release(e){
+  if(!pointers.delete(e.pointerId))return;
+  lastPinch=pinch();interact();if(!pointers.size)canvas.classList.remove('dragging');
+}
+canvas.addEventListener('pointerup',release);canvas.addEventListener('pointercancel',release);canvas.addEventListener('lostpointercapture',release);
+canvas.addEventListener('wheel',e=>{e.preventDefault();interact();const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?canvas.clientHeight:1);zoom(Math.exp(clamp(delta,-250,250)*.00145))},{passive:false});
+window.addEventListener('blur',()=>{pointers.clear();canvas.classList.remove('dragging')});
+document.querySelector('#home').addEventListener('click',home);
+async function fullscreen(){try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();reveal()}catch{reveal()}}
+const fullButton=document.querySelector('#full');
+if(!document.fullscreenEnabled)fullButton.style.display='none';
+fullButton.addEventListener('click',fullscreen);
+document.addEventListener('fullscreenchange',()=>{fullButton.setAttribute('aria-label',document.fullscreenElement?'Exit fullscreen':'Enter fullscreen');resize()});
+window.addEventListener('keydown',e=>{
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  switch(e.key){case 'ArrowLeft':wantedYaw-=.11;break;case 'ArrowRight':wantedYaw+=.11;break;
+  case 'ArrowUp':wantedPitch=clamp(wantedPitch+.08,-1.46,1.46);break;case 'ArrowDown':wantedPitch=clamp(wantedPitch-.08,-1.46,1.46);break;
+  case '+':case '=':zoom(.88);break;case '-':zoom(1.14);break;case 'Home':home();break;case 'f':case 'F':fullscreen();break;default:return}
+  e.preventDefault();interact();
+});
+if(matchMedia('(pointer:coarse)').matches)document.querySelector('#hint').textContent='Drag to look · Pinch to zoom';
+reveal();
+function quad(){gl.bindVertexArray(empty);gl.drawArrays(gl.TRIANGLES,0,3)}
+function drawMesh(p,m,indexed=true){gl.useProgram(p);gl.bindVertexArray(m.vao);if(indexed)gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_INT,0);else gl.drawArrays(gl.TRIANGLES,0,m.count)}
+function blur(from,to,axis,threshold){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,to.fbo);gl.viewport(0,0,to.w,to.h);gl.useProgram(blurProgram);
+  tex(0,from.texture);gl.uniform1i(loc(blurProgram,'source'),0);gl.uniform2fv(loc(blurProgram,'axis'),axis);gl.uniform1i(loc(blurProgram,'extract'),threshold);quad();
+}
+let previous=0,time=14.7,frameId=0;
+function render(now){
+  const raw=previous?now-previous:16.7,dt=Math.min(raw/1000,.095);previous=now;time+=dt;
+  if(!document.hidden&&raw<500){
+    frameAverage=mix(frameAverage,raw,.05);slowFrames=frameAverage>43?slowFrames+1:0;fastFrames=frameAverage<20?fastFrames+1:0;
+    if(now>qualityCooldown&&slowFrames>32&&quality>.56){quality=Math.max(.56,quality-.11);qualityCooldown=now+5000;slowFrames=fastFrames=0}
+    if(now>qualityCooldown&&fastFrames>220&&quality<1){quality=Math.min(1,quality+.09);qualityCooldown=now+10000;slowFrames=fastFrames=0}
+  }
+  resize();
+  const W=canvas.width,H=canvas.height,aspect=W/H;
+  const auto=!pointers.size&&now-lastInput>3800;
+  returnTime=auto?Math.min(1,returnTime+dt*.48):0;
+  // Continue gliding in the direction the visitor chose. Ease the horizon level gently.
+  if(auto){const speed=smooth(0,1,returnTime)*(reducedMotion?.18:1);driftTime+=dt*speed;
+    wantedYaw+=(.010*Math.cos(driftTime*.062)+.003*Math.sin(driftTime*.17))*dt*speed;
+    wantedPitch+=(defaultPitch+.018*Math.sin(driftTime*.079)-wantedPitch)*(1-Math.exp(-dt*.105*speed));}
+  const easing=1-Math.exp(-dt*13);
+  yaw=mix(yaw,wantedYaw,easing);pitch=mix(pitch,wantedPitch,easing);fov=mix(fov,wantedFov,1-Math.exp(-dt*10));
+  const camX=-1.4+3.1*Math.sin(driftTime*.044)+.36*Math.sin(driftTime*.097);
+  const camZ=104-6.6*Math.sin(driftTime*.042)+1.25*(Math.cos(driftTime*.071)-1);
+  const camera=[camX,terrain(camX,camZ)+4.45+.18*Math.sin(driftTime*.082),camZ];
+  const right=[Math.cos(yaw),0,Math.sin(yaw)],forward=[Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),-Math.cos(yaw)*Math.cos(pitch)];
+  const up=[-Math.sin(yaw)*Math.sin(pitch),Math.cos(pitch),Math.cos(yaw)*Math.sin(pitch)],tan=Math.tan(fov/2);
+  const near=.18,far=1800, vp=cameraMatrix(camera,right,up,forward,tan,aspect,near,far);
+  const frame={framebuffer:scene.fbo,camera,right,up,forward,vp,near,far,lens:[tan*aspect,tan],resolution:[W,H],depthTexture:scene.depthTexture,time,quality};
+  gl.bindFramebuffer(gl.FRAMEBUFFER,scene.fbo);gl.viewport(0,0,W,H);gl.disable(gl.BLEND);gl.disable(gl.CULL_FACE);gl.depthMask(true);gl.clearDepth(1);gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);gl.useProgram(skyProgram);gl.uniform3fv(loc(skyProgram,'rightDir'),right);gl.uniform3fv(loc(skyProgram,'upDir'),up);gl.uniform3fv(loc(skyProgram,'forward'),forward);gl.uniform2fv(loc(skyProgram,'lens'),frame.lens);gl.uniform1f(loc(skyProgram,'time'),time);quad();
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
+  for(const [p,mesh,indexed] of [[landProgram,land,true],[waterProgram,water,true],[detailProgram,details,false]]){
+    gl.useProgram(p);if(p===landProgram){tex(0,soil);gl.uniform1i(loc(p,'soil'),0)}gl.uniformMatrix4fv(loc(p,'vp'),false,vp);gl.uniform3fv(loc(p,'camera'),camera);gl.uniform1f(loc(p,'time'),time);drawMesh(p,mesh,indexed);
+  }
+  forest.draw(frame);cover.draw(frame);smoke.draw(frame);flames.draw(frame);
+  gl.useProgram(particleProgram);gl.uniformMatrix4fv(loc(particleProgram,'vp'),false,vp);gl.uniform3fv(loc(particleProgram,'camera'),camera);gl.uniform2f(loc(particleProgram,'resolution'),W,H);gl.uniform1f(loc(particleProgram,'time'),time);
+  gl.enable(gl.DEPTH_TEST);gl.depthMask(false);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.bindVertexArray(motes.vao);gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,motes.count);gl.depthMask(true);gl.disable(gl.BLEND);gl.disable(gl.DEPTH_TEST);
+  blur(scene,bloomX,[3.3/W,0],1);blur(bloomX,bloomY,[0,2.6/bloomY.h],0);
+  blur(bloomY,hazeX,[1.85/hazeX.w,0],0);blur(hazeX,hazeY,[0,1.65/hazeY.h],0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);gl.useProgram(finishProgram);tex(0,scene.texture);tex(1,bloomY.texture);
+  tex(2,hazeY.texture);tex(3,scene.depthTexture);tex(4,profile);
+  gl.uniform1i(loc(finishProgram,'scene'),0);gl.uniform1i(loc(finishProgram,'bloom'),1);gl.uniform1i(loc(finishProgram,'scatter'),2);gl.uniform1i(loc(finishProgram,'depthMap'),3);gl.uniform1i(loc(finishProgram,'profile'),4);
+  gl.uniform2fv(loc(finishProgram,'lens'),frame.lens);gl.uniform3fv(loc(finishProgram,'rightDir'),right);gl.uniform3fv(loc(finishProgram,'upDir'),up);gl.uniform3fv(loc(finishProgram,'forward'),forward);gl.uniform3fv(loc(finishProgram,'camera'),camera);gl.uniform1f(loc(finishProgram,'time'),time);quad();
+  frameId=requestAnimationFrame(render);
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelAnimationFrame(frameId);previous=0}else if(!gl.isContextLost()){previous=0;cancelAnimationFrame(frameId);frameId=requestAnimationFrame(render)}});
+canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();cancelAnimationFrame(frameId);notice.hidden=false;notice.textContent='Restoring the valley view…'});
+canvas.addEventListener('webglcontextrestored',()=>location.reload());
+frameId=requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
