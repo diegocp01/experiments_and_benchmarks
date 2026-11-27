@@ -1,0 +1,3722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Storm at Sea — Night Watch</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #03070d;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas.dragging {
+    cursor: grabbing;
+  }
+  #hud {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hint {
+    position: fixed;
+    bottom: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(215, 230, 245, 0.72);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: rgba(5, 10, 18, 0.42);
+    border: 1px solid rgba(180, 210, 240, 0.14);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: opacity 1.4s ease;
+    white-space: nowrap;
+  }
+  #hint.hidden {
+    opacity: 0;
+  }
+  #audio-btn {
+    position: fixed;
+    bottom: 20px;
+    right: 22px;
+    pointer-events: auto;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    border: 1px solid rgba(180, 210, 240, 0.2);
+    background: rgba(5, 10, 18, 0.46);
+    color: rgba(215, 232, 248, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: background 0.25s ease, border-color 0.25s ease, color 0.25s ease, opacity 0.4s ease;
+    opacity: 0.72;
+  }
+  #audio-btn:hover {
+    background: rgba(18, 32, 52, 0.72);
+    border-color: rgba(200, 226, 250, 0.45);
+    color: #fff;
+    opacity: 1;
+  }
+  #audio-btn svg {
+    width: 17px;
+    height: 17px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  #fallback {
+    display: none;
+    position: fixed;
+    inset: 0;
+    align-items: center;
+    justify-content: center;
+    color: #c8d8e8;
+    background: #060b14;
+    padding: 24px;
+    text-align: center;
+    font-size: 16px;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">
+  <div id="hint">Drag to look 360° &nbsp;·&nbsp; Scroll or pinch to zoom</div>
+  <button id="audio-btn" title="Toggle storm audio" aria-label="Toggle storm audio">
+    <svg id="icon-muted" viewBox="0 0 24 24">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+      <line x1="23" y1="9" x2="17" y2="15"></line>
+      <line x1="17" y1="9" x2="23" y2="15"></line>
+    </svg>
+    <svg id="icon-sound" viewBox="0 0 24 24" style="display:none">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+    </svg>
+  </button>
+</div>
+<div id="fallback">WebGL 2 is required to render this storm scene.</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl2', {
+    antialias: false,
+    alpha: false,
+    depth: true,
+    stencil: false,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: false
+  });
+
+  if (!gl) {
+    document.getElementById('fallback').style.display = 'flex';
+    return;
+  }
+
+  // =========================================================================
+  // 1. MATH UTILITIES
+  // =========================================================================
+  const TAU = Math.PI * 2;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smoothstep = (e0, e1, x) => {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+
+  function m4Identity(out = new Float32Array(16)) {
+    out.fill(0);
+    out[0] = out[5] = out[10] = out[15] = 1;
+    return out;
+  }
+
+  function m4Mul(a, b, out = new Float32Array(16)) {
+    const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
+    const a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+    const a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+    const a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+    for (let i = 0; i < 4; i++) {
+      const b0 = b[i * 4], b1 = b[i * 4 + 1], b2 = b[i * 4 + 2], b3 = b[i * 4 + 3];
+      out[i * 4]     = a00 * b0 + a10 * b1 + a20 * b2 + a30 * b3;
+      out[i * 4 + 1] = a01 * b0 + a11 * b1 + a21 * b2 + a31 * b3;
+      out[i * 4 + 2] = a02 * b0 + a12 * b1 + a22 * b2 + a32 * b3;
+      out[i * 4 + 3] = a03 * b0 + a13 * b1 + a23 * b2 + a33 * b3;
+    }
+    return out;
+  }
+
+  function m4Perspective(fovY, aspect, near, far, out = new Float32Array(16)) {
+    const f = 1.0 / Math.tan(fovY * 0.5);
+    const nf = 1 / (near - far);
+    out.fill(0);
+    out[0] = f / aspect;
+    out[5] = f;
+    out[10] = (far + near) * nf;
+    out[11] = -1;
+    out[14] = 2 * far * near * nf;
+    return out;
+  }
+
+  function m4Translate(x, y, z, out = new Float32Array(16)) {
+    m4Identity(out);
+    out[12] = x; out[13] = y; out[14] = z;
+    return out;
+  }
+
+  function m4Scale(x, y, z, out = new Float32Array(16)) {
+    m4Identity(out);
+    out[0] = x; out[5] = y; out[10] = z;
+    return out;
+  }
+
+  function m4RotX(a, out = new Float32Array(16)) {
+    m4Identity(out);
+    const c = Math.cos(a), s = Math.sin(a);
+    out[5] = c; out[6] = s; out[9] = -s; out[10] = c;
+    return out;
+  }
+
+  function m4RotY(a, out = new Float32Array(16)) {
+    m4Identity(out);
+    const c = Math.cos(a), s = Math.sin(a);
+    out[0] = c; out[2] = -s; out[8] = s; out[10] = c;
+    return out;
+  }
+
+  function m4RotZ(a, out = new Float32Array(16)) {
+    m4Identity(out);
+    const c = Math.cos(a), s = Math.sin(a);
+    out[0] = c; out[1] = s; out[4] = -s; out[5] = c;
+    return out;
+  }
+
+  function m4Invert(m, out = new Float32Array(16)) {
+    const m00 = m[0], m01 = m[1], m02 = m[2], m03 = m[3];
+    const m10 = m[4], m11 = m[5], m12 = m[6], m13 = m[7];
+    const m20 = m[8], m21 = m[9], m22 = m[10], m23 = m[11];
+    const m30 = m[12], m31 = m[13], m32 = m[14], m33 = m[15];
+
+    const b00 = m00 * m11 - m01 * m10;
+    const b01 = m00 * m12 - m02 * m10;
+    const b02 = m00 * m13 - m03 * m10;
+    const b03 = m01 * m12 - m02 * m11;
+    const b04 = m01 * m13 - m03 * m11;
+    const b05 = m02 * m13 - m03 * m12;
+    const b06 = m20 * m31 - m21 * m30;
+    const b07 = m20 * m32 - m22 * m30;
+    const b08 = m20 * m33 - m23 * m30;
+    const b09 = m21 * m32 - m22 * m31;
+    const b10 = m21 * m33 - m23 * m31;
+    const b11 = m22 * m33 - m23 * m32;
+
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    if (Math.abs(det) < 1e-12) return m4Identity(out);
+    det = 1.0 / det;
+
+    out[0]  = (m11 * b11 - m12 * b10 + m13 * b09) * det;
+    out[1]  = (m02 * b10 - m01 * b11 - m03 * b09) * det;
+    out[2]  = (m31 * b05 - m32 * b04 + m33 * b03) * det;
+    out[3]  = (m22 * b04 - m21 * b05 - m23 * b03) * det;
+    out[4]  = (m12 * b08 - m10 * b11 - m13 * b07) * det;
+    out[5]  = (m00 * b11 - m02 * b08 + m03 * b07) * det;
+    out[6]  = (m32 * b02 - m30 * b05 - m33 * b01) * det;
+    out[7]  = (m20 * b05 - m22 * b02 + m23 * b01) * det;
+    out[8]  = (m10 * b10 - m11 * b08 + m13 * b06) * det;
+    out[9]  = (m01 * b08 - m00 * b10 - m03 * b06) * det;
+    out[10] = (m30 * b04 - m31 * b02 + m33 * b00) * det;
+    out[11] = (m21 * b02 - m20 * b04 - m23 * b00) * det;
+    out[12] = (m11 * b07 - m10 * b09 - m12 * b06) * det;
+    out[13] = (m00 * b09 - m01 * b07 + m02 * b06) * det;
+    out[14] = (m31 * b01 - m30 * b03 - m32 * b00) * det;
+    out[15] = (m20 * b03 - m21 * b01 + m22 * b00) * det;
+    return out;
+  }
+
+  function m4TransformPoint(m, x, y, z, out = [0, 0, 0]) {
+    out[0] = m[0] * x + m[4] * y + m[8] * z + m[12];
+    out[1] = m[1] * x + m[5] * y + m[9] * z + m[13];
+    out[2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+    return out;
+  }
+
+  function m4TransformDir(m, x, y, z, out = [0, 0, 0]) {
+    out[0] = m[0] * x + m[4] * y + m[8] * z;
+    out[1] = m[1] * x + m[5] * y + m[9] * z;
+    out[2] = m[2] * x + m[6] * y + m[10] * z;
+    return out;
+  }
+
+  // =========================================================================
+  // 2. STORM OCEAN WAVE SPECTRUM (SHARED CPU & GPU GERSTNER MODEL)
+  // =========================================================================
+  const GRAVITY = 9.81;
+  const SHIP_SPEED = 4.4;
+  const WIND_DIR = (() => {
+    // Gale blows from port-bow toward starboard-aft
+    const x = 0.74, z = 0.67;
+    const l = Math.hypot(x, z);
+    return [x / l, z / l];
+  })();
+
+  // 16 multi-directional Beaufort Force 11 storm waves (massive rogue swells + steep crossing chop!)
+  const RAW_WAVES = [
+    [ 20, 152.0, 2.85, 1.00],
+    [ 38, 110.0, 2.05, 0.96],
+    [ 58,  84.0, 1.48, 0.92],
+    [-16,  74.0, 1.18, 0.86],
+    [  8,  55.0, 0.92, 0.88],
+    [ 46,  44.0, 0.78, 0.86],
+    [-28,  36.0, 0.60, 0.82],
+    [ 68,  29.0, 0.50, 0.80],
+    [ 26,  23.5, 0.42, 0.85],
+    [ -8,  18.8, 0.33, 0.82],
+    [ 50,  15.2, 0.27, 0.80],
+    [ 16,  12.1, 0.21, 0.78],
+    [-34,   9.6, 0.16, 0.72],
+    [ 36,   7.5, 0.12, 0.70],
+    [ 62,   5.8, 0.09, 0.66],
+    [ 12,   4.4, 0.065, 0.62],
+  ];
+
+  const NUM_WAVES = RAW_WAVES.length;
+  const WAVES = [];
+  let sumKA = 0;
+  for (let i = 0; i < NUM_WAVES; i++) {
+    const [deg, wl, amp, sw] = RAW_WAVES[i];
+    const rad = deg * Math.PI / 180;
+    const dx = Math.sin(rad);
+    const dz = Math.cos(rad);
+    const k = TAU / wl;
+    const omega = Math.sqrt(GRAVITY * k);
+    sumKA += k * amp * sw;
+    WAVES.push({
+      dx, dz, k, amp, omega, sw,
+      q: 0,
+      phase0: (i * 2.3999632 + 0.7) % TAU,
+      phase: 0
+    });
+  }
+  // Sharp towering crests with zero self-intersection loops
+  const STEEP_BUDGET = 0.82;
+  for (let i = 0; i < NUM_WAVES; i++) {
+    WAVES[i].q = (WAVES[i].sw * STEEP_BUDGET) / sumKA;
+  }
+
+  const uWaveA = new Float32Array(NUM_WAVES * 4);
+  const uWaveB = new Float32Array(NUM_WAVES * 4);
+  let shipTravelZ = 0;
+
+  function updateWavePhases(simTime) {
+    shipTravelZ = simTime * SHIP_SPEED;
+    for (let i = 0; i < NUM_WAVES; i++) {
+      const w = WAVES[i];
+      const rawPhase = w.phase0 - w.omega * simTime - w.dz * w.k * shipTravelZ;
+      w.phase = ((rawPhase % TAU) + TAU) % TAU;
+
+      uWaveA[i * 4 + 0] = w.dx;
+      uWaveA[i * 4 + 1] = w.dz;
+      uWaveA[i * 4 + 2] = w.k;
+      uWaveA[i * 4 + 3] = w.amp;
+
+      uWaveB[i * 4 + 0] = w.q * w.amp;
+      uWaveB[i * 4 + 1] = w.phase;
+      uWaveB[i * 4 + 2] = w.omega;
+      uWaveB[i * 4 + 3] = w.q * w.k * w.amp;
+    }
+  }
+
+  function sampleOceanAt(wx, wz, out = { y: 0, vy: 0, foam: 0, nx: 0, ny: 1, nz: 0 }) {
+    let px = wx, pz = wz;
+    for (let iter = 0; iter < 2; iter++) {
+      let dispX = 0, dispZ = 0;
+      for (let i = 0; i < 10; i++) {
+        const w = WAVES[i];
+        const th = w.k * (w.dx * px + w.dz * pz) + w.phase;
+        const c = Math.cos(th);
+        const qa = w.q * w.amp;
+        dispX += qa * w.dx * c;
+        dispZ += qa * w.dz * c;
+      }
+      px = wx - dispX;
+      pz = wz - dispZ;
+    }
+
+    let y = 0, vy = 0, dHx = 0, dHz = 0, fold = 0;
+    for (let i = 0; i < NUM_WAVES; i++) {
+      const w = WAVES[i];
+      const th = w.k * (w.dx * px + w.dz * pz) + w.phase;
+      const s = Math.sin(th);
+      const c = Math.cos(th);
+      y += w.amp * s;
+      const dThDt = -(w.omega + w.dz * w.k * SHIP_SPEED);
+      vy += w.amp * c * dThDt;
+      dHx += w.k * w.amp * w.dx * c;
+      dHz += w.k * w.amp * w.dz * c;
+      fold += w.q * w.k * w.amp * s;
+    }
+    const invLen = 1 / Math.hypot(-dHx, 1, -dHz);
+    out.y = y;
+    out.vy = vy;
+    out.foam = clamp(fold, 0, 1);
+    out.nx = -dHx * invLen;
+    out.ny = invLen;
+    out.nz = -dHz * invLen;
+    return out;
+  }
+
+  // =========================================================================
+  // 3. SHIP HULL PROFILE & HYDROSTATIC DYNAMICS
+  // =========================================================================
+  const DECK_Y = 4.70;
+  const SHIP_BOW_Z = -31.0;
+  const SHIP_STERN_Z = 29.0;
+
+  function hullHalfBeam(z, y) {
+    if (z < SHIP_BOW_Z || z > SHIP_STERN_Z) return 0;
+    let t;
+    if (z < -6.0) {
+      t = clamp((z - SHIP_BOW_Z) / (-6.0 - SHIP_BOW_Z), 0, 1);
+      t = Math.pow(t, 0.58);
+    } else if (z < 17.0) {
+      t = 1.0;
+    } else {
+      const u = clamp((z - 17.0) / (SHIP_STERN_Z - 17.0), 0, 1);
+      t = 1.0 - 0.24 * u * u;
+    }
+    const maxB = 5.65 * t;
+    const yNorm = clamp((y + 3.6) / (DECK_Y + 3.6), 0, 1.35);
+    let profile = Math.pow(clamp(yNorm, 0.001, 1.0), 0.36);
+    if (y > DECK_Y) {
+      const bowFactor = smoothstep(-10.0, -30.5, z);
+      profile += (y - DECK_Y) * (0.04 + 0.14 * bowFactor);
+    }
+    return maxB * profile;
+  }
+
+  function bulwarkHeightAtZ(z) {
+    const bowSheer = smoothstep(-9.0, -31.0, z);
+    const prowLift = smoothstep(-21.0, -31.0, z);
+    return 0.84 + 0.40 * bowSheer + 0.34 * prowLift * prowLift;
+  }
+
+  const shipState = {
+    heave: 0.4, heaveVel: 0,
+    pitch: 0.02, pitchVel: 0,
+    roll: 0.0, rollVel: 0,
+    yawSway: 0.0,
+    slamShake: 0.0,
+    slamPhase: 0.0,
+    bowSubmerge: 0.0,
+    matrix: m4Identity(),
+    invMatrix: m4Identity(),
+    prevBowWorldY: DECK_Y
+  };
+
+  const BUOY_POINTS = [
+    [ 0.0, -28.0, 0.9],
+    [-2.4, -22.0, 1.1], [ 2.4, -22.0, 1.1],
+    [-4.6, -12.0, 1.4], [ 4.6, -12.0, 1.4],
+    [-5.2,   0.0, 1.6], [ 5.2,   0.0, 1.6],
+    [-5.0,  12.0, 1.4], [ 5.0,  12.0, 1.4],
+    [-4.0,  24.0, 1.1], [ 4.0,  24.0, 1.1],
+  ];
+
+  const _tmpWave = { y: 0, vy: 0, foam: 0, nx: 0, ny: 1, nz: 0 };
+  const _mT1 = new Float32Array(16), _mT2 = new Float32Array(16), _mR1 = new Float32Array(16);
+  const _mR2 = new Float32Array(16), _mR3 = new Float32Array(16), _mTmp = new Float32Array(16);
+
+  function updateShipMatrix() {
+    const cy = 1.2, cz = -1.0;
+    m4Translate(0, shipState.heave + cy, cz, _mT1);
+    m4RotY(shipState.yawSway, _mR1);
+    m4RotX(shipState.pitch, _mR2);
+    m4RotZ(shipState.roll, _mR3);
+    m4Translate(0, -cy, -cz, _mT2);
+
+    m4Mul(_mT1, _mR1, _mTmp);
+    m4Mul(_mTmp, _mR2, shipState.matrix);
+    m4Mul(shipState.matrix, _mR3, _mTmp);
+    m4Mul(_mTmp, _mT2, shipState.matrix);
+    m4Invert(shipState.matrix, shipState.invMatrix);
+  }
+
+  let bowImpactCooldown = 0;
+  let onBowSlamCallback = null;
+
+  function stepShipPhysics(dt, simTime) {
+    let sumW = 0, sumY = 0;
+    let sumZ2 = 0, sumZY = 0;
+    let sumX2 = 0, sumXY = 0;
+
+    for (let i = 0; i < BUOY_POINTS.length; i++) {
+      const [lx, lz, w] = BUOY_POINTS[i];
+      sampleOceanAt(lx, lz, _tmpWave);
+      sumW += w;
+      sumY += w * _tmpWave.y;
+      sumZ2 += w * lz * lz;
+      sumZY += w * lz * _tmpWave.y;
+      sumX2 += w * lx * lx;
+      sumXY += w * lx * _tmpWave.y;
+    }
+
+    const meanY = sumY / sumW;
+    const slopeZ = -sumZY / sumZ2;
+    const slopeX = sumXY / sumX2;
+
+    const targetHeave = meanY * 0.94 + 0.14;
+    const targetPitch = Math.atan(slopeZ * 1.22);
+    const targetRoll = Math.atan(slopeX * 1.42) + Math.sin(simTime * 0.72) * 0.036;
+
+    const kHeave = 2.6, dHeave = 1.62;
+    shipState.heaveVel += ((targetHeave - shipState.heave) * kHeave - shipState.heaveVel * dHeave) * dt;
+    shipState.heave += shipState.heaveVel * dt;
+
+    const kPitch = 2.45, dPitch = 1.38;
+    shipState.pitchVel += ((targetPitch - shipState.pitch) * kPitch - shipState.pitchVel * dPitch) * dt;
+    shipState.pitch = clamp(shipState.pitch + shipState.pitchVel * dt, -0.34, 0.36);
+
+    const kRoll = 1.38, dRoll = 0.70;
+    shipState.rollVel += ((targetRoll - shipState.roll) * kRoll - shipState.rollVel * dRoll) * dt;
+    shipState.roll = clamp(shipState.roll + shipState.rollVel * dt, -0.38, 0.38);
+
+    shipState.yawSway = lerp(shipState.yawSway, shipState.roll * 0.14 + Math.sin(simTime * 0.37) * 0.015, dt * 1.2);
+    shipState.slamShake *= Math.exp(-dt * 4.8);
+    shipState.slamPhase += dt * 38.0;
+
+    updateShipMatrix();
+
+    // Bow wave impact check -> explosive spray bursts + hull shudder!
+    const bowWorld = m4TransformPoint(shipState.matrix, 0, DECK_Y + 0.35, -29.8);
+    const bowVelY = (bowWorld[1] - shipState.prevBowWorldY) / Math.max(dt, 0.001);
+    shipState.prevBowWorldY = bowWorld[1];
+
+    sampleOceanAt(bowWorld[0], bowWorld[2], _tmpWave);
+    const waterRelToDeck = _tmpWave.y - (bowWorld[1] - 1.6);
+    const closingVel = Math.max(0, _tmpWave.vy - bowVelY);
+    shipState.bowSubmerge = clamp(waterRelToDeck * 0.5, 0, 1.6);
+
+    bowImpactCooldown = Math.max(0, bowImpactCooldown - dt);
+    const impactEnergy = waterRelToDeck * 0.72 + closingVel * 0.34;
+    if (waterRelToDeck > -1.0 && impactEnergy > 1.25 && bowImpactCooldown <= 0) {
+      const strength = clamp((impactEnergy - 0.9) / 2.8, 0.45, 1.4);
+      shipState.slamShake = Math.min(1.0, shipState.slamShake + strength * 0.48);
+      bowImpactCooldown = lerp(1.5, 0.75, clamp(strength, 0, 1));
+      if (onBowSlamCallback) onBowSlamCallback(strength, bowWorld, _tmpWave.y);
+    }
+  }
+
+  // =========================================================================
+  // 4. WEBGL SHADER HELPERS
+  // =========================================================================
+  function compileShader(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      console.error('Shader compile error:', log);
+      throw new Error('Shader compile failed: ' + log);
+    }
+    return sh;
+  }
+
+  function createProgram(vsSrc, fsSrc) {
+    const p = gl.createProgram();
+    const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(p);
+      console.error('Program link error:', log);
+      throw new Error('Program link failed: ' + log);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    const uniforms = {};
+    const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+      const info = gl.getActiveUniform(p, i);
+      const name = info.name.replace(/\[0\]$/, '');
+      uniforms[name] = gl.getUniformLocation(p, name);
+    }
+    return { program: p, u: uniforms };
+  }
+
+  // =========================================================================
+  // 5. PROCEDURAL SEAMLESS NOISE TEXTURE BAKER (ZERO EXTERNAL ASSETS!)
+  // =========================================================================
+  function createSeamlessNoiseTextures() {
+    const size = 512;
+    const quadVao = gl.createVertexArray();
+    const bakeVS = `#version 300 es
+      out vec2 vUv;
+      void main() {
+        vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+        vUv = p;
+        gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+      }
+    `;
+
+    const commonNoiseGLSL = `
+      vec2 hash22(vec2 p, vec2 period) {
+        p = mod(p, period);
+        vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.xx + p3.yz) * p3.zy);
+      }
+      float hash21(vec2 p, vec2 period) {
+        p = mod(p, period);
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+      }
+      float vnoise(vec2 uv, float period) {
+        vec2 p = uv * period;
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+        vec2 per = vec2(period);
+        float a = hash21(i + vec2(0, 0), per);
+        float b = hash21(i + vec2(1, 0), per);
+        float c = hash21(i + vec2(0, 1), per);
+        float d = hash21(i + vec2(1, 1), per);
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+      }
+      float fbm(vec2 uv, float basePeriod) {
+        float v = 0.0, a = 0.5, per = basePeriod;
+        for (int i = 0; i < 6; i++) {
+          v += a * vnoise(uv, per);
+          per *= 2.0;
+          a *= 0.5;
+        }
+        return v;
+      }
+      vec2 worley(vec2 uv, float period) {
+        vec2 p = uv * period;
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 per = vec2(period);
+        float d1 = 8.0, d2 = 8.0;
+        for (int y = -1; y <= 1; y++) {
+          for (int x = -1; x <= 1; x++) {
+            vec2 nb = vec2(float(x), float(y));
+            vec2 pt = hash22(i + nb, per);
+            vec2 diff = nb + pt - f;
+            float d = dot(diff, diff);
+            if (d < d1) { d2 = d1; d1 = d; }
+            else if (d < d2) { d2 = d; }
+          }
+        }
+        return vec2(sqrt(d1), sqrt(d2) - sqrt(d1));
+      }
+    `;
+
+    // Texture 1: Clouds + Wispy Mist + Sea Foam (RGBA8)
+    // R: Smooth low-freq Perlin fBm (wispy spray, cloud base)
+    // G: Multi-scale billowy cumulus Perlin-Worley (cloud thunderheads & turbulent mist)
+    // B: High-freq turbulent detail fBm (spray filaments, weathering, rain streaks)
+    // A: Lacy sea-foam bubble web (ONLY for ocean water foam, NEVER for airborne spray!)
+    const bakeNoiseFS = `#version 300 es
+      precision highp float;
+      in vec2 vUv;
+      out vec4 fragColor;
+      ${commonNoiseGLSL}
+      void main() {
+        float perlin = fbm(vUv, 5.0);
+        // Domain-warped organic cloud/mist fBm
+        vec2 wOff = vec2(fbm(vUv + vec2(0.13, 0.47), 4.0), fbm(vUv + vec2(0.71, 0.23), 4.0));
+        float billowP = fbm(vUv + (wOff - 0.5) * 0.14, 6.0);
+        vec2 w1 = worley(vUv, 5.0);
+        vec2 w2 = worley(vUv, 12.0);
+        float cumulus = mix(billowP, 1.0 - clamp(w1.x * 1.1, 0.0, 1.0), 0.35);
+        float detail = fbm(vUv + vec2(0.37, 0.71) + (wOff - 0.5) * 0.08, 14.0);
+
+        // Delicate ocean surface foam webbing (softened natural foam filaments)
+        vec2 w3 = worley(vUv + (wOff - 0.5) * 0.04, 24.0);
+        float web1 = smoothstep(0.22, 0.02, w2.y) * 0.55;
+        float web2 = smoothstep(0.26, 0.03, w3.y) * 0.45;
+        float foamLace = clamp(web1 + web2 + detail * 0.55 - 0.12, 0.0, 1.0);
+
+        fragColor = vec4(perlin, cumulus, detail, foamLace);
+      }
+    `;
+
+    // Texture 2: Multi-Scale Ocean Capillary Wave Normal + Deck Puddle Height
+    const bakeWaveFS = `#version 300 es
+      precision highp float;
+      in vec2 vUv;
+      out vec4 fragColor;
+      ${commonNoiseGLSL}
+      float waveHeight(vec2 uv) {
+        float h = 0.0;
+        h += vnoise(uv * vec2(1.0, 1.5), 12.0) * 0.42;
+        h += vnoise(uv * vec2(1.5, 1.0) + vec2(0.21, 0.63), 24.0) * 0.28;
+        h += vnoise(uv + vec2(0.53, 0.19), 48.0) * 0.18;
+        h += vnoise(uv + vec2(0.11, 0.87), 96.0) * 0.12;
+        vec2 w = worley(uv, 18.0);
+        h = mix(h, 1.0 - w.x, 0.16);
+        return h;
+      }
+      void main() {
+        float e = 1.0 / 512.0;
+        float h0 = waveHeight(vUv);
+        float hx = waveHeight(vUv + vec2(e, 0.0));
+        float hy = waveHeight(vUv + vec2(0.0, e));
+        vec2 grad = vec2(hx - h0, hy - h0) * 40.0;
+        float puddleWarp = fbm(vUv + vec2(0.42, 0.17), 4.0);
+        fragColor = vec4(clamp(grad * 0.5 + 0.5, 0.0, 1.0), h0, puddleWarp);
+      }
+    `;
+
+    function bakeToTex(fsSrc) {
+      const prog = createProgram(bakeVS, fsSrc);
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      gl.viewport(0, 0, size, size);
+      gl.useProgram(prog.program);
+      gl.bindVertexArray(quadVao);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(fbo);
+      gl.deleteProgram(prog.program);
+
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      return tex;
+    }
+
+    const noiseTex = bakeToTex(bakeNoiseFS);
+    const waveNormalTex = bakeToTex(bakeWaveFS);
+    gl.deleteVertexArray(quadVao);
+    return { noiseTex, waveNormalTex };
+  }
+
+  // =========================================================================
+  // 6. HIGH-DETAIL PROCEDURAL SHIP GEOMETRY BUILDER
+  // =========================================================================
+  class MeshBuilder {
+    constructor() {
+      this.verts = [];
+      this.indices = [];
+    }
+    addVert(x, y, z, nx, ny, nz, u, v, matId, rough, metal, ao = 1.0) {
+      const idx = this.verts.length / 12;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      this.verts.push(x, y, z, nx / nl, ny / nl, nz / nl, u, v, matId, rough, metal, ao);
+      return idx;
+    }
+    addQuad(p0, p1, p2, p3, u0, v0, u1, v1, matId, rough, metal, ao = 1.0, flip = false) {
+      const e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+      const e2x = p3[0] - p0[0], e2y = p3[1] - p0[1], e2z = p3[2] - p0[2];
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      if (flip) { nx = -nx; ny = -ny; nz = -nz; }
+      const i0 = this.addVert(p0[0], p0[1], p0[2], nx, ny, nz, u0, v0, matId, rough, metal, ao);
+      const i1 = this.addVert(p1[0], p1[1], p1[2], nx, ny, nz, u1, v0, matId, rough, metal, ao);
+      const i2 = this.addVert(p2[0], p2[1], p2[2], nx, ny, nz, u1, v1, matId, rough, metal, ao);
+      const i3 = this.addVert(p3[0], p3[1], p3[2], nx, ny, nz, u0, v1, matId, rough, metal, ao);
+      if (!flip) this.indices.push(i0, i1, i2, i0, i2, i3);
+      else this.indices.push(i0, i2, i1, i0, i3, i2);
+    }
+    addTri(p0, p1, p2, matId, rough, metal, ao = 1.0, flip = false) {
+      const e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+      const e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      if (flip) { nx = -nx; ny = -ny; nz = -nz; }
+      const i0 = this.addVert(p0[0], p0[1], p0[2], nx, ny, nz, 0, 0, matId, rough, metal, ao);
+      const i1 = this.addVert(p1[0], p1[1], p1[2], nx, ny, nz, 1, 0, matId, rough, metal, ao);
+      const i2 = this.addVert(p2[0], p2[1], p2[2], nx, ny, nz, 0, 1, matId, rough, metal, ao);
+      if (!flip) this.indices.push(i0, i1, i2);
+      else this.indices.push(i0, i2, i1);
+    }
+    addBox(cx, cy, cz, sx, sy, sz, matId, rough, metal, ao = 1.0, rakedFront = 0) {
+      const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+      const x0 = cx - hx, x1 = cx + hx;
+      const y0 = cy - hy, y1 = cy + hy;
+      const z0b = cz - hz, z0t = cz - hz - rakedFront;
+      const z1 = cz + hz;
+      this.addQuad([x0, y0, z0b], [x0, y1, z0t], [x1, y1, z0t], [x1, y0, z0b], 0, 0, sx, sy, matId, rough, metal, ao);
+      this.addQuad([x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1], 0, 0, sx, sy, matId, rough, metal, ao);
+      this.addQuad([x0, y0, z1], [x0, y1, z1], [x0, y1, z0t], [x0, y0, z0b], 0, 0, sz, sy, matId, rough, metal, ao);
+      this.addQuad([x1, y0, z0b], [x1, y1, z0t], [x1, y1, z1], [x1, y0, z1], 0, 0, sz, sy, matId, rough, metal, ao);
+      this.addQuad([x0, y1, z0t], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0t], 0, 0, sx, sz, matId, rough, metal, ao);
+      this.addQuad([x0, y0, z1], [x0, y0, z0b], [x1, y0, z0b], [x1, y0, z1], 0, 0, sx, sz, matId, rough, metal, ao * 0.65);
+    }
+    // Authentic sturdy beveled steel bulwark stiffener bracket (replaces thin spiky needles!)
+    addGusset(side, wallX, deckY, z, depth, height, thick, matId, rough, metal, ao) {
+      const xWall = side * wallX;
+      const xTop = side * (wallX - depth * 0.34);
+      const xBot = side * (wallX - depth);
+      const z0 = z - thick * 0.5, z1 = z + thick * 0.5;
+      const y0 = deckY, y1 = deckY + height;
+      const flip = side < 0;
+      // Trapezoidal web plates (front & back)
+      this.addQuad([xWall, y0, z0], [xBot, y0, z0], [xTop, y1, z0], [xWall, y1, z0], 0, 0, 1, 1, matId, rough, metal, ao, !flip);
+      this.addQuad([xWall, y0, z1], [xBot, y0, z1], [xTop, y1, z1], [xWall, y1, z1], 0, 0, 1, 1, matId, rough, metal, ao, flip);
+      // Sturdy outer flange face & top cap
+      this.addQuad([xBot, y0, z0], [xBot, y0, z1], [xTop, y1, z1], [xTop, y1, z0], 0, 0, 1, 1, matId, rough, metal, ao * 1.08, flip);
+      this.addQuad([xTop, y1, z0], [xTop, y1, z1], [xWall, y1, z1], [xWall, y1, z0], 0, 0, 1, 1, matId, rough, metal, ao * 1.05, flip);
+    }
+    addCylinder(p0, p1, r0, r1, segs, matId, rough, metal, ao = 1.0, cap = true) {
+      const dx = p1[0] - p0[0], dy = p1[1] - p0[1], dz = p1[2] - p0[2];
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-5) return;
+      const ax = dx / len, ay = dy / len, az = dz / len;
+      let ux = Math.abs(ay) < 0.9 ? 0 : 1, uy = Math.abs(ay) < 0.9 ? 1 : 0, uz = 0;
+      let bx = ay * uz - az * uy, by = az * ux - ax * uz, bz = ax * uy - ay * ux;
+      const bl = Math.hypot(bx, by, bz) || 1;
+      bx /= bl; by /= bl; bz /= bl;
+      const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+
+      const ring0 = [], ring1 = [];
+      for (let i = 0; i <= segs; i++) {
+        const a = (i / segs) * TAU;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const nx = bx * ca + cx * sa, ny = by * ca + cy * sa, nz = bz * ca + cz * sa;
+        ring0.push(this.addVert(p0[0] + nx * r0, p0[1] + ny * r0, p0[2] + nz * r0, nx, ny, nz, i / segs, 0, matId, rough, metal, ao));
+        ring1.push(this.addVert(p1[0] + nx * r1, p1[1] + ny * r1, p1[2] + nz * r1, nx, ny, nz, i / segs, len, matId, rough, metal, ao));
+      }
+      for (let i = 0; i < segs; i++) {
+        this.indices.push(ring0[i], ring0[i + 1], ring1[i + 1], ring0[i], ring1[i + 1], ring1[i]);
+      }
+      if (cap) {
+        const c0 = this.addVert(p0[0], p0[1], p0[2], -ax, -ay, -az, 0.5, 0.5, matId, rough, metal, ao * 0.85);
+        const c1 = this.addVert(p1[0], p1[1], p1[2], ax, ay, az, 0.5, 0.5, matId, rough, metal, ao);
+        for (let i = 0; i < segs; i++) {
+          const a0 = (i / segs) * TAU, a1 = ((i + 1) / segs) * TAU;
+          const n0x = bx * Math.cos(a0) + cx * Math.sin(a0), n0y = by * Math.cos(a0) + cy * Math.sin(a0), n0z = bz * Math.cos(a0) + cz * Math.sin(a0);
+          const n1x = bx * Math.cos(a1) + cx * Math.sin(a1), n1y = by * Math.cos(a1) + cy * Math.sin(a1), n1z = bz * Math.cos(a1) + cz * Math.sin(a1);
+          if (r0 > 1e-4) {
+            const v0 = this.addVert(p0[0] + n0x * r0, p0[1] + n0y * r0, p0[2] + n0z * r0, -ax, -ay, -az, 0, 0, matId, rough, metal, ao * 0.85);
+            const v1 = this.addVert(p0[0] + n1x * r0, p0[1] + n1y * r0, p0[2] + n1z * r0, -ax, -ay, -az, 1, 0, matId, rough, metal, ao * 0.85);
+            this.indices.push(c0, v1, v0);
+          }
+          if (r1 > 1e-4) {
+            const v0 = this.addVert(p1[0] + n0x * r1, p1[1] + n0y * r1, p1[2] + n0z * r1, ax, ay, az, 0, 0, matId, rough, metal, ao);
+            const v1 = this.addVert(p1[0] + n1x * r1, p1[1] + n1y * r1, p1[2] + n1z * r1, ax, ay, az, 1, 0, matId, rough, metal, ao);
+            this.indices.push(c1, v0, v1);
+          }
+        }
+      }
+    }
+    addTorus(cx, cy, cz, majorR, minorR, segsMajor, segsMinor, rotAxis, matId, rough, metal, ao = 1.0) {
+      const grid = [];
+      for (let i = 0; i <= segsMajor; i++) {
+        const u = (i / segsMajor) * TAU;
+        const cu = Math.cos(u), su = Math.sin(u);
+        const ring = [];
+        for (let j = 0; j <= segsMinor; j++) {
+          const v = (j / segsMinor) * TAU;
+          const cv = Math.cos(v), sv = Math.sin(v);
+          const rr = majorR + minorR * cv;
+          let lx = rr * cu, ly = minorR * sv, lz = rr * su;
+          let nx = cv * cu, ny = sv, nz = cv * su;
+          if (rotAxis === 'x') {
+            [lx, ly, lz] = [ly, lx, lz];
+            [nx, ny, nz] = [ny, nx, nz];
+          } else if (rotAxis === 'z') {
+            [lx, ly, lz] = [lx, lz, ly];
+            [nx, ny, nz] = [nx, nz, ny];
+          }
+          ring.push(this.addVert(cx + lx, cy + ly, cz + lz, nx, ny, nz, i / segsMajor, j / segsMinor, matId, rough, metal, ao));
+        }
+        grid.push(ring);
+      }
+      for (let i = 0; i < segsMajor; i++) {
+        for (let j = 0; j < segsMinor; j++) {
+          const a = grid[i][j], b = grid[i + 1][j], c = grid[i + 1][j + 1], d = grid[i][j + 1];
+          this.indices.push(a, b, c, a, c, d);
+        }
+      }
+    }
+    buildVAO() {
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      const vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(this.verts), gl.STATIC_DRAW);
+      const ibo = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.indices), gl.STATIC_DRAW);
+
+      const stride = 12 * 4;
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 2, gl.FLOAT, false, stride, 24);
+      gl.enableVertexAttribArray(3);
+      gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 32);
+      gl.bindVertexArray(null);
+      return { vao, count: this.indices.length };
+    }
+  }
+
+  // Material IDs:
+  // 0: Wet Mirror-Puddle Steel Weather Deck
+  // 1: Dark Marine Battleship-Navy Hull Steel
+  // 2: Weathered Storm-Slate Superstructure & Inner Bulwark Steel
+  // 3: Cast Iron / Weathered Heavy Deck Hardware (windlass, bollards, chains)
+  // 4: Painted Marine Tubular Rail / Stanchion Steel
+  // 5: Weathered Safety Orange / Marine Rust-Red Accent
+  // 6: Glowing Warm Bridge Window / Porthole Glass (interior console gradient!)
+  // 7: Crimson Red Emissive Nav Light / Top Beacon
+  // 8: Emerald Green Emissive Nav Light
+  // 9: Wet Weathered Teak Cap Rail & Manila Hawser Rope
+  // 10: High-Intensity Floodlight & Bow Mast Lamp Lens
+  function buildShipMeshes() {
+    const mb = new MeshBuilder();
+
+    // --- A. LOFTED FLARED HULL & INNER BULWARK ---
+    const zSteps = 58;
+    const zVals = [];
+    for (let i = 0; i <= zSteps; i++) {
+      const u = i / zSteps;
+      zVals.push(lerp(SHIP_BOW_Z, SHIP_STERN_Z, Math.pow(u, 1.32)));
+    }
+
+    const ySteps = 12;
+    for (const side of [-1, 1]) {
+      const grid = [];
+      for (let iz = 0; iz <= zSteps; iz++) {
+        const z = zVals[iz];
+        const bH = bulwarkHeightAtZ(z);
+        const topY = DECK_Y + bH;
+        const col = [];
+        for (let iy = 0; iy <= ySteps; iy++) {
+          const v = iy / ySteps;
+          const y = lerp(-3.4, topY, v);
+          const x = side * hullHalfBeam(z, y);
+          const dz = 0.25, dy = 0.2;
+          const bx1 = side * hullHalfBeam(clamp(z + dz, SHIP_BOW_Z, SHIP_STERN_Z), y);
+          const bx0 = side * hullHalfBeam(clamp(z - dz, SHIP_BOW_Z, SHIP_STERN_Z), y);
+          const by1 = side * hullHalfBeam(z, y + dy);
+          const by0 = side * hullHalfBeam(z, y - dy);
+          const tzx = bx1 - bx0, tzz = 2 * dz;
+          const tyx = by1 - by0, tyy = 2 * dy;
+          let nx = side * (tyy * tzz);
+          let ny = side * (-tyx * tzz);
+          let nz = side * (-tyy * tzx);
+          const mat = y < 0.4 ? 5 : 1;
+          const ao = lerp(0.55, 1.0, smoothstep(-3.0, DECK_Y, y));
+          col.push(mb.addVert(x, y, z, nx, ny, nz, (z - SHIP_BOW_Z) * 0.12, y * 0.2, mat, 0.20, 0.22, ao));
+        }
+        grid.push(col);
+      }
+      for (let iz = 0; iz < zSteps; iz++) {
+        for (let iy = 0; iy < ySteps; iy++) {
+          const a = grid[iz][iy], b = grid[iz + 1][iy], c = grid[iz + 1][iy + 1], d = grid[iz][iy + 1];
+          if (side > 0) mb.indices.push(a, c, b, a, d, c);
+          else mb.indices.push(a, b, c, a, c, d);
+        }
+      }
+
+      // Inner bulwark wall (dark weathered naval steel, grounded at deck scupper) + gunwale cap rail!
+      const thick = 0.19;
+      for (let iz = 0; iz < zSteps; iz++) {
+        const z0 = zVals[iz], z1 = zVals[iz + 1];
+        const topY0 = DECK_Y + bulwarkHeightAtZ(z0);
+        const topY1 = DECK_Y + bulwarkHeightAtZ(z1);
+
+        const ox0b = side * hullHalfBeam(z0, DECK_Y);
+        const ox1b = side * hullHalfBeam(z1, DECK_Y);
+        const ox0t = side * hullHalfBeam(z0, topY0);
+        const ox1t = side * hullHalfBeam(z1, topY1);
+
+        const ix0b = side * Math.max(0, Math.abs(ox0b) - thick);
+        const ix1b = side * Math.max(0, Math.abs(ox1b) - thick);
+        const ix0t = side * Math.max(0, Math.abs(ox0t) - thick);
+        const ix1t = side * Math.max(0, Math.abs(ox1t) - thick);
+
+        // Inner bulwark steel (matId 1/2 weathered wet marine steel with subtle vertical dark gradient)
+        mb.addQuad([ix0b, DECK_Y, z0], [ix1b, DECK_Y, z1], [ix1t, topY1, z1], [ix0t, topY0, z0], z0 * 0.25, 0, z1 * 0.25, 1, 2, 0.18, 0.24, 0.84, side < 0);
+
+        // Dark steel drainage scupper trim bar right along deck-bulwark base!
+        mb.addQuad([ix0b, DECK_Y, z0], [ix1b, DECK_Y, z1], [ix1b - side * 0.04, DECK_Y + 0.14, z1], [ix0b - side * 0.04, DECK_Y + 0.14, z0], 0, 0, 1, 0.2, 3, 0.20, 0.65, 0.60, side < 0);
+
+        // Top beveled weathered dark teak & steel gunwale cap rail
+        const capH = 0.075;
+        const c0 = [ix0t - side * 0.035, topY0 + capH, z0];
+        const c1 = [ix1t - side * 0.035, topY1 + capH, z1];
+        const c2 = [ox1t + side * 0.035, topY1 + capH, z1];
+        const c3 = [ox0t + side * 0.035, topY0 + capH, z0];
+        mb.addQuad(c0, c1, c2, c3, z0 * 0.3, 0, z1 * 0.3, 0.3, 9, 0.14, 0.12, 1.0, side < 0);
+        mb.addQuad([ix0t, topY0, z0], [ix1t, topY1, z1], c1, c0, 0, 0, 1, 0.1, 9, 0.14, 0.12, 0.92, side < 0);
+        mb.addQuad([ox0t, topY0, z0], c3, c2, [ox1t, topY1, z1], 0, 0, 1, 0.1, 9, 0.14, 0.12, 0.92, side < 0);
+      }
+
+      // Authentic sturdy flanged steel bulwark stiffeners
+      for (let z = -27.5; z <= 25.5; z += 2.6) {
+        const bw = hullHalfBeam(z, DECK_Y) - 0.19;
+        if (bw < 0.85) continue;
+        const bh = bulwarkHeightAtZ(z);
+        mb.addGusset(side, bw, DECK_Y, z, 0.19, bh * 0.90, 0.085, 2, 0.22, 0.30, 0.78);
+      }
+    }
+
+    // Stern transom
+    {
+      const bTop = DECK_Y + bulwarkHeightAtZ(SHIP_STERN_Z);
+      const wBot = hullHalfBeam(SHIP_STERN_Z, -3.4);
+      const wTop = hullHalfBeam(SHIP_STERN_Z, bTop);
+      mb.addQuad([-wBot, -3.4, SHIP_STERN_Z], [wBot, -3.4, SHIP_STERN_Z], [wTop, bTop, SHIP_STERN_Z], [-wTop, bTop, SHIP_STERN_Z], 0, 0, 4, 3, 1, 0.22, 0.2, 0.8);
+      mb.addBox(0, DECK_Y + 0.45, SHIP_STERN_Z - 0.12, wTop * 1.95, 0.92, 0.24, 2, 0.20, 0.2, 0.86);
+    }
+
+    // --- B. CONTINUOUS FLUSH WET MIRROR-PUDDLE WEATHER DECK (matId = 0) ---
+    for (let iz = 0; iz < zSteps; iz++) {
+      const z0 = zVals[iz], z1 = zVals[iz + 1];
+      const w0 = Math.max(0.02, hullHalfBeam(z0, DECK_Y) - 0.10);
+      const w1 = Math.max(0.02, hullHalfBeam(z1, DECK_Y) - 0.10);
+      const xSegs = 10;
+      for (let ix = 0; ix < xSegs; ix++) {
+        const u0 = (ix / xSegs) * 2 - 1;
+        const u1 = ((ix + 1) / xSegs) * 2 - 1;
+        const x00 = u0 * w0, x10 = u1 * w0;
+        const x01 = u0 * w1, x11 = u1 * w1;
+        const edgeDist = 1.0 - Math.max(Math.abs(u0), Math.abs(u1));
+        const ao = lerp(0.58, 1.0, smoothstep(0.0, 0.22, edgeDist));
+        mb.addQuad(
+          [x00, DECK_Y, z0], [x01, DECK_Y, z1], [x11, DECK_Y, z1], [x10, DECK_Y, z0],
+          x00, z0, x11, z1,
+          0, 0.06, 0.22, ao
+        );
+      }
+    }
+
+    // --- C. CURVED TUBULAR MARINE SAFETY RAILING & STANCHIONS ---
+    const railStep = 2;
+    for (const side of [-1, 1]) {
+      for (let iz = 0; iz < zSteps; iz += railStep) {
+        const izNext = Math.min(zSteps, iz + railStep);
+        const z0 = zVals[iz], z1 = zVals[izNext];
+        const y0 = DECK_Y + bulwarkHeightAtZ(z0) + 0.075;
+        const y1 = DECK_Y + bulwarkHeightAtZ(z1) + 0.075;
+        const x0 = side * Math.max(0.05, hullHalfBeam(z0, y0) - 0.10);
+        const x1 = side * Math.max(0.05, hullHalfBeam(z1, y1) - 0.10);
+        const rh = 0.44;
+        mb.addCylinder([x0, y0 + rh, z0], [x1, y1 + rh, z1], 0.034, 0.034, 8, 4, 0.14, 0.65, 1.0, false);
+        mb.addCylinder([x0, y0 + rh * 0.5, z0], [x1, y1 + rh * 0.5, z1], 0.020, 0.020, 6, 4, 0.16, 0.65, 0.95, false);
+        if (iz % 4 === 0 || iz === 0) {
+          mb.addCylinder([x0, y0 - 0.02, z0], [x0, y0 + rh + 0.025, z0], 0.028, 0.025, 8, 4, 0.15, 0.65, 0.96, true);
+        }
+      }
+    }
+    // Prow chock & heavy cast-iron bow fairlead
+    {
+      const prowY = DECK_Y + bulwarkHeightAtZ(SHIP_BOW_Z) + 0.08;
+      mb.addBox(0, prowY + 0.08, SHIP_BOW_Z + 0.45, 0.46, 0.28, 0.58, 3, 0.22, 0.78, 0.9);
+      mb.addTorus(0, prowY + 0.20, SHIP_BOW_Z + 0.22, 0.19, 0.052, 12, 8, 'z', 3, 0.20, 0.82, 0.95);
+    }
+
+    // --- D. BOW JACKSTAFF / FOREMAST + BOW LAMP + RIGGING STAYS ---
+    {
+      const mz = -29.5;
+      const baseY = DECK_Y;
+      const topY = DECK_Y + 5.2;
+      mb.addCylinder([0, baseY, mz], [0, topY, mz - 0.35], 0.10, 0.048, 12, 4, 0.18, 0.55, 0.95, true);
+      mb.addCylinder([-1.1, topY - 0.95, mz - 0.28], [1.1, topY - 0.95, mz - 0.28], 0.028, 0.028, 8, 4, 0.18, 0.55, 0.95, true);
+      // Bow lantern hood & bright warm steaming/anchor lamp
+      const ly = DECK_Y + 4.35, lz = mz - 0.30;
+      mb.addCylinder([0, ly - 0.24, lz], [0, ly - 0.13, lz], 0.15, 0.14, 10, 3, 0.22, 0.78, 0.9, true);
+      mb.addCylinder([0, ly + 0.13, lz], [0, ly + 0.24, lz], 0.16, 0.12, 10, 3, 0.22, 0.78, 0.9, true);
+      mb.addCylinder([0, ly - 0.13, lz], [0, ly + 0.13, lz], 0.115, 0.115, 10, 10, 0.05, 0.0, 1.0, false);
+      // Taut wire forestays
+      const stayZ = -24.4;
+      const stayY = DECK_Y + bulwarkHeightAtZ(stayZ) + 0.08;
+      const stayX = hullHalfBeam(stayZ, stayY) - 0.12;
+      mb.addCylinder([0, topY - 0.35, mz - 0.32], [-stayX, stayY, stayZ], 0.013, 0.013, 5, 3, 0.25, 0.85, 0.85, false);
+      mb.addCylinder([0, topY - 0.35, mz - 0.32], [ stayX, stayY, stayZ], 0.013, 0.013, 5, 3, 0.25, 0.85, 0.85, false);
+    }
+
+    // --- E. SLEEK, MECHANICALLY DETAILED FORECASTLE HARDWARE ---
+    // Moved slightly forward & sleeker (z = -24.8, lower profile!) so wide gleaming wet bow deck
+    // AND massive oncoming storm waves over the bow railing are framed heroically!
+    {
+      const wz = -24.8;
+      // Low bolted steel bedplate with chamfered step
+      mb.addBox(0, DECK_Y + 0.045, wz, 3.05, 0.09, 1.25, 3, 0.24, 0.75, 0.65);
+      // Cylindrical electric-hydraulic motor & ribbed central gearbox (NOT a plain box!)
+      mb.addCylinder([0, DECK_Y + 0.44, wz - 0.38], [0, DECK_Y + 0.44, wz + 0.46], 0.34, 0.32, 16, 3, 0.22, 0.78, 0.88, true);
+      mb.addBox(0, DECK_Y + 0.24, wz + 0.02, 0.66, 0.36, 0.78, 3, 0.24, 0.75, 0.80);
+      // Top gear inspection dome & bolts
+      mb.addCylinder([0, DECK_Y + 0.68, wz + 0.02], [0, DECK_Y + 0.80, wz + 0.02], 0.24, 0.20, 12, 3, 0.20, 0.82, 0.94, true);
+      // Main horizontal steel drive shaft
+      mb.addCylinder([-1.68, DECK_Y + 0.50, wz], [1.68, DECK_Y + 0.50, wz], 0.095, 0.095, 12, 3, 0.18, 0.88, 0.92, true);
+      // Side bearing frames, ribbed gypsy drums, brake bands & handwheels
+      for (const s of [-1, 1]) {
+        mb.addBox(s * 1.22, DECK_Y + 0.38, wz, 0.16, 0.64, 0.72, 3, 0.24, 0.75, 0.82);
+        mb.addCylinder([s * 1.22, DECK_Y + 0.50, wz - 0.02], [s * 1.22, DECK_Y + 0.50, wz + 0.02], 0.22, 0.22, 12, 3, 0.22, 0.78, 0.9, true);
+        // Toothed anchor chain gypsy drum + flanges
+        mb.addCylinder([s * 0.56, DECK_Y + 0.50, wz], [s * 1.04, DECK_Y + 0.50, wz], 0.29, 0.29, 14, 3, 0.20, 0.82, 0.9, true);
+        mb.addCylinder([s * 0.54, DECK_Y + 0.50, wz], [s * 0.60, DECK_Y + 0.50, wz], 0.34, 0.34, 14, 3, 0.18, 0.85, 0.94, true);
+        mb.addCylinder([s * 1.00, DECK_Y + 0.50, wz], [s * 1.06, DECK_Y + 0.50, wz], 0.34, 0.34, 14, 3, 0.18, 0.85, 0.94, true);
+        // Outer concave warping capstan drum
+        mb.addCylinder([s * 1.32, DECK_Y + 0.50, wz], [s * 1.66, DECK_Y + 0.50, wz], 0.24, 0.19, 12, 3, 0.20, 0.82, 0.92, true);
+        // Brake screw column & weathered crimson handwheel
+        mb.addCylinder([s * 0.80, DECK_Y + 0.68, wz + 0.38], [s * 0.80, DECK_Y + 1.04, wz + 0.38], 0.032, 0.032, 8, 3, 0.20, 0.85, 0.9, true);
+        mb.addTorus(s * 0.80, DECK_Y + 1.06, wz + 0.38, 0.18, 0.025, 14, 8, 'y', 5, 0.22, 0.45, 0.96);
+        mb.addCylinder([s * 0.62, DECK_Y + 1.06, wz + 0.38], [s * 0.98, DECK_Y + 1.06, wz + 0.38], 0.015, 0.015, 6, 5, 0.22, 0.45, 0.92, false);
+        mb.addCylinder([s * 0.80, DECK_Y + 1.06, wz + 0.20], [s * 0.80, DECK_Y + 1.06, wz + 0.56], 0.015, 0.015, 6, 5, 0.22, 0.45, 0.92, false);
+      }
+
+      // Heavy 3D Interlocking Anchor Chains + Deck Chain Stoppers + Hawsepipe Collars!
+      for (const s of [-1, 1]) {
+        const hx = s * 0.88, hz = -27.7;
+        // Raised cast-iron hawsepipe deck collar & lip
+        mb.addCylinder([hx, DECK_Y, hz], [hx, DECK_Y + 0.24, hz - 0.10], 0.28, 0.22, 12, 3, 0.24, 0.78, 0.78, true);
+        mb.addTorus(hx, DECK_Y + 0.24, hz - 0.10, 0.22, 0.04, 12, 7, 'y', 3, 0.20, 0.82, 0.9);
+        // Deck chain stopper pawl between windlass & hawsepipe
+        mb.addBox(s * 0.84, DECK_Y + 0.16, -26.25, 0.34, 0.30, 0.42, 3, 0.24, 0.76, 0.82);
+        // Interlocking iron anchor chain links running forward & visible from camera!
+        const numLinks = 16;
+        for (let i = 0; i < numLinks; i++) {
+          const t = i / (numLinks - 1);
+          const lx = lerp(s * 0.80, hx, t);
+          const lz = lerp(wz - 0.28, hz + 0.08, t);
+          const ly = lerp(DECK_Y + 0.34, DECK_Y + 0.18, t) - Math.sin(t * Math.PI) * 0.05;
+          mb.addTorus(lx, ly, lz, 0.095, 0.032, 8, 6, i % 2 === 0 ? 'y' : 'x', 3, 0.26, 0.78, 0.84);
+        }
+      }
+    }
+
+    // Heavy Cast-Iron Twin Mooring Bollards (Bitts) with grounded base flanges
+    const bollardZs = [-26.2, -21.2, -14.2, -3.5, 22.0];
+    for (const bz of bollardZs) {
+      for (const s of [-1, 1]) {
+        const bw = hullHalfBeam(bz, DECK_Y);
+        const bx = s * (bw - 0.78);
+        if (Math.abs(bx) < 0.7) continue;
+        mb.addBox(bx, DECK_Y + 0.045, bz, 0.48, 0.09, 1.08, 3, 0.24, 0.75, 0.65);
+        for (const dz of [-0.28, 0.28]) {
+          mb.addCylinder([bx, DECK_Y + 0.08, bz + dz], [bx, DECK_Y + 0.56, bz + dz], 0.135, 0.135, 12, 3, 0.22, 0.78, 0.86, true);
+          mb.addCylinder([bx, DECK_Y + 0.52, bz + dz], [bx, DECK_Y + 0.60, bz + dz], 0.168, 0.168, 12, 3, 0.20, 0.82, 0.94, true);
+        }
+        // Horizontal cross-horn bar between twin bitts
+        mb.addCylinder([bx, DECK_Y + 0.38, bz - 0.42], [bx, DECK_Y + 0.38, bz + 0.42], 0.05, 0.05, 8, 3, 0.22, 0.78, 0.88, true);
+      }
+    }
+
+    // Coiled Wet Mooring Hawser neatly resting beside starboard-forward bollard (smooth 32-seg curve!)
+    for (let r = 0; r < 4; r++) {
+      mb.addTorus(2.35, DECK_Y + 0.055 + (r % 2) * 0.05, -21.8, 0.28 + r * 0.08, 0.052, 32, 10, 'y', 9, 0.40, 0.05, 0.80);
+    }
+
+    // --- F. SLEEKER LOW-PROFILE CARGO HATCH, PROPERLY TERMINATED DECK PIPES & CLEAR LIFEBUOYS ---
+    {
+      // Sleek low-profile watertight cargo hatch (narrower 4.3m & lower 0.72m so wet deck walkway
+      // clearly reflects the entire glowing bridge & floodlights right to the camera!)
+      mb.addBox(0, DECK_Y + 0.36, -6.5, 4.30, 0.72, 10.2, 1, 0.22, 0.32, 0.78);
+      // Dark steel bolted base coaming skirt (grounds the hatch solidly into the deck!)
+      mb.addBox(0, DECK_Y + 0.05, -6.5, 4.54, 0.10, 10.44, 3, 0.24, 0.72, 0.52);
+      // Beveled hatch cover top + structural ribs
+      mb.addBox(0, DECK_Y + 0.76, -6.5, 4.52, 0.12, 10.42, 3, 0.20, 0.52, 0.92);
+      for (let z = -11.0; z <= -2.0; z += 1.5) {
+        mb.addBox(0, DECK_Y + 0.85, z, 4.44, 0.08, 0.14, 3, 0.22, 0.60, 0.94);
+      }
+      // Deck hydraulic & fire-main pipes with proper vertical 90° deck-penetration elbows & clamps!
+      for (const s of [-1, 1]) {
+        const px1 = s * 3.18, px2 = s * 3.40;
+        const pzStart = -15.8, pzEnd = 4.8;
+        mb.addCylinder([px1, DECK_Y + 0.20, pzStart], [px1, DECK_Y + 0.20, pzEnd], 0.068, 0.068, 8, 3, 0.20, 0.78, 0.84, true);
+        mb.addCylinder([px2, DECK_Y + 0.20, pzStart], [px2, DECK_Y + 0.20, pzEnd], 0.052, 0.052, 8, 5, 0.22, 0.35, 0.88, true);
+        // Proper vertical elbows into bolted deck penetration flanges at forward end!
+        mb.addCylinder([px1, DECK_Y, pzStart], [px1, DECK_Y + 0.22, pzStart], 0.068, 0.068, 8, 3, 0.20, 0.78, 0.78, true);
+        mb.addCylinder([px2, DECK_Y, pzStart], [px2, DECK_Y + 0.22, pzStart], 0.052, 0.052, 8, 5, 0.22, 0.35, 0.80, true);
+        mb.addBox(s * 3.29, DECK_Y + 0.03, pzStart, 0.44, 0.06, 0.30, 3, 0.24, 0.72, 0.68);
+        // Pipe support saddle brackets along deck
+        for (let z = -13.0; z <= 3.0; z += 4.0) {
+          mb.addBox(s * 3.29, DECK_Y + 0.09, z, 0.40, 0.18, 0.10, 3, 0.24, 0.72, 0.72);
+        }
+        // Mushroom ventilation cowls with bolted base flanges
+        for (const vz of [-14.8, 2.2]) {
+          const vx = s * 4.25;
+          mb.addCylinder([vx, DECK_Y, vz], [vx, DECK_Y + 0.08, vz], 0.24, 0.24, 12, 3, 0.22, 0.72, 0.68, true);
+          mb.addCylinder([vx, DECK_Y + 0.06, vz], [vx, DECK_Y + 0.96, vz], 0.15, 0.14, 12, 2, 0.20, 0.25, 0.88, true);
+          mb.addCylinder([vx, DECK_Y + 0.90, vz], [vx, DECK_Y + 1.18, vz], 0.32, 0.18, 12, 2, 0.18, 0.25, 0.95, true);
+        }
+        // Lifebuoy rings cleanly mounted on dedicated bracket midway between stanchions (ZERO clipping!)
+        for (const lz of [-15.2, -4.6, 3.2]) {
+          const rx = s * (hullHalfBeam(lz, DECK_Y + 0.5) - 0.36);
+          mb.addBox(rx + s * 0.06, DECK_Y + 0.56, lz, 0.12, 0.16, 0.10, 3, 0.24, 0.7, 0.82);
+          mb.addTorus(rx - s * 0.02, DECK_Y + 0.58, lz, 0.28, 0.078, 14, 8, 'x', 5, 0.26, 0.08, 0.94);
+        }
+      }
+    }
+
+    // --- G. MULTI-TIER BRIDGE, SUPERSTRUCTURE, RADAR MAST, FUNNEL & LIFEBOATS ---
+    {
+      const t1H = 3.45;
+      mb.addBox(0, DECK_Y + t1H * 0.5, 12.5, 8.6, t1H, 15.4, 2, 0.22, 0.18, 0.90);
+      // Dark bolted lower coaming skirt grounding deckhouse into the wet deck
+      mb.addBox(0, DECK_Y + 0.38, 12.5, 8.76, 0.76, 15.56, 1, 0.22, 0.28, 0.72);
+
+      // Forward watertight steel bulkhead door + frame + warm caged porch lamp
+      mb.addBox(-2.2, DECK_Y + 1.12, 4.74, 1.08, 2.08, 0.16, 3, 0.24, 0.65, 0.78);
+      mb.addBox(-2.2, DECK_Y + 1.12, 4.68, 0.92, 1.92, 0.10, 1, 0.24, 0.40, 0.84);
+      mb.addBox(-2.2, DECK_Y + 2.38, 4.66, 0.28, 0.20, 0.20, 3, 0.24, 0.75, 0.88);
+      mb.addBox(-2.2, DECK_Y + 2.36, 4.58, 0.18, 0.12, 0.10, 10, 0.06, 0.0, 1.0);
+
+      // Illuminated brass-rimmed portholes across forward & side bulkheads
+      for (const px of [-0.4, 1.2, 2.8]) {
+        mb.addCylinder([px, DECK_Y + 2.05, 4.75], [px, DECK_Y + 2.05, 4.62], 0.29, 0.29, 14, 3, 0.22, 0.82, 0.88, true);
+        mb.addCylinder([px, DECK_Y + 2.05, 4.72], [px, DECK_Y + 2.05, 4.60], 0.20, 0.20, 14, 6, 0.06, 0.0, 1.0, true);
+      }
+      for (const s of [-1, 1]) {
+        for (const pz of [7.2, 10.0, 12.8, 15.6, 18.2]) {
+          mb.addCylinder([s * 4.31, DECK_Y + 2.05, pz], [s * 4.40, DECK_Y + 2.05, pz], 0.27, 0.27, 12, 3, 0.22, 0.82, 0.88, true);
+          mb.addCylinder([s * 4.33, DECK_Y + 2.05, pz], [s * 4.42, DECK_Y + 2.05, pz], 0.19, 0.19, 12, 6, 0.06, 0.0, 1.0, true);
+        }
+      }
+
+      // Exterior companionway staircase on starboard forward face
+      {
+        const sx = 4.65;
+        mb.addCylinder([sx, DECK_Y, 4.5], [sx, DECK_Y + t1H, 7.8], 0.05, 0.05, 6, 3, 0.24, 0.65, 0.85, true);
+        mb.addCylinder([sx + 0.65, DECK_Y, 4.5], [sx + 0.65, DECK_Y + t1H, 7.8], 0.05, 0.05, 6, 3, 0.24, 0.65, 0.85, true);
+        mb.addCylinder([sx + 0.65, DECK_Y + 1.0, 4.5], [sx + 0.65, DECK_Y + t1H + 1.0, 7.8], 0.03, 0.03, 6, 4, 0.18, 0.55, 0.9, true);
+        for (let st = 0; st < 11; st++) {
+          const t = (st + 0.5) / 11;
+          mb.addBox(sx + 0.32, DECK_Y + t * t1H, lerp(4.5, 7.8, t), 0.66, 0.06, 0.26, 3, 0.24, 0.65, 0.82);
+        }
+      }
+
+      // Tier 2: Raked Bridge / Wheelhouse
+      const bBase = DECK_Y + t1H;
+      const bH = 3.05;
+      mb.addBox(0, bBase + bH * 0.5, 10.6, 8.2, bH, 8.4, 2, 0.20, 0.18, 0.94, 0.52);
+      // Dark window band fascia behind bridge windows
+      mb.addBox(0, bBase + 1.92, 6.22, 7.6, 1.48, 0.20, 3, 0.22, 0.72, 0.85, 0.24);
+      // Overhanging storm visor brow
+      mb.addBox(0, bBase + bH + 0.08, 10.32, 8.8, 0.24, 9.3, 1, 0.20, 0.30, 0.94);
+
+      // Extended Port & Starboard Bridge Wings
+      mb.addBox(0, bBase + 0.14, 7.55, 12.3, 0.28, 2.35, 1, 0.22, 0.25, 0.88);
+      for (const s of [-1, 1]) {
+        mb.addBox(s * 5.05, bBase + 0.72, 6.45, 2.15, 1.15, 0.18, 2, 0.20, 0.20, 0.92);
+        mb.addBox(s * 6.06, bBase + 0.72, 7.55, 0.18, 1.15, 2.25, 2, 0.20, 0.20, 0.92);
+      }
+
+      // 7 Iconic Glowing Warm-Amber Bridge Windows with crisp mullions & rich interior glass UV!
+      const winCount = 7;
+      const winSpan = 7.1;
+      for (let i = 0; i < winCount; i++) {
+        const wx = lerp(-winSpan * 0.5, winSpan * 0.5, (i + 0.5) / winCount);
+        const ww = winSpan / winCount - 0.18;
+        const y0 = bBase + 1.30, y1 = bBase + 2.52;
+        const z0 = 6.09, z1 = 5.83;
+        mb.addQuad([wx - ww * 0.5, y0, z0], [wx - ww * 0.5, y1, z1], [wx + ww * 0.5, y1, z1], [wx + ww * 0.5, y0, z0], 0, 0, 1, 1, 6, 0.06, 0.0, 1.0);
+      }
+      for (const s of [-1, 1]) {
+        for (const wz of [7.6, 9.2, 10.8]) {
+          const x = s * 4.13;
+          mb.addQuad([x, bBase + 1.32, wz - 0.54], [x, bBase + 2.46, wz - 0.54], [x, bBase + 2.46, wz + 0.54], [x, bBase + 1.32, wz + 0.54], 0, 0, 1, 1, 6, 0.06, 0.0, 1.0, s < 0);
+        }
+      }
+
+      // Port (RED) & Starboard (GREEN) Wing Navigation Lights
+      for (const s of [-1, 1]) {
+        const nx = s * 6.08, ny = bBase + 1.45, nz = 7.25;
+        mb.addBox(nx, ny - 0.25, nz, 0.34, 0.42, 0.48, 3, 0.24, 0.72, 0.9);
+        mb.addCylinder([nx, ny - 0.12, nz - 0.05], [nx, ny + 0.16, nz - 0.05], 0.135, 0.135, 12, s < 0 ? 7 : 8, 0.05, 0.0, 1.0, true);
+      }
+
+      // Twin High-Powered Deck Floodlight Housings under the Bridge Brow
+      for (const s of [-1, 1]) {
+        const fx = s * 3.25, fy = bBase + 2.82, fz = 5.72;
+        mb.addBox(fx, fy, fz + 0.12, 0.56, 0.34, 0.28, 3, 0.22, 0.78, 0.9);
+        mb.addQuad([fx - 0.23, fy - 0.12, fz - 0.03], [fx - 0.23, fy + 0.12, fz - 0.06], [fx + 0.23, fy + 0.12, fz - 0.06], [fx + 0.23, fy - 0.12, fz - 0.03], 0, 0, 1, 1, 10, 0.04, 0.0, 1.0);
+      }
+
+      // Compass Deck Rails
+      const roofY = bBase + bH + 0.18;
+      for (const s of [-1, 1]) {
+        mb.addCylinder([s * 4.1, roofY + 0.95, 6.2], [s * 4.1, roofY + 0.95, 14.8], 0.03, 0.03, 6, 4, 0.18, 0.6, 0.95, false);
+        for (let z = 6.2; z <= 14.8; z += 2.15) {
+          mb.addCylinder([s * 4.1, roofY, z], [s * 4.1, roofY + 0.98, z], 0.025, 0.025, 6, 4, 0.18, 0.6, 0.95, true);
+        }
+      }
+      mb.addCylinder([-4.1, roofY + 0.95, 6.2], [4.1, roofY + 0.95, 6.2], 0.03, 0.03, 6, 4, 0.18, 0.6, 0.95, false);
+
+      // Tall Tapered Main Radar Mast
+      const mastZ = 9.4;
+      const mastTop = roofY + 10.4;
+      mb.addCylinder([0, roofY, mastZ], [0, mastTop, mastZ + 0.65], 0.32, 0.10, 12, 2, 0.20, 0.30, 0.96, true);
+      for (const s of [-1, 1]) {
+        mb.addCylinder([s * 1.35, roofY, mastZ - 1.1], [0, roofY + 4.8, mastZ + 0.28], 0.10, 0.08, 8, 2, 0.22, 0.30, 0.92, true);
+      }
+      mb.addBox(0, roofY + 5.15, mastZ - 0.35, 1.3, 0.16, 1.1, 1, 0.22, 0.45, 0.9);
+      mb.addCylinder([0, roofY + 5.2, mastZ - 0.55], [0, roofY + 5.75, mastZ - 0.55], 0.22, 0.16, 10, 2, 0.20, 0.35, 0.95, true);
+      mb.addCylinder([-3.6, roofY + 6.9, mastZ + 0.42], [3.6, roofY + 6.9, mastZ + 0.42], 0.06, 0.04, 8, 2, 0.20, 0.35, 0.95, true);
+      mb.addCylinder([-2.2, roofY + 8.9, mastZ + 0.56], [2.2, roofY + 8.9, mastZ + 0.56], 0.045, 0.03, 8, 2, 0.20, 0.35, 0.95, true);
+      for (const s of [-1, 1]) {
+        mb.addCylinder([s * 3.1, roofY + 6.9, mastZ + 0.42], [s * 3.1, roofY + 10.6, mastZ + 0.42], 0.02, 0.01, 5, 3, 0.28, 0.85, 0.9, false);
+      }
+      // Steaming lights + top crimson beacon
+      mb.addCylinder([0, roofY + 3.6, mastZ - 0.18], [0, roofY + 3.92, mastZ - 0.18], 0.14, 0.14, 10, 10, 0.05, 0.0, 1.0, true);
+      mb.addCylinder([0, mastTop - 0.45, mastZ + 0.50], [0, mastTop - 0.12, mastZ + 0.50], 0.14, 0.14, 10, 10, 0.05, 0.0, 1.0, true);
+      mb.addCylinder([0, mastTop, mastZ + 0.65], [0, mastTop + 0.36, mastZ + 0.65], 0.11, 0.11, 10, 7, 0.05, 0.0, 1.0, true);
+
+      // Raked Smokestack / Funnel
+      mb.addCylinder([0, bBase + 0.2, 16.4], [0, roofY + 5.6, 17.5], 1.45, 1.12, 16, 1, 0.24, 0.25, 0.9, true);
+      mb.addCylinder([0, roofY + 3.1, 17.02], [0, roofY + 4.35, 17.26], 1.28, 1.20, 16, 5, 0.24, 0.12, 0.95, false);
+      for (const s of [-1, 1]) {
+        mb.addCylinder([s * 0.42, roofY + 5.4, 17.45], [s * 0.42, roofY + 6.25, 17.68], 0.24, 0.22, 10, 3, 0.32, 0.72, 0.85, true);
+      }
+
+      // Port & Starboard Lifeboats in Davits
+      for (const s of [-1, 1]) {
+        const lx = s * 4.75, ly = bBase + 0.85, lz = 15.8;
+        mb.addCylinder([lx, ly, lz - 2.3], [lx, ly, lz + 2.3], 0.72, 0.72, 12, 5, 0.20, 0.10, 0.92, true);
+        mb.addCylinder([lx, ly, lz - 3.1], [lx, ly, lz - 2.3], 0.12, 0.72, 10, 5, 0.20, 0.10, 0.92, true);
+        mb.addCylinder([lx, ly, lz + 2.3], [lx, ly, lz + 3.1], 0.72, 0.12, 10, 5, 0.20, 0.10, 0.92, true);
+        mb.addBox(lx, ly + 0.48, lz, 0.92, 0.46, 2.8, 2, 0.20, 0.12, 0.96);
+        for (const dz of [-2.0, 2.0]) {
+          mb.addBox(s * 4.35, bBase + 0.55, lz + dz, 0.22, 1.65, 0.22, 3, 0.24, 0.68, 0.85);
+          mb.addBox(s * 4.75, bBase + 1.48, lz + dz, 0.95, 0.22, 0.22, 3, 0.24, 0.68, 0.88);
+        }
+      }
+    }
+
+    const rmb = new MeshBuilder();
+    rmb.addBox(0, 0, 0, 2.85, 0.14, 0.24, 2, 0.18, 0.30, 1.0);
+    rmb.addBox(0, -0.10, 0, 0.34, 0.18, 0.34, 3, 0.22, 0.65, 0.95);
+
+    return {
+      ship: mb.buildVAO(),
+      radar: rmb.buildVAO(),
+      radarPos: [0, DECK_Y + 3.45 + 3.05 + 0.18 + 5.85, 9.4 - 0.55]
+    };
+  }
+
+  const SHIP_LIGHTS_LOCAL = {
+    floodL:  [-3.25, DECK_Y + 6.22,  5.60],
+    floodR:  [ 3.25, DECK_Y + 6.22,  5.60],
+    bowLamp: [ 0.00, DECK_Y + 4.35, -29.80],
+    portNav: [-6.08, DECK_Y + 4.92,  7.18],
+    stbdNav: [ 6.08, DECK_Y + 4.92,  7.18],
+    bridge:  [ 0.00, DECK_Y + 5.35,  5.70],
+  };
+
+  // =========================================================================
+  // 7. HIGH-DENSITY RADIAL OCEAN MESH
+  // =========================================================================
+  function buildOceanMesh() {
+    const RINGS = 240;
+    const SECTORS = 264;
+    const MAX_RADIUS = 2600.0;
+
+    const verts = new Float32Array((RINGS + 1) * (SECTORS + 1) * 3);
+    const indices = new Uint32Array(RINGS * SECTORS * 6);
+
+    let vi = 0;
+    for (let ir = 0; ir <= RINGS; ir++) {
+      const t = ir / RINGS;
+      // Extra mid-to-far resolution so distant storm swells have silky-smooth curved crests!
+      const r = 1.5 + 22.0 * t + 360.0 * Math.pow(t, 2.20) + (MAX_RADIUS - 383.5) * Math.pow(t, 4.15);
+      for (let is = 0; is <= SECTORS; is++) {
+        const a = (is / SECTORS) * TAU;
+        verts[vi++] = Math.cos(a) * r;
+        verts[vi++] = Math.sin(a) * r;
+        verts[vi++] = t;
+      }
+    }
+
+    let ii = 0;
+    const stride = SECTORS + 1;
+    for (let ir = 0; ir < RINGS; ir++) {
+      for (let is = 0; is < SECTORS; is++) {
+        const a = ir * stride + is;
+        const b = a + 1;
+        const c = a + stride;
+        const d = c + 1;
+        indices[ii++] = a; indices[ii++] = b; indices[ii++] = c;
+        indices[ii++] = b; indices[ii++] = d; indices[ii++] = c;
+      }
+    }
+
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+    const ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+    gl.bindVertexArray(null);
+    return { vao, count: indices.length };
+  }
+
+  // =========================================================================
+  // 8. LIGHTNING SYSTEM (MULTI-FLICKER INTERNAL CLOUD ILLUMINATION + FORKS)
+  // =========================================================================
+  const lightning = {
+    slots: [
+      { active: false, time: 0, dur: 0.72, az: -0.26, elev: 0.24, intensity: 0, hasBolt: true, seed: 1.0, peak: 1.0, flickerFreq: 24 },
+      { active: false, time: 0, dur: 0.62, az:  0.65, elev: 0.26, intensity: 0, hasBolt: false, seed: 2.0, peak: 0.8, flickerFreq: 28 }
+    ],
+    nextStrikeIn: 1.4,
+    boltMeshVao: null,
+    boltVertCount: 0,
+    boltBuffer: null,
+    boltMaxVerts: 720,
+    onStrikeSound: null
+  };
+
+  function initBoltGeometry() {
+    lightning.boltMeshVao = gl.createVertexArray();
+    gl.bindVertexArray(lightning.boltMeshVao);
+    lightning.boltBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, lightning.boltBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, lightning.boltMaxVerts * 6 * 4, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 24, 12);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 24, 20);
+    gl.bindVertexArray(null);
+  }
+
+  function rebuildLightningBolt(az, elev, seed) {
+    let s = seed * 12345.6789;
+    const rand = () => { s = (s * 16807.0) % 2147483647.0; return (s - 1) / 2147483646.0; };
+
+    const dist = 1400.0;
+    const baseDirX = Math.sin(az);
+    const baseDirZ = -Math.cos(az);
+    const rightX = Math.cos(az);
+    const rightZ = Math.sin(az);
+
+    const startX = baseDirX * dist;
+    const startZ = baseDirZ * dist;
+    const startY = Math.tan(elev) * dist * 0.96;
+    const endY = -10.0;
+
+    const verts = [];
+    function addSegment(p0, p1, halfW, bright) {
+      if (verts.length / 6 + 6 > lightning.boltMaxVerts) return;
+      const rx = rightX * halfW, rz = rightZ * halfW;
+      const v0 = [p0[0] - rx, p0[1], p0[2] - rz];
+      const v1 = [p0[0] + rx, p0[1], p0[2] + rz];
+      const v2 = [p1[0] + rx, p1[1], p1[2] + rz];
+      const v3 = [p1[0] - rx, p1[1], p1[2] - rz];
+      verts.push(
+        v0[0], v0[1], v0[2], 0, 0, bright,
+        v1[0], v1[1], v1[2], 1, 0, bright,
+        v2[0], v2[1], v2[2], 1, 1, bright,
+        v0[0], v0[1], v0[2], 0, 0, bright,
+        v2[0], v2[1], v2[2], 1, 1, bright,
+        v3[0], v3[1], v3[2], 0, 1, bright
+      );
+    }
+
+    function traceBranch(pStart, pEnd, steps, jitter, width, bright, depth) {
+      let cur = pStart.slice();
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const next = [
+          lerp(pStart[0], pEnd[0], t) + (i < steps ? (rand() - 0.5) * jitter * rightX : 0),
+          lerp(pStart[1], pEnd[1], t),
+          lerp(pStart[2], pEnd[2], t) + (i < steps ? (rand() - 0.5) * jitter * rightZ : 0)
+        ];
+        addSegment(cur, next, width * lerp(1.1, 0.52, t), bright);
+        if (depth < 2 && i > 1 && i < steps - 2 && rand() < (depth === 0 ? 0.42 : 0.26)) {
+          const side = rand() < 0.5 ? -1 : 1;
+          const bLen = lerp(130, 260, rand()) * (depth === 0 ? 1.0 : 0.55);
+          const bEnd = [
+            next[0] + rightX * side * bLen * (0.45 + rand() * 0.55),
+            next[1] - bLen * (0.55 + rand() * 0.45),
+            next[2] + rightZ * side * bLen * (0.45 + rand() * 0.55)
+          ];
+          traceBranch(next, bEnd, 6, jitter * 0.55, width * 0.50, bright * 0.72, depth + 1);
+        }
+        cur = next;
+      }
+    }
+
+    const endOffset = (rand() - 0.5) * 180;
+    traceBranch(
+      [startX, startY, startZ],
+      [startX + rightX * endOffset, endY, startZ + rightZ * endOffset],
+      18, 76.0, 9.5, 1.0, 0
+    );
+
+    lightning.boltVertCount = verts.length / 6;
+    gl.bindBuffer(gl.ARRAY_BUFFER, lightning.boltBuffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(verts));
+  }
+
+  function triggerLightning(slotIdx = 0, forcedAz = null, forcedBolt = null) {
+    const sl = lightning.slots[slotIdx];
+    sl.active = true;
+    sl.time = 0;
+    sl.dur = 0.62 + Math.random() * 0.48;
+    if (forcedAz !== null) {
+      sl.az = forcedAz;
+    } else if (Math.random() < 0.74) {
+      sl.az = (Math.random() - 0.5) * 1.9;
+    } else {
+      sl.az = (Math.random() - 0.5) * TAU;
+    }
+    sl.elev = 0.19 + Math.random() * 0.22;
+    sl.peak = 1.95 + Math.random() * 1.55;
+    sl.hasBolt = forcedBolt !== null ? forcedBolt : (slotIdx === 0 && Math.random() < 0.66);
+    sl.seed = Math.random() * 999 + 1;
+    sl.flickerFreq = 19 + Math.random() * 16;
+    if (sl.hasBolt) {
+      rebuildLightningBolt(sl.az, sl.elev, sl.seed);
+    }
+    if (lightning.onStrikeSound) lightning.onStrikeSound(sl.peak, sl.hasBolt);
+  }
+
+  function updateLightning(dt) {
+    lightning.nextStrikeIn -= dt;
+    if (lightning.nextStrikeIn <= 0) {
+      const slot = lightning.slots[0].active ? 1 : 0;
+      triggerLightning(slot);
+      lightning.nextStrikeIn = Math.random() < 0.38 ? (0.8 + Math.random() * 1.3) : (2.4 + Math.random() * 3.8);
+    }
+
+    for (let i = 0; i < lightning.slots.length; i++) {
+      const sl = lightning.slots[i];
+      if (!sl.active) {
+        sl.intensity = 0;
+        continue;
+      }
+      sl.time += dt;
+      const u = sl.time / sl.dur;
+      if (u >= 1.0) {
+        sl.active = false;
+        sl.intensity = 0;
+        continue;
+      }
+      const mainStroke = Math.exp(-Math.pow((u - 0.10) / 0.055, 2));
+      const restrike1  = 0.88 * Math.exp(-Math.pow((u - 0.28) / 0.050, 2));
+      const restrike2  = 0.62 * Math.exp(-Math.pow((u - 0.46) / 0.068, 2));
+      const afterglow  = 0.30 * Math.exp(-Math.max(0, u - 0.12) * 3.5);
+      const microFlick = 0.82 + 0.18 * Math.sin(sl.time * sl.flickerFreq * TAU);
+      sl.intensity = sl.peak * (mainStroke + restrike1 + restrike2 + afterglow) * microFlick;
+    }
+  }
+
+  // =========================================================================
+  // 9. PHOTOREALISTIC BOW SPRAY PLUMES & BALLISTIC WATER STREAK DROPLETS
+  // =========================================================================
+  // Completely refactored: ZERO Voronoi dandelion blobs, ZERO oval speckle columns!
+  // Layer A (type 0): Wispy multi-octave fBm mist sheets sheared across the bow by gale wind
+  // Layer B (type 1): Velocity-aligned fine glistening ballistic water droplets & whitewater streaks!
+  const MAX_SPRAY = 2200;
+  const sprayPos = new Float32Array(MAX_SPRAY * 3);
+  const sprayVel = new Float32Array(MAX_SPRAY * 3);
+  const sprayLife = new Float32Array(MAX_SPRAY);
+  const sprayMaxLife = new Float32Array(MAX_SPRAY);
+  const spraySize = new Float32Array(MAX_SPRAY);
+  const spraySeed = new Float32Array(MAX_SPRAY);
+  const sprayType = new Float32Array(MAX_SPRAY);
+  let sprayCursor = 0;
+
+  // Per-instance GPU data: pos(3), size(1), vel(3), alpha(1), seed(1), type(1), age(1), pad(1) -> 12 floats!
+  const sprayGpuData = new Float32Array(MAX_SPRAY * 12);
+  let sprayVao = null, sprayInstBuf = null;
+  let lensSprayImpulse = 0.0;
+
+  function initSprayBuffers() {
+    sprayVao = gl.createVertexArray();
+    gl.bindVertexArray(sprayVao);
+    const quad = new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]);
+    const qBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+
+    sprayInstBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, sprayInstBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, sprayGpuData.byteLength, gl.DYNAMIC_DRAW);
+    const stride = 48;
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0);  // pos.xyz, size
+    gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 16); // vel.xyz, alpha
+    gl.vertexAttribDivisor(2, 1);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 32); // seed, type, age, pad
+    gl.vertexAttribDivisor(3, 1);
+    gl.bindVertexArray(null);
+  }
+
+  function spawnSprayParticle(wx, wy, wz, vx, vy, vz, maxLife, size, type) {
+    const i = sprayCursor;
+    sprayCursor = (sprayCursor + 1) % MAX_SPRAY;
+    sprayPos[i * 3 + 0] = wx;
+    sprayPos[i * 3 + 1] = wy;
+    sprayPos[i * 3 + 2] = wz;
+    sprayVel[i * 3 + 0] = vx;
+    sprayVel[i * 3 + 1] = vy;
+    sprayVel[i * 3 + 2] = vz;
+    sprayLife[i] = maxLife;
+    sprayMaxLife[i] = maxLife;
+    spraySize[i] = size;
+    spraySeed[i] = Math.random() * 100.0;
+    sprayType[i] = type;
+  }
+
+  function triggerBowSprayBurst(strength) {
+    // Explosive, heavy sea-spray sheet erupting high over the flared bow & swept aft by the 45kt gale!
+    const numMist = Math.floor(155 + strength * 175);
+    const numDrops = Math.floor(320 + strength * 340);
+    const windSpeed = 18.0;
+
+    for (let k = 0; k < numMist; k++) {
+      // Concentrate strongly around the sharp bow stem & windward port-bow flare!
+      const u = (Math.random() - 0.56) * 2.0;
+      const lz = lerp(-31.0, -23.8, Math.pow(Math.min(1.0, Math.abs(u)), 0.85) * (0.55 + Math.random() * 0.45));
+      const sideSign = u < 0 ? -1 : 1;
+      const bw = hullHalfBeam(lz, DECK_Y + 0.9);
+      const lx = sideSign * bw * lerp(0.35, 1.15, Math.random());
+      const ly = DECK_Y + bulwarkHeightAtZ(lz) - 0.25 + Math.random() * 0.95;
+
+      const wp = m4TransformPoint(shipState.matrix, lx, ly, lz);
+      const fanOut = sideSign * (1.6 + Math.random() * 4.4) * (0.30 + Math.abs(u) * 0.7);
+      const upSpeed = (7.2 + Math.random() * 8.6) * (0.78 + strength * 0.42);
+      const vx = fanOut + WIND_DIR[0] * windSpeed * (0.28 + Math.random() * 0.38);
+      const vy = upSpeed;
+      const vz = (Math.random() - 0.2) * 2.6 + WIND_DIR[1] * windSpeed * (0.26 + Math.random() * 0.38);
+
+      spawnSprayParticle(
+        wp[0], wp[1], wp[2],
+        vx, vy, vz,
+        1.15 + Math.random() * 1.45,
+        0.75 + Math.random() * 1.35,
+        0.0
+      );
+    }
+
+    // Hundreds of crisp individual flying water droplets & whitewater splash arcs!
+    for (let k = 0; k < numDrops; k++) {
+      const u = (Math.random() - 0.55) * 2.0;
+      const lz = lerp(-31.0, -24.0, Math.min(1.0, Math.abs(u)) * (0.45 + Math.random() * 0.55));
+      const sideSign = u < 0 ? -1 : 1;
+      const bw = hullHalfBeam(lz, DECK_Y + 0.9);
+      const lx = sideSign * bw * lerp(0.30, 1.12, Math.random());
+      const ly = DECK_Y + bulwarkHeightAtZ(lz) - 0.05 + Math.random() * 0.9;
+      const wp = m4TransformPoint(shipState.matrix, lx, ly, lz);
+
+      const vx = sideSign * (2.2 + Math.random() * 5.8) + WIND_DIR[0] * (7.5 + Math.random() * 11);
+      const vy = (8.0 + Math.random() * 11.5) * (0.76 + strength * 0.42);
+      const vz = WIND_DIR[1] * (7.0 + Math.random() * 11) + (Math.random() - 0.15) * 3.8;
+
+      spawnSprayParticle(
+        wp[0], wp[1], wp[2],
+        vx, vy, vz,
+        0.90 + Math.random() * 1.15,
+        0.0055 + Math.random() * 0.0095, // Fine crisp flying water droplet width (ZERO glowing cigars!)
+        1.0
+      );
+    }
+
+    lensSprayImpulse = Math.min(1.0, lensSprayImpulse + strength * 0.60);
+  }
+
+  onBowSlamCallback = (strength) => {
+    triggerBowSprayBurst(strength);
+  };
+
+  let ambientSprayAccum = 0;
+  function updateSpray(dt, simTime) {
+    ambientSprayAccum += dt * (68 + shipState.bowSubmerge * 110);
+    while (ambientSprayAccum >= 1.0) {
+      ambientSprayAccum -= 1.0;
+      const side = Math.random() < 0.65 ? -1 : 1;
+      const lz = lerp(-31.0, -24.2, Math.pow(Math.random(), 1.25));
+      const ly = DECK_Y + bulwarkHeightAtZ(lz) - 0.35 + Math.random() * 0.80;
+      const lx = side * hullHalfBeam(lz, ly) * lerp(0.45, 1.06, Math.random());
+      const wp = m4TransformPoint(shipState.matrix, lx, ly, lz);
+      const isDrop = Math.random() < 0.62 ? 1.0 : 0.0;
+      spawnSprayParticle(
+        wp[0], wp[1], wp[2],
+        side * (1.2 + Math.random() * 2.8) + WIND_DIR[0] * (7.5 + Math.random() * 7.5),
+        4.8 + Math.random() * 6.8,
+        WIND_DIR[1] * (7.0 + Math.random() * 8.0) + SHIP_SPEED,
+        0.90 + Math.random() * 1.15,
+        isDrop > 0.5 ? (0.005 + Math.random() * 0.0085) : (0.62 + Math.random() * 1.05),
+        isDrop
+      );
+    }
+
+    const windGust = 1.0 + 0.28 * Math.sin(simTime * 0.9) + 0.16 * Math.sin(simTime * 2.3);
+    const windVX = WIND_DIR[0] * 19.5 * windGust;
+    const windVZ = WIND_DIR[1] * 19.5 * windGust + SHIP_SPEED;
+
+    let activeCount = 0;
+    for (let i = 0; i < MAX_SPRAY; i++) {
+      if (sprayLife[i] <= 0) continue;
+      sprayLife[i] -= dt;
+      if (sprayLife[i] <= 0) continue;
+
+      const idx3 = i * 3;
+      const isDrop = sprayType[i] > 0.5;
+      const drag = isDrop ? 0.55 : 2.10;
+      sprayVel[idx3 + 0] += (windVX - sprayVel[idx3 + 0]) * drag * dt;
+      sprayVel[idx3 + 2] += (windVZ - sprayVel[idx3 + 2]) * drag * dt;
+      sprayVel[idx3 + 1] -= (isDrop ? 11.4 : 5.2) * dt;
+
+      sprayPos[idx3 + 0] += sprayVel[idx3 + 0] * dt;
+      sprayPos[idx3 + 1] += sprayVel[idx3 + 1] * dt;
+      sprayPos[idx3 + 2] += sprayVel[idx3 + 2] * dt;
+
+      const age = 1.0 - sprayLife[i] / sprayMaxLife[i];
+      const alpha = smoothstep(0.0, 0.10, age) * (1.0 - smoothstep(0.25, 1.0, age));
+      const grow = isDrop ? 1.0 : (0.75 + age * 2.45);
+
+      const g = activeCount * 12;
+      sprayGpuData[g + 0] = sprayPos[idx3 + 0];
+      sprayGpuData[g + 1] = sprayPos[idx3 + 1];
+      sprayGpuData[g + 2] = sprayPos[idx3 + 2];
+      sprayGpuData[g + 3] = spraySize[i] * grow;
+
+      sprayGpuData[g + 4] = sprayVel[idx3 + 0];
+      sprayGpuData[g + 5] = sprayVel[idx3 + 1];
+      sprayGpuData[g + 6] = sprayVel[idx3 + 2];
+      sprayGpuData[g + 7] = alpha;
+
+      sprayGpuData[g + 8] = spraySeed[i];
+      sprayGpuData[g + 9] = sprayType[i];
+      sprayGpuData[g + 10] = age;
+      sprayGpuData[g + 11] = 0;
+      activeCount++;
+    }
+
+    if (activeCount > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, sprayInstBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, sprayGpuData.subarray(0, activeCount * 12));
+    }
+    lensSprayImpulse *= Math.exp(-dt * 0.55);
+    return activeCount;
+  }
+
+  // =========================================================================
+  // 10. 3D WIND-DRIVEN SIDEWAYS RAIN SYSTEM (6800 FINE CRISP STREAKS!)
+  // =========================================================================
+  const RAIN_COUNT = 7800;
+  function buildRainVAO() {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const quad = new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]);
+    const qBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+
+    const seeds = new Float32Array(RAIN_COUNT * 4);
+    for (let i = 0; i < RAIN_COUNT; i++) {
+      seeds[i * 4 + 0] = Math.random();
+      seeds[i * 4 + 1] = Math.random();
+      seeds[i * 4 + 2] = Math.random();
+      seeds[i * 4 + 3] = Math.random();
+    }
+    const sBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, sBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+    gl.vertexAttribDivisor(1, 1);
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  // =========================================================================
+  // 11. VOLUMETRIC FLOODLIGHT CONES
+  // =========================================================================
+  function buildLightConeVAO() {
+    const segs = 24;
+    const verts = [];
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * TAU, a1 = ((i + 1) / segs) * TAU;
+      const c0 = Math.cos(a0), s0 = Math.sin(a0);
+      const c1 = Math.cos(a1), s1 = Math.sin(a1);
+      const r0 = 0.06, r1 = 1.0;
+      verts.push(
+        c0 * r0, s0 * r0, 0, c0, s0, 0, 0,
+        c1 * r0, s1 * r0, 0, c1, s1, 0, 0,
+        c1 * r1, s1 * r1, -1, c1, s1, 0, 1,
+        c0 * r0, s0 * r0, 0, c0, s0, 0, 0,
+        c1 * r1, s1 * r1, -1, c1, s1, 0, 1,
+        c0 * r1, s0 * r1, -1, c0, s0, 0, 1
+      );
+    }
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 24);
+    gl.bindVertexArray(null);
+    return { vao, count: verts.length / 7 };
+  }
+
+  // =========================================================================
+  // 12. GLSL 300 ES SHADERS (UPGRADED FOR PHOTOREALISM!)
+  // =========================================================================
+  const COMMON_LIGHTING_GLSL = `
+    uniform vec3 uCamPos;
+    uniform float uTime;
+    uniform vec3 uLightningDir0;
+    uniform float uLightningInt0;
+    uniform vec3 uLightningDir1;
+    uniform float uLightningInt1;
+
+    uniform vec3 uFloodLPos;
+    uniform vec3 uFloodRPos;
+    uniform vec3 uFloodDir;
+    uniform vec3 uBowLampPos;
+    uniform vec3 uPortNavPos;
+    uniform vec3 uStbdNavPos;
+    uniform vec3 uBridgeGlowPos;
+
+    vec3 evalStormFogColor(vec3 rd) {
+      float up = clamp(rd.y, 0.0, 1.0);
+      vec3 baseFog = mix(vec3(0.018, 0.036, 0.062), vec3(0.006, 0.013, 0.028), smoothstep(0.0, 0.35, up));
+      vec3 moonDir = normalize(vec3(-0.32, 0.26, -0.90));
+      float mGlow = pow(max(dot(rd, moonDir), 0.0), 5.0) * 0.036;
+      baseFog += vec3(0.38, 0.56, 0.78) * mGlow;
+      // Tightly localized horizon flash under the lightning strike (NEVER milky whiteout!)
+      float l0 = (0.06 + 0.94 * pow(max(dot(rd, uLightningDir0), 0.0), 6.0)) * uLightningInt0;
+      float l1 = (0.06 + 0.94 * pow(max(dot(rd, uLightningDir1), 0.0), 6.0)) * uLightningInt1;
+      baseFog += vec3(0.24, 0.40, 0.72) * (l0 + l1) * 0.16;
+      return baseFog;
+    }
+
+    float spotAtten(vec3 toFrag, vec3 spotDir, float range) {
+      float d = length(toFrag);
+      vec3 ldir = toFrag / max(d, 0.001);
+      float cone = smoothstep(0.45, 0.88, dot(ldir, spotDir));
+      float distAtt = 1.0 / (1.0 + d * d * (1.0 / (range * range * 0.14)));
+      return cone * distAtt * smoothstep(range, range * 0.38, d);
+    }
+
+    float pointAtten(float d, float radius) {
+      float a = 1.0 / (1.0 + (d * d) / (radius * radius * 0.08));
+      return a * smoothstep(radius, radius * 0.24, d);
+    }
+  `;
+
+  // --- 12A. DRAMATIC VOLUMETRIC THUNDERHEAD SKY + INTERNAL LIGHTNING ILLUMINATION ---
+  const skyVS = `#version 300 es
+    out vec2 vNdc;
+    void main() {
+      vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+      vNdc = p * 2.0 - 1.0;
+      gl_Position = vec4(vNdc, 0.9999, 1.0);
+    }
+  `;
+
+  const skyFS = `#version 300 es
+    precision highp float;
+    in vec2 vNdc;
+    out vec4 fragColor;
+
+    uniform mat4 uInvVP;
+    uniform sampler2D uNoiseTex;
+    ${COMMON_LIGHTING_GLSL}
+
+    // High-contrast turbulent storm cumulonimbus density with dramatic rifts & anvil bellies!
+    float cloudDensity(vec3 p) {
+      vec2 wind = vec2(0.74, 0.67) * uTime * 36.0;
+      vec2 uv1 = (p.xz - wind) * 0.00022;
+      vec2 uv2 = (p.xz - wind * 1.55) * 0.00062 + vec2(0.29, 0.17);
+      vec2 uv3 = (p.xz - wind * 2.10) * 0.00145 + vec2(0.61, 0.43);
+
+      vec4 n1 = texture(uNoiseTex, uv1);
+      vec4 n2 = texture(uNoiseTex, uv2);
+      float n3 = texture(uNoiseTex, uv3).b;
+
+      float h = clamp((p.y - 480.0) / 1520.0, 0.0, 1.0);
+      // Flat brooding storm shelf at bottom, towering billowing thunderheads above
+      float hShape = smoothstep(0.0, 0.14, h) * (1.0 - smoothstep(0.50, 1.0, h));
+
+      // Carve deep dark storm bands & dramatic moonlit rifts between towering cumulonimbus masses
+      float macro = n1.g * 0.62 + n1.r * 0.38;
+      float billows = n2.g * 0.58 + n2.b * 0.42;
+      float coverage = smoothstep(0.24, 0.78, macro);
+      float d = coverage * hShape - (1.0 - billows) * 0.36 * (0.35 + 0.65 * h) - (1.0 - n3) * 0.12;
+      return clamp(d * 2.6, 0.0, 1.0);
+    }
+
+    void main() {
+      vec4 wp0 = uInvVP * vec4(vNdc, -1.0, 1.0);
+      vec4 wp1 = uInvVP * vec4(vNdc,  1.0, 1.0);
+      vec3 rd = normalize(wp1.xyz / wp1.w - wp0.xyz / wp0.w);
+
+      // Deep nocturnal storm sky behind the clouds (silver-blue moon glow in cloud rifts!)
+      float up = max(rd.y, 0.0);
+      vec3 skyCol = mix(vec3(0.032, 0.058, 0.095), vec3(0.008, 0.017, 0.036), pow(up, 0.55));
+
+      vec3 moonDir = normalize(vec3(-0.32, 0.28, -0.90));
+      float mCos = max(dot(rd, moonDir), 0.0);
+      skyCol += vec3(0.32, 0.48, 0.70) * pow(mCos, 5.0) * 0.36;
+      skyCol += vec3(0.75, 0.88, 1.0) * pow(mCos, 38.0) * 0.45;
+
+      // Internal 3D lightning core positions inside the thunderhead deck!
+      vec3 lPos0 = uLightningDir0 * 2400.0;
+      lPos0.y = clamp(lPos0.y, 700.0, 1360.0);
+      vec3 lPos1 = uLightningDir1 * 2550.0;
+      lPos1.y = clamp(lPos1.y, 740.0, 1420.0);
+
+      if (rd.y > 0.008) {
+        // Curved atmospheric shell intersection for realistic horizon perspective!
+        float raySlope = max(rd.y, 0.065);
+        float tMin = min(480.0 / raySlope, 7500.0);
+        float tMax = min(2000.0 / raySlope, 16500.0);
+
+        const int STEPS = 22;
+        float dt = (tMax - tMin) / float(STEPS);
+        // Smooth Interleaved Gradient Noise (eliminates visible dithering grain in clouds!)
+        float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float t = tMin + dt * jitter;
+
+        float transmittance = 1.0;
+        vec3 accumLight = vec3(0.0);
+        float moonPhase = 0.22 + 0.78 * pow(mCos, 3.8);
+
+        for (int i = 0; i < STEPS; i++) {
+          vec3 p = vec3(0.0, 10.0, 0.0) + rd * t;
+          float dens = cloudDensity(p);
+          if (dens > 0.006) {
+            float hNorm = clamp((p.y - 480.0) / 1520.0, 0.0, 1.0);
+
+            // Directional self-shadowing toward moon/top for dramatic 3D billowy storm relief!
+            float upDens = cloudDensity(p + moonDir * 240.0 + vec3(0.0, 160.0, 0.0));
+            float moonShadow = exp(-upDens * 2.6);
+            // Dark menacing charcoal-indigo thunderhead bellies vs silver-slate moon-rimmed tops!
+            vec3 bellyCol = vec3(0.007, 0.012, 0.022);
+            vec3 rimCol   = vec3(0.072, 0.115, 0.175);
+            vec3 light = mix(bellyCol, rimCol, clamp(hNorm * 0.62 + moonShadow * 0.55, 0.0, 1.0));
+            float silverEdge = (1.0 - exp(-dens * 3.0)) * moonShadow * moonPhase;
+            light += vec3(0.30, 0.45, 0.66) * silverEdge * 0.52;
+
+            // DRAMATIC LOCALIZED INTERNAL LIGHTNING SCATTERING — thunderheads glow incandescent INSIDE
+            // while thick foreground storm bellies carve razor-sharp dark silhouettes in front!
+            if (uLightningInt0 > 0.01) {
+              vec3 toL = lPos0 - p;
+              float distL = length(toL);
+              float att = 1.0 / (1.0 + (distL * distL) * 0.00000105);
+              float occ1 = cloudDensity(mix(p, lPos0, 0.26));
+              float occ2 = cloudDensity(mix(p, lPos0, 0.58));
+              // Dense foreground clouds block the inner core -> epic backlit thunderhead drama!
+              float innerTrans = exp(-(occ1 + occ2) * 2.45) * (0.14 + 0.86 * exp(-dens * 1.55));
+              vec3 lCol = mix(vec3(0.32, 0.48, 0.98), vec3(0.92, 0.96, 1.0), exp(-distL * 0.00095));
+              light += lCol * uLightningInt0 * att * innerTrans * 6.5;
+            }
+            if (uLightningInt1 > 0.01) {
+              vec3 toL = lPos1 - p;
+              float distL = length(toL);
+              float att = 1.0 / (1.0 + (distL * distL) * 0.00000105);
+              float occ1 = cloudDensity(mix(p, lPos1, 0.28));
+              float innerTrans = exp(-occ1 * 2.9) * (0.14 + 0.86 * exp(-dens * 1.55));
+              vec3 lCol = mix(vec3(0.30, 0.46, 0.96), vec3(0.90, 0.95, 1.0), exp(-distL * 0.00095));
+              light += lCol * uLightningInt1 * att * innerTrans * 5.8;
+            }
+
+            float sigma = dens * dt * 0.00074;
+            float stepTrans = exp(-sigma);
+            accumLight += transmittance * light * (1.0 - stepTrans);
+            transmittance *= stepTrans;
+            if (transmittance < 0.02) break;
+          }
+          t += dt;
+        }
+
+        float horizonFade = smoothstep(0.008, 0.11, rd.y);
+        vec3 cloudFinal = skyCol * transmittance + accumLight;
+        skyCol = mix(evalStormFogColor(rd), cloudFinal, horizonFade);
+      } else {
+        skyCol = evalStormFogColor(rd);
+      }
+
+      // Localized subtle in-cloud glow halo behind foreground thunderheads (keeps surrounding sky dark!)
+      if (uLightningInt0 > 0.01) {
+        float ang = max(dot(rd, uLightningDir0), 0.0);
+        skyCol += vec3(0.36, 0.54, 1.0) * pow(ang, 22.0) * uLightningInt0 * 0.34 * smoothstep(-0.01, 0.14, rd.y);
+      }
+      if (uLightningInt1 > 0.01) {
+        float ang = max(dot(rd, uLightningDir1), 0.0);
+        skyCol += vec3(0.34, 0.50, 1.0) * pow(ang, 22.0) * uLightningInt1 * 0.28 * smoothstep(-0.01, 0.14, rd.y);
+      }
+
+      fragColor = vec4(skyCol, 1.0);
+    }
+  `;
+
+  // --- 12B. FORKED LIGHTNING BOLT SHADER ---
+  const boltVS = `#version 300 es
+    layout(location=0) in vec3 aPos;
+    layout(location=1) in vec2 aUv;
+    layout(location=2) in float aBright;
+    uniform mat4 uVP;
+    out vec2 vUv;
+    out float vBright;
+    void main() {
+      vUv = aUv;
+      vBright = aBright;
+      gl_Position = uVP * vec4(aPos, 1.0);
+    }
+  `;
+
+  const boltFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    in float vBright;
+    uniform float uBoltIntensity;
+    out vec4 fragColor;
+    void main() {
+      float distFromCenter = abs(vUv.x - 0.5) * 2.0;
+      float core = exp(-distFromCenter * distFromCenter * 28.0);
+      float halo = exp(-distFromCenter * 3.6) * 0.55;
+      vec3 col = mix(vec3(0.42, 0.64, 1.0), vec3(1.0, 0.99, 1.0), core);
+      float alpha = (core * 1.5 + halo) * vBright * uBoltIntensity;
+      fragColor = vec4(col * alpha * 4.5, clamp(alpha, 0.0, 1.0));
+    }
+  `;
+
+  // --- 12C. PHOTOREALISTIC GERSTNER STORM OCEAN SHADER ---
+  const oceanVS = `#version 300 es
+    layout(location=0) in vec3 aGrid;
+
+    uniform mat4 uVP;
+    uniform vec4 uWaveA[16];
+    uniform vec4 uWaveB[16];
+
+    out vec3 vWorldPos;
+    out vec3 vNormal;
+    out vec2 vBaseXZ;
+    out float vFoamCrest;
+    out float vCrestHeight;
+
+    void main() {
+      vec2 xz = aGrid.xy;
+      float distFade = 1.0 - smoothstep(450.0, 2200.0, length(xz));
+
+      vec3 pos = vec3(xz.x, 0.0, xz.y);
+      vec3 tX = vec3(1.0, 0.0, 0.0);
+      vec3 tZ = vec3(0.0, 0.0, 1.0);
+
+      for (int i = 0; i < 16; i++) {
+        vec4 wa = uWaveA[i];
+        vec4 wb = uWaveB[i];
+        float wFade = (i >= 10) ? distFade : 1.0;
+        float amp = wa.w * wFade;
+        float qAmp = wb.x * wFade;
+        float k = wa.z;
+        float qKA = wb.w * wFade;
+
+        float th = k * (wa.x * xz.x + wa.y * xz.y) + wb.y;
+        float s = sin(th);
+        float c = cos(th);
+
+        pos.x += qAmp * wa.x * c;
+        pos.z += qAmp * wa.y * c;
+        pos.y += amp * s;
+
+        float kaC = k * amp * c;
+        tX.x -= qKA * wa.x * wa.x * s;
+        tX.z -= qKA * wa.x * wa.y * s;
+        tX.y += kaC * wa.x;
+
+        tZ.x -= qKA * wa.y * wa.x * s;
+        tZ.z -= qKA * wa.y * wa.y * s;
+        tZ.y += kaC * wa.y;
+      }
+
+      float J = tX.x * tZ.z - tX.z * tZ.x;
+      vFoamCrest = clamp(1.0 - J, 0.0, 1.5);
+      vCrestHeight = pos.y;
+      vWorldPos = pos;
+      vBaseXZ = xz;
+      vNormal = normalize(cross(tZ, tX));
+
+      gl_Position = uVP * vec4(pos, 1.0);
+    }
+  `;
+
+  const oceanFS = `#version 300 es
+    precision highp float;
+    in vec3 vWorldPos;
+    in vec3 vNormal;
+    in vec2 vBaseXZ;
+    in float vFoamCrest;
+    in float vCrestHeight;
+    out vec4 fragColor;
+
+    uniform mat4 uShipInv;
+    uniform float uShipTravelZ;
+    uniform sampler2D uNoiseTex;
+    uniform sampler2D uWaveNormalTex;
+    ${COMMON_LIGHTING_GLSL}
+
+    float hullHalfBeamGLSL(float z, float y) {
+      if (z < -31.1 || z > 29.1) return 0.0;
+      float t;
+      if (z < -6.0) {
+        t = clamp((z + 31.0) / 25.0, 0.0, 1.0);
+        t = pow(t, 0.58);
+      } else if (z < 17.0) {
+        t = 1.0;
+      } else {
+        float u = clamp((z - 17.0) / 12.0, 0.0, 1.0);
+        t = 1.0 - 0.24 * u * u;
+      }
+      float maxB = 5.65 * t;
+      float yNorm = clamp((y + 3.6) / 8.3, 0.001, 1.35);
+      float prof = pow(clamp(yNorm, 0.001, 1.0), 0.36);
+      if (y > 4.70) {
+        float bowF = smoothstep(-10.0, -30.5, z);
+        prof += (y - 4.70) * (0.04 + 0.14 * bowF);
+      }
+      return maxB * prof;
+    }
+
+    vec3 sampleNightSkyRefl(vec3 r) {
+      float up = max(r.y, 0.0);
+      vec3 sky = mix(vec3(0.032, 0.062, 0.102), vec3(0.009, 0.020, 0.042), pow(up, 0.55));
+      vec2 wind = vec2(0.74, 0.67) * uTime * 0.018;
+      vec2 cuv = r.xz / (up + 0.22) * 0.16 - wind;
+      float cld = texture(uNoiseTex, cuv).g;
+      sky *= mix(0.55, 1.45, cld);
+
+      vec3 moonDir = normalize(vec3(-0.32, 0.28, -0.90));
+      float mCos = max(dot(r, moonDir), 0.0);
+      sky += vec3(0.38, 0.54, 0.76) * pow(mCos, 7.0) * 0.34;
+      sky += vec3(0.88, 0.95, 1.0) * pow(mCos, 85.0) * 0.65;
+
+      if (uLightningInt0 > 0.01) {
+        float lCos = max(dot(r, uLightningDir0), 0.0);
+        sky += vec3(0.44, 0.66, 1.0) * (0.06 + pow(lCos, 6.0) * 0.85 + pow(lCos, 45.0) * 2.2) * uLightningInt0 * (0.55 + 0.65 * cld);
+      }
+      if (uLightningInt1 > 0.01) {
+        float lCos = max(dot(r, uLightningDir1), 0.0);
+        sky += vec3(0.42, 0.62, 1.0) * (0.05 + pow(lCos, 6.0) * 0.75 + pow(lCos, 45.0) * 1.9) * uLightningInt1 * (0.55 + 0.65 * cld);
+      }
+      return sky;
+    }
+
+    float ggxSpec(vec3 N, vec3 V, vec3 L, float rough) {
+      vec3 H = normalize(V + L);
+      float ndh = max(dot(N, H), 0.0);
+      float a = rough * rough;
+      float a2 = a * a;
+      float denom = ndh * ndh * (a2 - 1.0) + 1.0;
+      return (a2 / (3.14159 * denom * denom + 0.0001)) * max(dot(N, L), 0.0);
+    }
+
+    void main() {
+      vec3 sp = (uShipInv * vec4(vWorldPos, 1.0)).xyz;
+      float hb = hullHalfBeamGLSL(sp.z, sp.y);
+      float hullDist = 99.0;
+      if (sp.z > -32.0 && sp.z < 30.0) {
+        if (abs(sp.x) < hb - 0.14 && sp.y < 6.45) {
+          discard;
+        }
+        float dx = max(abs(sp.x) - hb, 0.0);
+        float dz = max(max(-31.0 - sp.z, sp.z - 29.0), 0.0);
+        hullDist = length(vec2(dx, dz));
+      }
+
+      vec3 V = normalize(uCamPos - vWorldPos);
+      float camDist = length(uCamPos - vWorldPos);
+
+      vec2 worldUV = vBaseXZ + vec2(0.0, -uShipTravelZ);
+      vec2 windDir = vec2(0.74, 0.67);
+      vec2 crossWind = vec2(-windDir.y, windDir.x);
+
+      vec2 uvA = worldUV * 0.055 - windDir * uTime * 0.24;
+      vec2 uvB = (mat2(0.82, -0.57, 0.57, 0.82) * worldUV) * 0.145 - windDir * uTime * 0.44;
+      vec2 uvC = (mat2(0.45, 0.89, -0.89, 0.45) * worldUV) * 0.36 - windDir * uTime * 0.72;
+
+      vec2 gA = (texture(uWaveNormalTex, uvA).rg * 2.0 - 1.0);
+      vec2 gB = (texture(uWaveNormalTex, uvB).rg * 2.0 - 1.0);
+      vec2 gC = (texture(uWaveNormalTex, uvC).rg * 2.0 - 1.0);
+
+      float detailAtten = 1.0 - smoothstep(55.0, 880.0, camDist);
+      vec2 microGrad = (gA * 0.34 + gB * 0.26 + gC * 0.18 * detailAtten);
+      vec3 N = normalize(vNormal + vec3(microGrad.x, 0.0, microGrad.y) * 0.64);
+      if (dot(N, V) < 0.0) N = normalize(N - V * (dot(N, V) - 0.02));
+
+      float ndv = max(dot(N, V), 0.001);
+      float fresnel = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+
+      // Rich deep-abyssal indigo troughs -> glowing cold sea-green crests!
+      vec3 deepWater = vec3(0.004, 0.016, 0.028);
+      vec3 shallowTeal = vec3(0.015, 0.072, 0.074);
+      vec3 waterBody = mix(deepWater, shallowTeal, smoothstep(-0.8, 4.0, vCrestHeight));
+
+      // Subsurface Scattering in backlit thin storm crests
+      vec3 moonDir = normalize(vec3(-0.32, 0.28, -0.90));
+      float crestThin = smoothstep(0.5, 4.4, vCrestHeight) * smoothstep(0.30, 1.0, 1.0 - N.y + vFoamCrest * 0.55);
+      float sssMoon = pow(clamp(dot(V, -moonDir + N * 0.45), 0.0, 1.0), 3.0) * 0.38 + 0.20;
+      float sssLight0 = (0.35 + 0.65 * pow(clamp(dot(V, -uLightningDir0 + N * 0.4), 0.0, 1.0), 2.5)) * uLightningInt0;
+      float sssLight1 = (0.35 + 0.65 * pow(clamp(dot(V, -uLightningDir1 + N * 0.4), 0.0, 1.0), 2.5)) * uLightningInt1;
+      vec3 sssCol = vec3(0.032, 0.26, 0.23) * crestThin * (sssMoon * 0.60 + (sssLight0 + sssLight1) * 0.95);
+
+      vec3 R = reflect(-V, N);
+      R.y = max(R.y, 0.01);
+      vec3 skyRefl = sampleNightSkyRefl(R);
+
+      vec3 waterCol = mix(waterBody + sssCol, skyRefl, clamp(fresnel * 1.18, 0.02, 0.96));
+
+      float specRough = mix(0.10, 0.25, smoothstep(80.0, 900.0, camDist));
+      waterCol += vec3(0.58, 0.76, 0.98) * ggxSpec(N, V, moonDir, specRough + 0.05) * 0.18;
+      if (uLightningInt0 > 0.01) {
+        waterCol += vec3(0.76, 0.90, 1.0) * ggxSpec(N, V, uLightningDir0, specRough) * uLightningInt0 * 1.25;
+      }
+      if (uLightningInt1 > 0.01) {
+        waterCol += vec3(0.72, 0.86, 1.0) * ggxSpec(N, V, uLightningDir1, specRough) * uLightningInt1 * 1.10;
+      }
+
+      // Practical ship lights casting warm/red/green trails across dark rolling waves!
+      vec3 toFL = uFloodLPos - vWorldPos;
+      float attFL = spotAtten(-toFL, uFloodDir, 60.0);
+      vec3 lFL = normalize(toFL);
+      waterCol += vec3(1.0, 0.66, 0.32) * (ggxSpec(N, V, lFL, 0.20) * 1.4 + max(dot(N, lFL), 0.0) * 0.12) * attFL * 1.5;
+
+      vec3 toFR = uFloodRPos - vWorldPos;
+      float attFR = spotAtten(-toFR, uFloodDir, 60.0);
+      vec3 lFR = normalize(toFR);
+      waterCol += vec3(1.0, 0.66, 0.32) * (ggxSpec(N, V, lFR, 0.20) * 1.4 + max(dot(N, lFR), 0.0) * 0.12) * attFR * 1.5;
+
+      vec3 toBow = uBowLampPos - vWorldPos;
+      float attBow = pointAtten(length(toBow), 28.0);
+      vec3 lBow = normalize(toBow);
+      waterCol += vec3(1.0, 0.80, 0.52) * (ggxSpec(N, V, lBow, 0.22) * 1.0 + max(dot(N, lBow), 0.0) * 0.14) * attBow * 1.15;
+
+      vec3 toP = uPortNavPos - vWorldPos;
+      float attP = pointAtten(length(toP), 38.0) * smoothstep(2.0, -4.0, sp.x);
+      waterCol += vec3(1.0, 0.10, 0.04) * (ggxSpec(N, V, normalize(toP), 0.22) * 1.25 + 0.10) * attP * 1.45;
+
+      vec3 toS = uStbdNavPos - vWorldPos;
+      float attS = pointAtten(length(toS), 38.0) * smoothstep(-2.0, 4.0, sp.x);
+      waterCol += vec3(0.05, 1.0, 0.38) * (ggxSpec(N, V, normalize(toS), 0.22) * 1.25 + 0.10) * attS * 1.45;
+
+      // WHITECAPS, LACY BREAKING CRESTS, PROMINENT WIND-BLOWN FOAM STREAKS & BOW BOIL!
+      vec2 windSpace = vec2(dot(worldUV, windDir), dot(worldUV, crossWind));
+      vec2 warp = (texture(uNoiseTex, worldUV * 0.015).rg - 0.5) * 0.28;
+      // 7:1 wind-stretched Langmuir / spindrift foam streaks streaming downwind across waves!
+      vec2 streakUV1 = vec2(windSpace.x * 0.009 - uTime * 0.055, windSpace.y * 0.082) + warp;
+      vec2 streakUV2 = vec2(windSpace.x * 0.022 - uTime * 0.088, windSpace.y * 0.175 + 0.37) + warp * 0.6;
+      float sN1 = texture(uNoiseTex, streakUV1).r;
+      float sN2 = texture(uNoiseTex, streakUV2).a;
+
+      float laceA = texture(uNoiseTex, worldUV * 0.088 - windDir * uTime * 0.04).a;
+      float laceB = texture(uNoiseTex, worldUV * 0.25 - windDir * uTime * 0.065).a;
+      float foamLace = clamp(laceA * 0.62 + laceB * 0.56, 0.0, 1.0);
+
+      // (a) Thick, frothy breaking whitecaps tearing off steep storm crests
+      float crestMask = smoothstep(0.24, 0.80, vFoamCrest + smoothstep(1.1, 4.2, vCrestHeight) * 0.42);
+      float whitecap = smoothstep(0.18, 0.68, crestMask * (0.58 + 0.82 * foamLace));
+
+      // (b) Prominent wind-driven spindrift foam streaks streaming down wave backs & troughs
+      float streakRibbons = smoothstep(0.46, 0.80, sN1 * 0.68 + sN2 * 0.50);
+      float foamStreaks = streakRibbons * (0.38 + 0.72 * foamLace) * (0.52 + 0.48 * smoothstep(-1.2, 3.0, vCrestHeight));
+
+      // (c) Churning white bow wave & foaming hull wake
+      float hullFoamMask = exp(-hullDist * 0.38) * smoothstep(32.0, -30.0, sp.z);
+      float wakeSpread = max(0.0, sp.z - 26.0) * 0.18;
+      float sternWake = smoothstep(25.0, 32.0, sp.z) * exp(-max(0.0, abs(sp.x) - (3.8 + wakeSpread)) * 0.30) * exp(-max(0.0, sp.z - 29.0) * 0.018);
+      float shipFoam = clamp((hullFoamMask * 1.25 + sternWake * 0.80) * (0.48 + 0.75 * foamLace), 0.0, 1.0);
+
+      float totalFoam = clamp(max(whitecap, foamStreaks * 0.82) + shipFoam, 0.0, 1.0);
+      totalFoam *= mix(1.0, 0.62, smoothstep(260.0, 1600.0, camDist));
+
+      if (totalFoam > 0.005) {
+        float nUp = 0.55 + 0.45 * max(N.y, 0.0);
+        vec3 foamLight = vec3(0.095, 0.140, 0.195) * nUp;
+        foamLight += vec3(0.48, 0.65, 0.88) * max(dot(N, moonDir), 0.0) * 0.22;
+        foamLight += vec3(0.76, 0.90, 1.0) * (0.45 + 0.55 * max(dot(N, uLightningDir0), 0.0)) * uLightningInt0 * 0.95;
+        foamLight += vec3(0.72, 0.86, 1.0) * (0.45 + 0.55 * max(dot(N, uLightningDir1), 0.0)) * uLightningInt1 * 0.85;
+        foamLight += vec3(1.0, 0.68, 0.35) * (attFL + attFR) * 1.45;
+        foamLight += vec3(1.0, 0.82, 0.55) * attBow * 1.15;
+        foamLight += vec3(1.0, 0.12, 0.05) * attP * 1.25;
+        foamLight += vec3(0.08, 1.0, 0.40) * attS * 1.25;
+
+        vec3 foamAlbedo = mix(vec3(0.64, 0.80, 0.84), vec3(0.96, 0.98, 1.0), totalFoam);
+        waterCol = mix(waterCol, foamAlbedo * foamLight, totalFoam * 0.92);
+      }
+
+      float fogAmt = 1.0 - exp(-camDist * 0.00142);
+      fogAmt = clamp(fogAmt + smoothstep(140.0, 950.0, camDist) * 0.20, 0.0, 0.97);
+      vec3 fogCol = evalStormFogColor(-V);
+      vec3 finalCol = mix(waterCol, fogCol, fogAmt);
+
+      fragColor = vec4(finalCol, 1.0);
+    }
+  `;
+
+  // --- 12D. WET SHIP & MIRROR-PUDDLE REFLECTIVE DECK PBR SHADER ---
+  const shipVS = `#version 300 es
+    layout(location=0) in vec3 aPos;
+    layout(location=1) in vec3 aNorm;
+    layout(location=2) in vec2 aUv;
+    layout(location=3) in vec4 aMat;
+
+    uniform mat4 uModel;
+    uniform mat4 uVP;
+
+    out vec3 vWorldPos;
+    out vec3 vLocalPos;
+    out vec3 vNormal;
+    out vec2 vUv;
+    out vec4 vMat;
+
+    void main() {
+      vec4 wp = uModel * vec4(aPos, 1.0);
+      vWorldPos = wp.xyz;
+      vLocalPos = aPos;
+      vNormal = normalize(mat3(uModel) * aNorm);
+      vUv = aUv;
+      vMat = aMat;
+      gl_Position = uVP * wp;
+    }
+  `;
+
+  const shipFS = `#version 300 es
+    precision highp float;
+    in vec3 vWorldPos;
+    in vec3 vLocalPos;
+    in vec3 vNormal;
+    in vec2 vUv;
+    in vec4 vMat;
+    out vec4 fragColor;
+
+    uniform float uIsReflectionPass;
+    uniform float uClipDeckY;
+    uniform vec2 uResolution;
+    uniform sampler2D uNoiseTex;
+    uniform sampler2D uWaveNormalTex;
+    uniform sampler2D uReflTex;
+    uniform float uBeaconPulse;
+    ${COMMON_LIGHTING_GLSL}
+
+    // Concentric expanding raindrop impact ripples on wet deck puddles!
+    vec2 rainRippleGrad(vec2 p, float t) {
+      vec2 grad = vec2(0.0);
+      for (int layer = 0; layer < 2; layer++) {
+        float scale = (layer == 0) ? 1.85 : 3.1;
+        float speed = (layer == 0) ? 2.1 : 2.8;
+        vec2 g = p * scale;
+        vec2 cell = floor(g);
+        vec2 f = fract(g);
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dx = -1; dx <= 1; dx++) {
+            vec2 nb = vec2(float(dx), float(dy));
+            vec2 id = cell + nb;
+            vec3 rnd = fract(sin(vec3(dot(id, vec2(127.1, 311.7)), dot(id, vec2(269.5, 183.3)), dot(id, vec2(419.2, 371.9)))) * 43758.5453);
+            float phase = fract(t * speed * (0.65 + 0.55 * rnd.z) + rnd.z * 7.0);
+            vec2 center = nb + 0.15 + 0.70 * rnd.xy;
+            vec2 d = f - center;
+            float dist = length(d);
+            float radius = phase * 0.70;
+            float ringDist = dist - radius;
+            float envelope = exp(-ringDist * ringDist * 130.0) * (1.0 - phase) * smoothstep(0.0, 0.08, phase);
+            float wave = sin(ringDist * 38.0) * envelope;
+            grad += (d / max(dist, 0.001)) * wave * 0.34;
+          }
+        }
+      }
+      return grad;
+    }
+
+    // Analytical contact ambient occlusion on the wet deck around hatch, windlass & deckhouse!
+    float deckContactAO(vec2 xz) {
+      float ao = 1.0;
+      // Cargo hatch footprint: x in [-2.27, 2.27], z in [-11.72, -1.28]
+      vec2 dHatch = max(abs(xz - vec2(0.0, -6.5)) - vec2(2.27, 5.22), 0.0);
+      ao *= mix(0.22, 1.0, smoothstep(0.0, 0.72, length(dHatch)));
+      // Windlass bedplate footprint: x in [-1.52, 1.52], z in [-25.42, -24.18]
+      vec2 dWind = max(abs(xz - vec2(0.0, -24.8)) - vec2(1.52, 0.62), 0.0);
+      ao *= mix(0.24, 1.0, smoothstep(0.0, 0.55, length(dWind)));
+      // Superstructure forward bulkhead: x in [-4.38, 4.38], z > 4.72
+      vec2 dHouse = max(abs(xz - vec2(0.0, 12.5)) - vec2(4.38, 7.78), 0.0);
+      ao *= mix(0.20, 1.0, smoothstep(0.0, 0.95, length(dHouse)));
+      return ao;
+    }
+
+    float ggxD(float ndh, float rough) {
+      float a = max(rough * rough, 0.004);
+      float a2 = a * a;
+      float d = ndh * ndh * (a2 - 1.0) + 1.0;
+      return a2 / (3.14159 * d * d + 0.0001);
+    }
+
+    vec3 pbrLight(vec3 N, vec3 V, vec3 L, vec3 lCol, vec3 albedo, float rough, float metal) {
+      float ndl = max(dot(N, L), 0.0);
+      if (ndl <= 0.0) return vec3(0.0);
+      vec3 H = normalize(V + L);
+      float ndh = max(dot(N, H), 0.0);
+      float hdv = max(dot(H, V), 0.0);
+      vec3 F0 = mix(vec3(0.035), albedo, metal);
+      vec3 F = F0 + (1.0 - F0) * pow(1.0 - hdv, 5.0);
+      float D = ggxD(ndh, rough);
+      float G = 1.0 / (max(dot(N, V), 0.05) + ndl + 0.25);
+      vec3 spec = D * F * G * 0.45;
+      vec3 diff = (1.0 - F) * (1.0 - metal) * albedo / 3.14159;
+      return (diff + spec) * lCol * ndl;
+    }
+
+    void main() {
+      if (uIsReflectionPass > 0.5 && vLocalPos.y < uClipDeckY) {
+        discard;
+      }
+
+      int matId = int(vMat.x + 0.5);
+      float rough = vMat.y;
+      float metal = vMat.z;
+      float ao = vMat.w;
+
+      // Material 6: Photographic nocturnal wheelhouse windows & portholes (corrected vertical/horizontal UV,
+      // varied interior lighting per pane, dark ceiling overhang, helm silhouette, subtle cyan radar screens & wipers!)
+      if (matId == 6) {
+        vec3 N = normalize(vNormal);
+        vec3 V = normalize(uCamPos - vWorldPos);
+        float glassFresnel = 0.05 + 0.95 * pow(1.0 - max(dot(N, V), 0.0), 4.0);
+        float isPorthole = step(vLocalPos.y, 7.6);
+
+        if (isPorthole > 0.5) {
+          vec3 portholeCol = mix(vec3(0.95, 0.42, 0.09), vec3(1.0, 0.72, 0.32), 0.60);
+          fragColor = vec4(portholeCol * 1.38, 1.0);
+          return;
+        }
+
+        // addQuad maps vUv.x = vertical (0 bottom -> 1 top) and vUv.y = horizontal (0 left -> 1 right)!
+        float wx = vUv.y;
+        float wy = vUv.x;
+        // Identify each of the 7 panes uniquely so no two windows look cloned!
+        float paneId = floor((vLocalPos.x + 4.0) * 1.02);
+        float paneRnd = fract(sin(paneId * 91.7 + 13.4) * 43758.5453);
+        float centerBias = 1.0 - smoothstep(0.0, 3.8, abs(vLocalPos.x));
+
+        // Crisp dark window mullion recess
+        float frameMask = smoothstep(0.0, 0.07, wx) * smoothstep(1.0, 0.93, wx)
+                        * smoothstep(0.0, 0.08, wy) * smoothstep(1.0, 0.92, wy);
+
+        // Dark wheelhouse ceiling overhang in top 32%, warm ambient chartroom light in lower-middle!
+        float ceilingShade = smoothstep(0.95, 0.48, wy);
+        float lowerConsole = smoothstep(0.05, 0.34, wy);
+
+        // Unique per-pane interior silhouettes (helmsman/compass near center, chart desk & bulkhead consoles off-center)
+        float worldX = vLocalPos.x;
+        float consoleH = 0.24 + 0.14 * sin(worldX * 1.7 + 0.5) + 0.08 * paneRnd;
+        float consoleBlock = smoothstep(consoleH + 0.04, consoleH - 0.03, wy);
+        // Subtle standing watch-officer / center helm binnacle silhouette in pane near x = -0.3..+0.4
+        float watchSil = smoothstep(0.32, 0.12, abs(worldX - 0.12)) * smoothstep(0.76, 0.42, wy);
+
+        // Vary luminance naturally across the 7 panes (warmer & brighter at center bridge console, dimmer at wings!)
+        float paneBright = mix(0.42, 1.18, centerBias * 0.72 + paneRnd * 0.28);
+        vec3 warmDark = vec3(0.24, 0.08, 0.02);
+        vec3 warmAmber = vec3(1.00, 0.50, 0.14);
+        vec3 interior = mix(warmDark, warmAmber, clamp(ceilingShade * (0.40 + 0.60 * lowerConsole), 0.0, 1.0));
+        interior *= (1.0 - consoleBlock * 0.58) * (1.0 - watchSil * 0.65);
+
+        // Subtle glowing cyan/emerald marine radar & ECDIS screens on panes 2 & 4 (not every pane!)
+        float isRadarWin = step(0.5, abs(worldX)) * step(abs(worldX), 2.15);
+        float screenBox = smoothstep(0.20, 0.26, wx) * smoothstep(0.62, 0.56, wx)
+                        * smoothstep(0.16, 0.22, wy) * smoothstep(0.42, 0.36, wy);
+        vec3 radarGlow = vec3(0.04, 0.58, 0.52) * screenBox * isRadarWin * 0.95;
+
+        // Occasional subtle windshield wiper arm on center-ish panes (parked at realistic angles!)
+        float hasWiper = step(abs(worldX), 2.2) * step(0.35, paneRnd);
+        float wiperX = 0.78 - wy * 0.16;
+        float wiperMask = 1.0 - 0.65 * hasWiper * smoothstep(0.028, 0.008, abs(wx - wiperX)) * step(0.10, wy) * step(wy, 0.86);
+
+        float rainGloss = 0.90 + 0.16 * texture(uNoiseTex, vec2(wx * 5.0 + paneId * 0.3, wy * 1.4 + uTime * 0.38)).b;
+        vec3 winCol = (interior * paneBright * 1.25 + radarGlow) * wiperMask * rainGloss;
+
+        // Glossy night sky reflection on raked exterior glass
+        vec3 reflSky = evalStormFogColor(reflect(-V, N)) * 1.45;
+        winCol = mix(winCol, reflSky, glassFresnel * 0.42) * frameMask;
+        fragColor = vec4(winCol, 1.0);
+        return;
+      }
+      // Material 10: High-intensity halogen floodlight & bow steaming lamp lenses
+      if (matId == 10) {
+        fragColor = vec4(vec3(1.0, 0.84, 0.54) * 5.2, 1.0);
+        return;
+      }
+      if (matId == 7) {
+        float pulse = (vLocalPos.y > 18.0) ? uBeaconPulse : 1.0;
+        fragColor = vec4(vec3(1.0, 0.10, 0.04) * 5.8 * pulse, 1.0);
+        return;
+      }
+      if (matId == 8) {
+        fragColor = vec4(vec3(0.06, 1.0, 0.40) * 5.8, 1.0);
+        return;
+      }
+
+      vec3 N = normalize(vNormal);
+      vec3 V = normalize(uCamPos - vWorldPos);
+      if (dot(N, V) < 0.0) N = -N;
+
+      vec4 texN = texture(uNoiseTex, vLocalPos.xz * 0.24 + vLocalPos.xy * 0.18);
+      vec4 fineN = texture(uNoiseTex, vLocalPos.xz * 1.25 + vLocalPos.zy * 0.95);
+      // Realistic vertical rainwater runoff streaks & welded hull/superstructure steel plate bands!
+      float vertStreak = texture(uNoiseTex, vec2((vLocalPos.x + vLocalPos.z) * 0.85, vLocalPos.y * 0.14)).b;
+      float vertRunoff = texture(uNoiseTex, vec2((vLocalPos.x + vLocalPos.z) * 2.1, vLocalPos.y * 0.22 + uTime * 0.22)).b;
+      float wallSeamV = smoothstep(0.47, 0.495, abs(fract((vLocalPos.x + vLocalPos.z) * 0.38) - 0.5));
+      float wallSeamH = smoothstep(0.47, 0.495, abs(fract(vLocalPos.y * 0.72) - 0.5));
+      float wallSeam = max(wallSeamV, wallSeamH) * 0.35;
+
+      vec3 albedo = vec3(0.12);
+      if (matId == 0) {
+        albedo = mix(vec3(0.020, 0.027, 0.036), vec3(0.038, 0.048, 0.060), texN.r);
+      } else if (matId == 1) {
+        albedo = mix(vec3(0.032, 0.048, 0.068), vec3(0.066, 0.090, 0.116), texN.r * 0.55 + vertStreak * 0.45);
+        albedo *= (1.0 - wallSeam * 0.45);
+      } else if (matId == 2) {
+        // Weathered storm-drenched marine grey steel with welded plate panels, salt streaks & scupper rust hints!
+        albedo = mix(vec3(0.095, 0.118, 0.142), vec3(0.195, 0.225, 0.260), texN.r * 0.48 + vertStreak * 0.52);
+        albedo *= (1.0 - wallSeam * 0.40);
+        // Subtle salt & iron-oxide rust wash near deck scuppers & bottom edges
+        float rustBand = (1.0 - smoothstep(4.70, 5.25, vLocalPos.y)) * smoothstep(0.35, 0.78, fineN.b);
+        albedo = mix(albedo, vec3(0.14, 0.075, 0.045), rustBand * 0.45);
+        albedo *= mix(0.64, 1.0, smoothstep(4.70, 5.55, vLocalPos.y));
+      } else if (matId == 3) {
+        albedo = mix(vec3(0.042, 0.048, 0.056), vec3(0.115, 0.082, 0.060), fineN.b * 0.55);
+      } else if (matId == 4) {
+        albedo = mix(vec3(0.20, 0.24, 0.28), vec3(0.34, 0.38, 0.42), texN.r);
+      } else if (matId == 5) {
+        albedo = mix(vec3(0.42, 0.095, 0.04), vec3(0.64, 0.18, 0.06), texN.r);
+      } else if (matId == 9) {
+        // Distinguish coiled wet braided manila hawser on deck (y < 5.1) from dark wet teak cap rail!
+        if (vLocalPos.y < 5.15) {
+          float twist = 0.5 + 0.5 * sin(vUv.x * 160.0 + vUv.y * 18.85);
+          float fibers = 0.7 + 0.3 * sin(vUv.x * 420.0 - vUv.y * 37.7);
+          albedo = mix(vec3(0.085, 0.058, 0.032), vec3(0.21, 0.155, 0.095), twist * fibers);
+          rough = mix(0.68, 0.34, twist);
+        } else {
+          albedo = mix(vec3(0.085, 0.055, 0.034), vec3(0.16, 0.108, 0.068), fineN.r);
+        }
+      }
+
+      float puddleMask = 0.0;
+      vec2 reflRipple = vec2(0.0);
+
+      if (matId == 0) {
+        ao *= deckContactAO(vLocalPos.xz);
+
+        // Subtle realistic welded steel deck seams (soft, dark, non-distracting!)
+        vec2 plateUV = vLocalPos.xz / vec2(1.95, 3.25);
+        vec2 seamDist = abs(fract(plateUV) - 0.5);
+        float seam = smoothstep(0.488, 0.499, max(seamDist.x, seamDist.y));
+        albedo *= (1.0 - seam * 0.42);
+
+        // Smooth, broad organic standing rainwater puddles (ZERO crusty/jagged transition!)
+        float puddleNoise = texture(uWaveNormalTex, vLocalPos.xz * 0.055).a * 0.72
+                          + texture(uNoiseTex, vLocalPos.xz * 0.11).r * 0.28;
+        puddleMask = smoothstep(0.16, 0.68, puddleNoise + 0.16);
+
+        // Smooth organic raindrop splash rings + gentle wind-driven water film ripples!
+        // Keep windRip gentle so reflected straight rails & pipes stay natural and silky (ZERO jagged sawtooth wobble!)
+        vec2 windRip = (texture(uWaveNormalTex, vLocalPos.xz * 0.34 - vec2(0.74, 0.67) * uTime * 0.42).rg * 2.0 - 1.0) * 0.042;
+        vec2 dropRip = rainRippleGrad(vLocalPos.xz, uTime) * (0.42 + 0.58 * puddleMask);
+        vec2 plateMicro = (texture(uWaveNormalTex, vLocalPos.xz * 1.65).rg * 2.0 - 1.0) * (1.0 - puddleMask) * 0.12;
+        reflRipple = dropRip * 0.68 + windRip;
+
+        vec3 shipUp = N;
+        vec3 shipRight = normalize(cross(vec3(0.0, 0.0, 1.0), shipUp));
+        vec3 shipFwd = normalize(cross(shipUp, shipRight));
+        vec2 lightRip = reflRipple + plateMicro;
+        N = normalize(shipUp + shipRight * lightRip.x * 0.28 + shipFwd * lightRip.y * 0.28);
+
+        rough = mix(0.16, 0.048, puddleMask);
+        ao *= (1.0 - seam * 0.22);
+      } else {
+        // Glossy vertical rainwater drip streaks running down painted bulkheads, railings & hardware!
+        rough = mix(rough * 0.36, rough * 0.92, vertRunoff);
+        // Subtle normal perturbation on vertical walls from welded plating & water streams
+        N = normalize(N + vec3(vertRunoff - 0.5, 0.0, vertStreak - 0.5) * 0.055);
+      }
+
+      // --- DIRECT LIGHTING ---
+      vec3 moonDir = normalize(vec3(-0.32, 0.28, -0.90));
+      vec3 col = vec3(0.0);
+
+      float hemi = 0.5 + 0.5 * N.y;
+      vec3 ambSky = mix(vec3(0.012, 0.020, 0.034), vec3(0.054, 0.088, 0.136), hemi);
+      // Keep ambient lightning fill restrained so lightning preserves dramatic dark shadows & bright directional glints!
+      ambSky += vec3(0.22, 0.36, 0.62) * (uLightningInt0 + uLightningInt1) * 0.095 * hemi;
+      col += albedo * ambSky * ao;
+
+      col += pbrLight(N, V, moonDir, vec3(0.28, 0.42, 0.60), albedo, rough, metal) * ao;
+
+      if (uLightningInt0 > 0.01) {
+        col += pbrLight(N, V, uLightningDir0, vec3(0.76, 0.90, 1.0) * uLightningInt0 * 1.15, albedo, rough, metal) * ao;
+      }
+      if (uLightningInt1 > 0.01) {
+        col += pbrLight(N, V, uLightningDir1, vec3(0.72, 0.86, 1.0) * uLightningInt1 * 1.00, albedo, rough, metal) * ao;
+      }
+
+      // Practical ship lights
+      vec3 toFL = uFloodLPos - vWorldPos;
+      float attFL = spotAtten(-toFL, uFloodDir, 46.0) + pointAtten(length(toFL), 14.0) * 0.35;
+      col += pbrLight(N, V, normalize(toFL), vec3(1.0, 0.66, 0.30) * 4.2 * attFL, albedo, rough, metal) * ao;
+
+      vec3 toFR = uFloodRPos - vWorldPos;
+      float attFR = spotAtten(-toFR, uFloodDir, 46.0) + pointAtten(length(toFR), 14.0) * 0.35;
+      col += pbrLight(N, V, normalize(toFR), vec3(1.0, 0.66, 0.30) * 4.2 * attFR, albedo, rough, metal) * ao;
+
+      // Bow Lamp softly illuminates prow, anchor windlass & heavy iron anchor chains!
+      vec3 toBow = uBowLampPos - vWorldPos;
+      float attBow = pointAtten(length(toBow), 24.0);
+      col += pbrLight(N, V, normalize(toBow), vec3(1.0, 0.80, 0.50) * 3.6 * attBow, albedo, rough, metal) * ao;
+
+      vec3 toBr = uBridgeGlowPos - vWorldPos;
+      float attBr = pointAtten(length(toBr), 28.0);
+      col += pbrLight(N, V, normalize(toBr), vec3(1.0, 0.56, 0.18) * 2.8 * attBr, albedo, rough, metal) * ao;
+
+      // Mask nav-light spill shadowed under the central cargo hatch overhang (prevents tiny pinpoint bleed!)
+      float hatchShadow = mix(smoothstep(2.1, 2.9, abs(vLocalPos.x)), 1.0, smoothstep(5.35, 5.75, vLocalPos.y) + step(-1.0, vLocalPos.z));
+      hatchShadow = clamp(hatchShadow, 0.0, 1.0);
+
+      vec3 toP = uPortNavPos - vWorldPos;
+      float attP = pointAtten(length(toP), 28.0) * smoothstep(3.0, -2.5, vLocalPos.x) * hatchShadow;
+      col += pbrLight(N, V, normalize(toP), vec3(1.0, 0.10, 0.04) * 3.5 * attP, albedo, rough, metal) * ao;
+
+      vec3 toS = uStbdNavPos - vWorldPos;
+      float attS = pointAtten(length(toS), 28.0) * smoothstep(-3.0, 2.5, vLocalPos.x) * hatchShadow;
+      col += pbrLight(N, V, normalize(toS), vec3(0.06, 1.0, 0.42) * 3.5 * attS, albedo, rough, metal) * ao;
+
+      // Extra broad wet clear-coat specular streak lobe on the wet deck
+      if (matId == 0) {
+        float coatR = mix(0.28, 0.13, puddleMask);
+        col += vec3(1.0, 0.64, 0.28) * ggxD(max(dot(N, normalize(V + normalize(toFL))), 0.0), coatR) * attFL * 0.14 * ao;
+        col += vec3(1.0, 0.64, 0.28) * ggxD(max(dot(N, normalize(V + normalize(toFR))), 0.0), coatR) * attFR * 0.14 * ao;
+        col += vec3(1.0, 0.56, 0.20) * ggxD(max(dot(N, normalize(V + normalize(toBr))), 0.0), coatR) * attBr * 0.12 * ao;
+        col += vec3(1.0, 0.80, 0.50) * ggxD(max(dot(N, normalize(V + normalize(toBow))), 0.0), coatR) * attBow * 0.14 * ao;
+        col += vec3(1.0, 0.12, 0.04) * ggxD(max(dot(N, normalize(V + normalize(toP))), 0.0), coatR) * attP * 0.10 * ao;
+        col += vec3(0.08, 1.0, 0.42) * ggxD(max(dot(N, normalize(V + normalize(toS))), 0.0), coatR) * attS * 0.10 * ao;
+      }
+
+      // --- SILKY-SMOOTH PLANAR WET DECK REFLECTIONS (ZERO JAGGED PUDDLE CRUST!) ---
+      float ndv = max(dot(N, V), 0.001);
+      float wetFresnel = 0.04 + 0.96 * pow(1.0 - ndv, 4.0);
+
+      if (matId == 0 && uIsReflectionPass < 0.5) {
+        vec2 screenUV = gl_FragCoord.xy / uResolution;
+        // Restrained silky raindrop & gentle wind-film ripple distortion (keeps reflected rails & pipes crisp & natural!)
+        vec2 distort = vec2(reflRipple.x * 0.0075, reflRipple.y * 0.0125);
+        vec2 reflUV = clamp(screenUV + distort, vec2(0.004), vec2(0.996));
+
+        vec3 reflSharp = texture(uReflTex, reflUV).rgb;
+        // Smooth vertically stretched blur for damp steel around glassier puddles
+        vec2 px = vec2(3.6, 11.0) / uResolution;
+        vec3 reflSoft = (
+          texture(uReflTex, clamp(reflUV + vec2( px.x,  px.y), vec2(0.004), vec2(0.996))).rgb +
+          texture(uReflTex, clamp(reflUV + vec2(-px.x,  px.y), vec2(0.004), vec2(0.996))).rgb +
+          texture(uReflTex, clamp(reflUV + vec2( px.x, -px.y), vec2(0.004), vec2(0.996))).rgb +
+          texture(uReflTex, clamp(reflUV + vec2(-px.x, -px.y), vec2(0.004), vec2(0.996))).rgb +
+          texture(uReflTex, clamp(reflUV + vec2( 0.0,   px.y * 2.2), vec2(0.004), vec2(0.996))).rgb +
+          texture(uReflTex, clamp(reflUV + vec2( 0.0,  -px.y * 2.2), vec2(0.004), vec2(0.996))).rgb
+        ) / 6.0;
+
+        vec3 planarRefl = mix(reflSoft, reflSharp, smoothstep(0.18, 0.88, puddleMask));
+        float reflStrength = clamp(wetFresnel * mix(0.55, 1.00, puddleMask) + puddleMask * 0.28, 0.0, 0.90);
+        col = mix(col, col * 0.28 + planarRefl * 1.12, reflStrength * ao);
+      } else {
+        vec3 R = reflect(-V, N);
+        vec3 envRefl = evalStormFogColor(R) * (1.15 + (uLightningInt0 + uLightningInt1) * 0.32);
+        col += envRefl * wetFresnel * (0.48 + 0.45 * metal) * ao;
+      }
+
+      float dist = length(uCamPos - vWorldPos);
+      float haze = 1.0 - exp(-dist * 0.0052);
+      col = mix(col, evalStormFogColor(-V), haze * 0.52);
+
+      fragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // --- 12E. PHOTOREALISTIC BOW SPRAY PLUMES + VELOCITY-ALIGNED BALLISTIC DROPLETS ---
+  const sprayVS = `#version 300 es
+    layout(location=0) in vec2 aQuad;
+    layout(location=1) in vec4 aPosSize; // xyz, size
+    layout(location=2) in vec4 aVelAlpha;// vel.xyz, alpha
+    layout(location=3) in vec4 aMeta;    // seed, type, age, pad
+
+    uniform mat4 uVP;
+    uniform vec3 uCamPos;
+    uniform vec3 uCamRight;
+    uniform vec3 uCamUp;
+
+    out vec2 vUv;
+    out vec3 vWorldPos;
+    out vec4 vMeta; // alpha, seed, type, age
+
+    void main() {
+      float size = aPosSize.w;
+      float seed = aMeta.x;
+      float isDrop = aMeta.y;
+      float age = aMeta.z;
+      vec3 wp;
+
+      if (isDrop > 0.5) {
+        // Fine velocity-aligned flying water spray droplets (distance-clamped -> ZERO glowing white cigars!)
+        vec3 vel = aVelAlpha.xyz;
+        float spd = length(vel);
+        vec3 dir = vel / max(spd, 0.001);
+        vec3 toCamVec = uCamPos - aPosSize.xyz;
+        float camDist = length(toCamVec);
+        vec3 toCam = toCamVec / max(camDist, 0.001);
+        vec3 side = normalize(cross(dir, toCam));
+        float streakLen = clamp(spd * 0.017, 0.07, 0.30);
+        float dropW = size * clamp(camDist * 0.16, 0.35, 1.25);
+        wp = aPosSize.xyz + side * (aQuad.x * dropW) + dir * (aQuad.y * streakLen * 0.5);
+      } else {
+        // Billowing turbulent mist sheet slightly elongated along wind velocity!
+        float ang = seed * 6.2831 + age * (fract(seed) - 0.5) * 1.4;
+        float c = cos(ang), s = sin(ang);
+        vec2 rot = vec2(aQuad.x * c - aQuad.y * s, aQuad.x * s + aQuad.y * c);
+        vec2 stretched = rot * vec2(1.38, 0.88);
+        wp = aPosSize.xyz + (uCamRight * stretched.x + uCamUp * stretched.y) * size;
+      }
+
+      vWorldPos = wp;
+      vUv = aQuad * 0.5 + 0.5;
+      vMeta = vec4(aVelAlpha.w, seed, isDrop, age);
+      gl_Position = uVP * vec4(wp, 1.0);
+    }
+  `;
+
+  const sprayFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    in vec3 vWorldPos;
+    in vec4 vMeta; // alpha, seed, isDrop, age
+    out vec4 fragColor;
+
+    uniform sampler2D uNoiseTex;
+    ${COMMON_LIGHTING_GLSL}
+
+    void main() {
+      float isDrop = vMeta.z;
+      float camDist = length(uCamPos - vWorldPos);
+      // Smooth near-camera fade so mist NEVER blows out the lens into an opaque white veil!
+      float nearFade = smoothstep(1.2, 4.2, camDist);
+      if (nearFade < 0.01) discard;
+
+      float alpha;
+      if (isDrop > 0.5) {
+        // Crisp fine glistening water droplet streak (clean near fade prevents close-up blobs!)
+        float xFade = 1.0 - abs(vUv.x * 2.0 - 1.0);
+        xFade = xFade * xFade;
+        float yFade = smoothstep(0.0, 0.25, vUv.y) * smoothstep(1.0, 0.55, vUv.y);
+        alpha = xFade * yFade * vMeta.x * 0.56 * smoothstep(2.4, 5.2, camDist);
+      } else {
+        // PURE organic multi-octave fBm sea-mist wisp (ZERO Voronoi cellular webs!)
+        vec2 p = vUv * 2.0 - 1.0;
+        float r = length(p);
+        if (r > 1.0) discard;
+        float seed = vMeta.y;
+        float age = vMeta.w;
+        vec2 offA = vec2(fract(seed * 0.37), fract(seed * 0.71));
+        vec2 offB = vec2(fract(seed * 0.53), fract(seed * 0.19));
+
+        // Domain-warped double-octave soft Perlin mist
+        vec2 nWarp = (texture(uNoiseTex, vUv * 0.55 + offA).rb - 0.5) * 0.32;
+        float f1 = texture(uNoiseTex, vUv * 0.65 + offA + nWarp - vec2(age * 0.18, age * 0.10)).r;
+        float f2 = texture(uNoiseTex, vUv * 1.35 + offB - nWarp * 0.6 + vec2(age * 0.24, -age * 0.14)).b;
+        float mistTex = f1 * 0.62 + f2 * 0.38;
+
+        // Irregular ragged feather falloff (completely hides quad/circle boundary!)
+        float radial = pow(1.0 - smoothstep(0.0, 1.0, r), 1.45);
+        float wisp = smoothstep(0.14, 0.78, mistTex * 1.25 - r * 0.32);
+        alpha = radial * wisp * vMeta.x * 0.42 * nearFade;
+      }
+
+      if (alpha < 0.004) discard;
+
+      // Physically restrained storm night lighting on translucent sea spray!
+      vec3 col = vec3(0.15, 0.23, 0.31);
+      col += vec3(0.76, 0.90, 1.0) * (uLightningInt0 + uLightningInt1) * 0.95;
+
+      float attBow = pointAtten(length(uBowLampPos - vWorldPos), 20.0);
+      float attFL  = spotAtten(vWorldPos - uFloodLPos, uFloodDir, 42.0);
+      float attFR  = spotAtten(vWorldPos - uFloodRPos, uFloodDir, 42.0);
+      float attP   = pointAtten(length(uPortNavPos - vWorldPos), 20.0);
+      float attS   = pointAtten(length(uStbdNavPos - vWorldPos), 20.0);
+
+      col += vec3(1.0, 0.78, 0.48) * attBow * 1.45;
+      col += vec3(1.0, 0.66, 0.30) * (attFL + attFR) * 1.25;
+      col += vec3(1.0, 0.12, 0.05) * attP * 1.05;
+      col += vec3(0.08, 1.0, 0.42) * attS * 1.05;
+
+      if (isDrop > 0.5) col *= 1.85; // Crisp glistening specular sparkle on flying water droplets!
+
+      fragColor = vec4(col, alpha);
+    }
+  `;
+
+  // --- 12F. 3D WIND-DRIVEN SIDEWAYS RAIN SHADER ---
+  const rainVS = `#version 300 es
+    layout(location=0) in vec2 aQuad;
+    layout(location=1) in vec4 aSeed;
+
+    uniform mat4 uVP;
+    uniform vec3 uCamPos;
+    uniform float uTime;
+    uniform vec3 uWindRainVel;
+
+    out vec2 vUv;
+    out vec3 vWorldPos;
+    out float vVar;
+
+    void main() {
+      vec3 box = vec3(34.0, 22.0, 34.0);
+      float speedMult = 0.80 + aSeed.w * 0.46;
+      vec3 vel = uWindRainVel * speedMult;
+
+      vec3 localPos = fract(aSeed.xyz + (vel * uTime - uCamPos) / box) * box - box * 0.5;
+      vec3 worldCenter = uCamPos + localPos;
+
+      vec3 streakDir = normalize(vel);
+      vec3 toCamVec = uCamPos - worldCenter;
+      float camDist = length(toCamVec);
+      vec3 toCam = toCamVec / max(camDist, 0.001);
+      vec3 side = normalize(cross(streakDir, toCam));
+
+      float streakLen = mix(0.65, 1.35, aSeed.w);
+      // Distance-controlled gossamer-fine rain streaks (ZERO thick near-camera cigar blobs!)
+      float streakWidth = mix(0.0026, 0.0052, aSeed.w) * clamp(camDist * 0.24, 0.38, 1.45);
+
+      vec3 wp = worldCenter + side * (aQuad.x * streakWidth) + streakDir * (aQuad.y * streakLen * 0.5);
+      vWorldPos = wp;
+      vUv = aQuad * 0.5 + 0.5;
+      vVar = aSeed.w;
+      gl_Position = uVP * vec4(wp, 1.0);
+    }
+  `;
+
+  const rainFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    in vec3 vWorldPos;
+    in float vVar;
+    out vec4 fragColor;
+    ${COMMON_LIGHTING_GLSL}
+
+    void main() {
+      float xFade = 1.0 - abs(vUv.x * 2.0 - 1.0);
+      xFade = xFade * xFade;
+      float yFade = smoothstep(0.0, 0.25, vUv.y) * smoothstep(1.0, 0.65, vUv.y);
+      float dist = length(uCamPos - vWorldPos);
+      // Clean near fade so raindrops never turn into fat close-up pills!
+      float distFade = smoothstep(2.2, 5.2, dist) * (1.0 - smoothstep(11.5, 17.0, dist));
+
+      float shape = xFade * yFade * distFade;
+      if (shape < 0.005) discard;
+
+      vec3 col = vec3(0.24, 0.36, 0.50) * (0.45 + 0.45 * vVar);
+      col += vec3(0.80, 0.92, 1.0) * (uLightningInt0 + uLightningInt1) * 1.10;
+
+      float attFL  = spotAtten(vWorldPos - uFloodLPos, uFloodDir, 42.0);
+      float attFR  = spotAtten(vWorldPos - uFloodRPos, uFloodDir, 42.0);
+      float attBow = pointAtten(length(uBowLampPos - vWorldPos), 18.0);
+      float attBr  = pointAtten(length(uBridgeGlowPos - vWorldPos), 20.0);
+      float attP   = pointAtten(length(uPortNavPos - vWorldPos), 18.0);
+      float attS   = pointAtten(length(uStbdNavPos - vWorldPos), 18.0);
+
+      col += vec3(1.0, 0.70, 0.34) * (attFL + attFR) * 2.6;
+      col += vec3(1.0, 0.82, 0.54) * attBow * 1.9;
+      col += vec3(1.0, 0.64, 0.28) * attBr * 1.3;
+      col += vec3(1.0, 0.14, 0.06) * attP * 1.9;
+      col += vec3(0.08, 1.0, 0.44) * attS * 1.9;
+
+      float alpha = shape * mix(0.16, 0.32, vVar);
+      fragColor = vec4(col * alpha, alpha);
+    }
+  `;
+
+  // --- 12G. VOLUMETRIC FLOODLIGHT CONE SHADER ---
+  const coneVS = `#version 300 es
+    layout(location=0) in vec3 aPos;
+    layout(location=1) in vec3 aNorm;
+    layout(location=2) in float aAlong;
+    uniform mat4 uModel;
+    uniform mat4 uVP;
+    out vec3 vWorldPos;
+    out vec3 vNormal;
+    out float vAlong;
+    void main() {
+      vec4 wp = uModel * vec4(aPos, 1.0);
+      vWorldPos = wp.xyz;
+      vNormal = normalize(mat3(uModel) * aNorm);
+      vAlong = aAlong;
+      gl_Position = uVP * wp;
+    }
+  `;
+
+  const coneFS = `#version 300 es
+    precision highp float;
+    in vec3 vWorldPos;
+    in vec3 vNormal;
+    in float vAlong;
+    uniform vec3 uCamPos;
+    uniform vec3 uConeColor;
+    uniform float uTime;
+    uniform sampler2D uNoiseTex;
+    out vec4 fragColor;
+    void main() {
+      vec3 V = normalize(uCamPos - vWorldPos);
+      float rim = pow(abs(dot(normalize(vNormal), V)), 1.9);
+      float alongFade = smoothstep(0.0, 0.08, vAlong) * pow(1.0 - vAlong, 1.9);
+      float mist = 0.68 + 0.52 * texture(uNoiseTex, vWorldPos.xz * 0.08 - vec2(0.74, 0.67) * uTime * 0.45).r;
+      float alpha = rim * alongFade * mist * 0.11;
+      fragColor = vec4(uConeColor * alpha, 0.0);
+    }
+  `;
+
+  // --- 12H. POST-PROCESS: BLOOM & FILMIC ACES COMPOSITE (CLEAN OPTICAL LENS!) ---
+  const fsQuadVS = `#version 300 es
+    out vec2 vUv;
+    void main() {
+      vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+      vUv = p;
+      gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    }
+  `;
+
+  const bloomExtractFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    out vec4 fragColor;
+    void main() {
+      vec3 c = texture(uTex, vUv).rgb;
+      float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      float soft = smoothstep(0.72, 1.65, lum);
+      fragColor = vec4(c * soft, 1.0);
+    }
+  `;
+
+  const blurFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uDir;
+    out vec4 fragColor;
+    void main() {
+      vec3 sum = texture(uTex, vUv).rgb * 0.227027;
+      sum += texture(uTex, vUv + uDir * 1.384615).rgb * 0.316216;
+      sum += texture(uTex, vUv - uDir * 1.384615).rgb * 0.316216;
+      sum += texture(uTex, vUv + uDir * 3.230769).rgb * 0.070270;
+      sum += texture(uTex, vUv - uDir * 3.230769).rgb * 0.070270;
+      fragColor = vec4(sum, 1.0);
+    }
+  `;
+
+  const compositeFS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    uniform sampler2D uSceneTex;
+    uniform sampler2D uBloomTex;
+    uniform vec2 uResolution;
+    uniform float uTime;
+    uniform float uLensSpray;
+    out vec4 fragColor;
+
+    // Pure optical refraction droplets (ZERO fake glowing donut rings!)
+    // Only subtle water beads near outer corners & surging briefly when spray slams over bow!
+    vec2 opticalLensDrops(vec2 uv, float aspect, float t, float sprayAmt) {
+      vec2 centered = uv - 0.5;
+      float cornerMask = smoothstep(0.42, 0.74, length(centered * vec2(1.0, 1.15))) * (0.28 + 0.72 * sprayAmt)
+                       + sprayAmt * 0.25 * smoothstep(0.22, 0.55, length(centered));
+      if (cornerMask < 0.01) return vec2(0.0);
+
+      vec2 p = vec2(uv.x * aspect, uv.y) * 5.2;
+      float colId = floor(p.x);
+      float colRnd = fract(sin(colId * 127.1 + 19.3) * 43758.5453);
+      // Gravity slide with intermittent stick-slip pause
+      float slide = t * (0.12 + colRnd * 0.22);
+      p.y += slide + sin(slide * 3.0) * 0.14;
+      vec2 id = floor(p);
+      vec2 f = fract(p) - 0.5;
+      vec3 rnd = fract(sin(vec3(dot(id, vec2(127.1, 311.7)), dot(id, vec2(269.5, 183.3)), dot(id, vec2(419.2, 371.9)))) * 43758.5453);
+      if (rnd.z < 0.68) return vec2(0.0);
+
+      vec2 off = (rnd.xy - 0.5) * 0.45;
+      vec2 d = f - off;
+      d.y *= 0.72; // Teardrop elongation
+      float r = length(d);
+      float rad = 0.08 + 0.07 * rnd.x;
+      if (r >= rad) return vec2(0.0);
+      // Smooth convex-lens refraction offset (pure optical bend, zero additive ring!)
+      float dome = sqrt(max(0.0, 1.0 - (r * r) / (rad * rad)));
+      return -d * dome * 0.085 * cornerMask;
+    }
+
+    vec3 acesFilm(vec3 x) {
+      const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+      return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    }
+
+    void main() {
+      float aspect = uResolution.x / max(uResolution.y, 1.0);
+      vec2 dropOff = opticalLensDrops(vUv, aspect, uTime, uLensSpray);
+      vec2 uv = clamp(vUv + dropOff, vec2(0.001), vec2(0.999));
+
+      vec2 fromCenter = uv - 0.5;
+      float ca = dot(fromCenter, fromCenter) * 0.0035 + length(dropOff) * 0.12;
+      vec3 col;
+      col.r = texture(uSceneTex, clamp(uv + fromCenter * ca, vec2(0.001), vec2(0.999))).r;
+      col.g = texture(uSceneTex, uv).g;
+      col.b = texture(uSceneTex, clamp(uv - fromCenter * ca, vec2(0.001), vec2(0.999))).b;
+
+      vec3 bloom = texture(uBloomTex, uv).rgb;
+      col += bloom * 0.54;
+
+      col *= 1.16;
+      col = acesFilm(col);
+      col = pow(col, vec3(1.0 / 2.2));
+      col = mix(col, col * vec3(0.95, 0.99, 1.04), 0.20);
+
+      float vig = 1.0 - dot(fromCenter * vec2(1.10, 1.04), fromCenter * vec2(1.10, 1.04)) * 0.52;
+      col *= clamp(vig, 0.48, 1.0);
+
+      float grain = (fract(sin(dot(gl_FragCoord.xy + fract(uTime) * 173.0, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.016;
+      col = clamp(col + grain, 0.0, 1.0);
+
+      fragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // =========================================================================
+  // 13. FRAMEBUFFER PIPELINE
+  // =========================================================================
+  const hasHalfFloat = !!(gl.getExtension('EXT_color_buffer_half_float') || gl.getExtension('EXT_color_buffer_float'));
+  gl.getExtension('OES_texture_half_float_linear');
+  gl.getExtension('OES_texture_float_linear');
+
+  function createRenderTarget(w, h, withDepth, tryHDR) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    const useHalf = tryHDR && hasHalfFloat;
+    const internalFmt = useHalf ? gl.RGBA16F : gl.RGBA8;
+    const type = useHalf ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, gl.RGBA, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+    let rbo = null;
+    if (withDepth) {
+      rbo = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, rbo);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rbo);
+    }
+
+    let status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE && useHalf) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, rbo, w, h };
+  }
+
+  function destroyRenderTarget(rt) {
+    if (!rt) return;
+    gl.deleteFramebuffer(rt.fbo);
+    gl.deleteTexture(rt.tex);
+    if (rt.rbo) gl.deleteRenderbuffer(rt.rbo);
+  }
+
+  let rtScene = null, rtRefl = null, rtBloomA = null, rtBloomB = null;
+  let viewW = 1, viewH = 1;
+
+  function resizeTargets() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    viewW = Math.max(2, Math.floor(window.innerWidth * dpr));
+    viewH = Math.max(2, Math.floor(window.innerHeight * dpr));
+    canvas.width = viewW;
+    canvas.height = viewH;
+
+    destroyRenderTarget(rtScene);
+    destroyRenderTarget(rtRefl);
+    destroyRenderTarget(rtBloomA);
+    destroyRenderTarget(rtBloomB);
+
+    rtScene  = createRenderTarget(viewW, viewH, true, true);
+    rtRefl   = createRenderTarget(Math.max(2, viewW >> 1), Math.max(2, viewH >> 1), true, true);
+    rtBloomA = createRenderTarget(Math.max(2, viewW >> 2), Math.max(2, viewH >> 2), false, true);
+    rtBloomB = createRenderTarget(Math.max(2, viewW >> 2), Math.max(2, viewH >> 2), false, true);
+  }
+
+  // =========================================================================
+  // 14. INTERACTIVE CAMERA (360° DRAG, PINCH/SCROLL ZOOM, AUTO-RETURN)
+  // =========================================================================
+  const DEFAULT_YAW = 0.0;
+  const DEFAULT_PITCH = -0.04;
+  const DEFAULT_FOV = 60.0;
+
+  const cam = {
+    yaw: DEFAULT_YAW,
+    pitch: DEFAULT_PITCH,
+    fov: DEFAULT_FOV,
+    targetYaw: DEFAULT_YAW,
+    targetPitch: DEFAULT_PITCH,
+    targetFov: DEFAULT_FOV,
+    lastInputTime: -999,
+    isInteracting: false,
+    autoReturnDelay: 4.5,
+    autoReturnActive: false,
+    // Heroic eye-height on the wet forecastle deck looking cleanly over the sleek windlass & prow!
+    localPos: [0.0, DECK_Y + 2.02, -19.2]
+  };
+
+  const hintEl = document.getElementById('hint');
+  setTimeout(() => hintEl.classList.add('hidden'), 6500);
+
+  function markInteraction(nowSec) {
+    cam.lastInputTime = nowSec;
+    cam.autoReturnActive = false;
+    hintEl.classList.add('hidden');
+  }
+
+  const activePointers = new Map();
+  let lastPinchDist = null;
+  let lastDragX = 0, lastDragY = 0;
+
+  function getPointerDist() {
+    const pts = Array.from(activePointers.values());
+    if (pts.length < 2) return null;
+    return Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    cam.isInteracting = true;
+    markInteraction(performance.now() * 0.001);
+    canvas.classList.add('dragging');
+    if (activePointers.size === 1) {
+      lastDragX = e.clientX;
+      lastDragY = e.clientY;
+    } else if (activePointers.size === 2) {
+      lastPinchDist = getPointerDist();
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    markInteraction(performance.now() * 0.001);
+
+    if (activePointers.size === 1) {
+      const dx = e.clientX - lastDragX;
+      const dy = e.clientY - lastDragY;
+      lastDragX = e.clientX;
+      lastDragY = e.clientY;
+      const sens = 0.0046 * (cam.fov / DEFAULT_FOV);
+      cam.targetYaw += dx * sens;
+      cam.targetPitch = clamp(cam.targetPitch - dy * sens, -1.26, 1.32);
+    } else if (activePointers.size >= 2) {
+      const dist = getPointerDist();
+      if (dist !== null && lastPinchDist !== null && lastPinchDist > 5) {
+        const ratio = lastPinchDist / dist;
+        cam.targetFov = clamp(cam.targetFov * ratio, 25.0, 84.0);
+      }
+      lastPinchDist = dist;
+    }
+  });
+
+  function endPointer(e) {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size === 0) {
+      cam.isInteracting = false;
+      canvas.classList.remove('dragging');
+      lastPinchDist = null;
+      cam.lastInputTime = performance.now() * 0.001;
+    } else if (activePointers.size === 1) {
+      const rem = Array.from(activePointers.values())[0];
+      lastDragX = rem.x;
+      lastDragY = rem.y;
+      lastPinchDist = null;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    markInteraction(performance.now() * 0.001);
+    const delta = clamp(e.deltaY, -120, 120);
+    cam.targetFov = clamp(cam.targetFov + delta * 0.055, 25.0, 84.0);
+  }, { passive: false });
+
+  canvas.addEventListener('dblclick', () => {
+    cam.targetYaw = Math.round(cam.yaw / TAU) * TAU + DEFAULT_YAW;
+    cam.targetPitch = DEFAULT_PITCH;
+    cam.targetFov = DEFAULT_FOV;
+  });
+
+  function updateCamera(dt, nowSec) {
+    if (!cam.isInteracting && cam.lastInputTime > 0 && (nowSec - cam.lastInputTime) > cam.autoReturnDelay) {
+      if (!cam.autoReturnActive) {
+        cam.autoReturnActive = true;
+        const wrappedYaw = ((cam.yaw % TAU) + TAU + Math.PI) % TAU - Math.PI;
+        cam.yaw = wrappedYaw;
+        cam.targetYaw = DEFAULT_YAW;
+      }
+      cam.targetYaw = DEFAULT_YAW;
+      cam.targetPitch = DEFAULT_PITCH;
+      cam.targetFov = DEFAULT_FOV;
+    }
+
+    const smoothRate = cam.autoReturnActive ? 1.85 : 10.5;
+    const f = 1.0 - Math.exp(-smoothRate * dt);
+    cam.yaw   = lerp(cam.yaw, cam.targetYaw, f);
+    cam.pitch = lerp(cam.pitch, cam.targetPitch, f);
+    cam.fov   = lerp(cam.fov, cam.targetFov, f);
+  }
+
+  // =========================================================================
+  // 15. OPTIONAL PROCEDURAL WEB AUDIO STORM SOUNDSCAPE
+  // =========================================================================
+  let audioCtx = null, audioGain = null, audioPlaying = false;
+  const audioBtn = document.getElementById('audio-btn');
+  const iconMuted = document.getElementById('icon-muted');
+  const iconSound = document.getElementById('icon-sound');
+
+  function initStormAudio() {
+    if (audioCtx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audioCtx = new AC();
+    audioGain = audioCtx.createGain();
+    audioGain.gain.value = 0.0;
+    audioGain.connect(audioCtx.destination);
+
+    const len = audioCtx.sampleRate * 4;
+    const buf = audioCtx.createBuffer(2, len, audioCtx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buf.getChannelData(ch);
+      let b0 = 0, b1 = 0, b2 = 0;
+      for (let i = 0; i < len; i++) {
+        const w = Math.random() * 2 - 1;
+        b0 = 0.997 * b0 + w * 0.029;
+        b1 = 0.985 * b1 + w * 0.032;
+        b2 = 0.950 * b2 + w * 0.048;
+        data[i] = (b0 + b1 + b2 + w * 0.05) * 1.4;
+      }
+    }
+
+    const oceanSrc = audioCtx.createBufferSource();
+    oceanSrc.buffer = buf; oceanSrc.loop = true;
+    const oceanFilter = audioCtx.createBiquadFilter();
+    oceanFilter.type = 'lowpass'; oceanFilter.frequency.value = 185;
+    const oceanGain = audioCtx.createGain(); oceanGain.gain.value = 0.55;
+    oceanSrc.connect(oceanFilter).connect(oceanGain).connect(audioGain);
+    oceanSrc.start();
+
+    const windSrc = audioCtx.createBufferSource();
+    windSrc.buffer = buf; windSrc.loop = true;
+    const windFilter = audioCtx.createBiquadFilter();
+    windFilter.type = 'bandpass'; windFilter.frequency.value = 460; windFilter.Q.value = 2.8;
+    const windLfo = audioCtx.createOscillator();
+    windLfo.frequency.value = 0.14;
+    const windLfoGain = audioCtx.createGain(); windLfoGain.gain.value = 180;
+    windLfo.connect(windLfoGain).connect(windFilter.frequency);
+    const windGain = audioCtx.createGain(); windGain.gain.value = 0.24;
+    windSrc.connect(windFilter).connect(windGain).connect(audioGain);
+    windSrc.start(); windLfo.start();
+
+    const rainSrc = audioCtx.createBufferSource();
+    rainSrc.buffer = buf; rainSrc.loop = true;
+    const rainFilter = audioCtx.createBiquadFilter();
+    rainFilter.type = 'highpass'; rainFilter.frequency.value = 1750;
+    const rainGain = audioCtx.createGain(); rainGain.gain.value = 0.14;
+    rainSrc.connect(rainFilter).connect(rainGain).connect(audioGain);
+    rainSrc.start();
+
+    lightning.onStrikeSound = (peak, hasBolt) => {
+      if (!audioPlaying || !audioCtx) return;
+      const delay = hasBolt ? (0.45 + Math.random() * 0.9) : (1.2 + Math.random() * 1.6);
+      const t0 = audioCtx.currentTime + delay;
+      const thSrc = audioCtx.createBufferSource();
+      thSrc.buffer = buf; thSrc.loop = true;
+      const thFilt = audioCtx.createBiquadFilter();
+      thFilt.type = 'lowpass';
+      thFilt.frequency.setValueAtTime(hasBolt ? 280 : 140, t0);
+      thFilt.frequency.exponentialRampToValueAtTime(48, t0 + 3.6);
+      const thEnv = audioCtx.createGain();
+      const vol = clamp(peak * 0.25, 0.15, 0.65);
+      thEnv.gain.setValueAtTime(0.001, t0);
+      thEnv.gain.linearRampToValueAtTime(vol, t0 + 0.12);
+      thEnv.gain.exponentialRampToValueAtTime(vol * 0.35, t0 + 1.1);
+      thEnv.gain.exponentialRampToValueAtTime(0.001, t0 + 4.2);
+      thSrc.connect(thFilt).connect(thEnv).connect(audioGain);
+      thSrc.start(t0);
+      thSrc.stop(t0 + 4.4);
+    };
+  }
+
+  audioBtn.addEventListener('click', () => {
+    initStormAudio();
+    if (!audioCtx) return;
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    audioPlaying = !audioPlaying;
+    audioGain.gain.setTargetAtTime(audioPlaying ? 0.65 : 0.0, audioCtx.currentTime, 0.25);
+    iconMuted.style.display = audioPlaying ? 'none' : 'block';
+    iconSound.style.display = audioPlaying ? 'block' : 'none';
+  });
+
+  // =========================================================================
+  // 16. INITIALIZE GPU RESOURCES & PROGRAMS
+  // =========================================================================
+  const { noiseTex, waveNormalTex } = createSeamlessNoiseTextures();
+  const shipMeshes = buildShipMeshes();
+  const oceanMesh = buildOceanMesh();
+  const rainVao = buildRainVAO();
+  const lightConeMesh = buildLightConeVAO();
+  const emptyVao = gl.createVertexArray();
+  initBoltGeometry();
+  initSprayBuffers();
+
+  const progSky          = createProgram(skyVS, skyFS);
+  const progBolt         = createProgram(boltVS, boltFS);
+  const progOcean        = createProgram(oceanVS, oceanFS);
+  const progShip         = createProgram(shipVS, shipFS);
+  const progSpray        = createProgram(sprayVS, sprayFS);
+  const progRain         = createProgram(rainVS, rainFS);
+  const progCone         = createProgram(coneVS, coneFS);
+  const progBloomExtract = createProgram(fsQuadVS, bloomExtractFS);
+  const progBlur         = createProgram(fsQuadVS, blurFS);
+  const progComposite    = createProgram(fsQuadVS, compositeFS);
+
+  resizeTargets();
+  window.addEventListener('resize', resizeTargets);
+
+  let simTime = 6.0;
+  updateWavePhases(simTime);
+  for (let i = 0; i < 60; i++) {
+    simTime += 0.05;
+    updateWavePhases(simTime);
+    stepShipPhysics(0.05, simTime);
+  }
+  triggerBowSprayBurst(0.95);
+
+  // =========================================================================
+  // 17. SHARED UNIFORM UPLOAD & MAIN RENDER LOOP
+  // =========================================================================
+  const worldLights = {
+    floodL: [0, 0, 0], floodR: [0, 0, 0], floodDir: [0, 0, -1],
+    bowLamp: [0, 0, 0], portNav: [0, 0, 0], stbdNav: [0, 0, 0], bridge: [0, 0, 0],
+    lDir0: [0, 0.3, -1], lDir1: [0.5, 0.3, -0.8]
+  };
+
+  function uploadCommonLighting(u, camWorldPos) {
+    if (u.uCamPos) gl.uniform3f(u.uCamPos, camWorldPos[0], camWorldPos[1], camWorldPos[2]);
+    if (u.uTime) gl.uniform1f(u.uTime, simTime);
+    if (u.uLightningDir0) gl.uniform3fv(u.uLightningDir0, worldLights.lDir0);
+    if (u.uLightningInt0) gl.uniform1f(u.uLightningInt0, lightning.slots[0].intensity);
+    if (u.uLightningDir1) gl.uniform3fv(u.uLightningDir1, worldLights.lDir1);
+    if (u.uLightningInt1) gl.uniform1f(u.uLightningInt1, lightning.slots[1].intensity);
+
+    if (u.uFloodLPos) gl.uniform3fv(u.uFloodLPos, worldLights.floodL);
+    if (u.uFloodRPos) gl.uniform3fv(u.uFloodRPos, worldLights.floodR);
+    if (u.uFloodDir)  gl.uniform3fv(u.uFloodDir, worldLights.floodDir);
+    if (u.uBowLampPos) gl.uniform3fv(u.uBowLampPos, worldLights.bowLamp);
+    if (u.uPortNavPos) gl.uniform3fv(u.uPortNavPos, worldLights.portNav);
+    if (u.uStbdNavPos) gl.uniform3fv(u.uStbdNavPos, worldLights.stbdNav);
+    if (u.uBridgeGlowPos) gl.uniform3fv(u.uBridgeGlowPos, worldLights.bridge);
+  }
+
+  const matProj = new Float32Array(16);
+  const matView = new Float32Array(16);
+  const matVP = new Float32Array(16);
+  const matInvVP = new Float32Array(16);
+  const matReflView = new Float32Array(16);
+  const matReflVP = new Float32Array(16);
+  const matReflInvVP = new Float32Array(16);
+  const matDeckReflect = new Float32Array(16);
+  const matRadarModel = new Float32Array(16);
+  const matConeL = new Float32Array(16);
+  const matConeR = new Float32Array(16);
+
+  {
+    const tUp = m4Translate(0, 2 * DECK_Y, 0);
+    const sY = m4Scale(1, -1, 1);
+    m4Mul(tUp, sY, matDeckReflect);
+  }
+
+  let camWorldPos = [0, 0, 0];
+  let camRight = [1, 0, 0], camUp = [0, 1, 0];
+
+  function computeCameraMatrices() {
+    const shakeAmp = shipState.slamShake * 0.045;
+    const sx = Math.sin(shipState.slamPhase * 1.1) * shakeAmp;
+    const sy = Math.cos(shipState.slamPhase * 1.7) * shakeAmp * 1.3;
+
+    const eyeLocal = [cam.localPos[0] + sx, cam.localPos[1] + sy, cam.localPos[2]];
+    m4TransformPoint(shipState.matrix, eyeLocal[0], eyeLocal[1], eyeLocal[2], camWorldPos);
+
+    const rLookY = m4RotY(-cam.yaw);
+    const rLookX = m4RotX(cam.pitch);
+    const rLook = m4Mul(rLookY, rLookX);
+
+    const rShip = m4Identity();
+    for (let c = 0; c < 3; c++) {
+      rShip[c * 4 + 0] = shipState.matrix[c * 4 + 0];
+      rShip[c * 4 + 1] = shipState.matrix[c * 4 + 1];
+      rShip[c * 4 + 2] = shipState.matrix[c * 4 + 2];
+    }
+    const camRotWorld = m4Mul(rShip, rLook);
+
+    camRight = [camRotWorld[0], camRotWorld[1], camRotWorld[2]];
+    camUp    = [camRotWorld[4], camRotWorld[5], camRotWorld[6]];
+
+    const camToWorld = new Float32Array(camRotWorld);
+    camToWorld[12] = camWorldPos[0];
+    camToWorld[13] = camWorldPos[1];
+    camToWorld[14] = camWorldPos[2];
+    m4Invert(camToWorld, matView);
+
+    const aspect = viewW / viewH;
+    m4Perspective(cam.fov * Math.PI / 180, aspect, 0.22, 4200.0, matProj);
+    m4Mul(matProj, matView, matVP);
+    m4Invert(matVP, matInvVP);
+
+    // Exact planar reflection across y_local = DECK_Y
+    const tmp1 = m4Mul(shipState.matrix, matDeckReflect);
+    const worldReflect = m4Mul(tmp1, shipState.invMatrix);
+    m4Mul(matView, worldReflect, matReflView);
+    m4Mul(matProj, matReflView, matReflVP);
+    m4Invert(matReflVP, matReflInvVP);
+  }
+
+  function updateWorldLights() {
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.floodL, worldLights.floodL);
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.floodR, worldLights.floodR);
+    m4TransformDir(shipState.matrix, 0.0, -0.34, -0.94, worldLights.floodDir);
+    const fl = Math.hypot(...worldLights.floodDir) || 1;
+    worldLights.floodDir[0] /= fl; worldLights.floodDir[1] /= fl; worldLights.floodDir[2] /= fl;
+
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.bowLamp, worldLights.bowLamp);
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.portNav, worldLights.portNav);
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.stbdNav, worldLights.stbdNav);
+    m4TransformPoint(shipState.matrix, ...SHIP_LIGHTS_LOCAL.bridge,  worldLights.bridge);
+
+    for (let i = 0; i < 2; i++) {
+      const sl = lightning.slots[i];
+      const ce = Math.cos(sl.elev);
+      const dst = i === 0 ? worldLights.lDir0 : worldLights.lDir1;
+      dst[0] = Math.sin(sl.az) * ce;
+      dst[1] = Math.sin(sl.elev);
+      dst[2] = -Math.cos(sl.az) * ce;
+    }
+
+    const rp = shipMeshes.radarPos;
+    const tRad = m4Translate(rp[0], rp[1], rp[2]);
+    const rRad = m4RotY(simTime * 2.4);
+    m4Mul(shipState.matrix, m4Mul(tRad, rRad), matRadarModel);
+
+    const pitchDown = m4RotX(-0.35);
+    const coneScale = m4Scale(5.2, 5.2, 24.0);
+    const coneLocal = m4Mul(pitchDown, coneScale);
+    m4Mul(shipState.matrix, m4Mul(m4Translate(...SHIP_LIGHTS_LOCAL.floodL), coneLocal), matConeL);
+    m4Mul(shipState.matrix, m4Mul(m4Translate(...SHIP_LIGHTS_LOCAL.floodR), coneLocal), matConeR);
+  }
+
+  function renderSkyAndBolts(vpMat, invVpMat, camPos) {
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progSky.program);
+    gl.uniformMatrix4fv(progSky.u.uInvVP, false, invVpMat);
+    uploadCommonLighting(progSky.u, camPos);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.uniform1i(progSky.u.uNoiseTex, 0);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    const sl0 = lightning.slots[0];
+    if (sl0.active && sl0.hasBolt && sl0.intensity > 0.08 && lightning.boltVertCount > 0) {
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.useProgram(progBolt.program);
+      gl.uniformMatrix4fv(progBolt.u.uVP, false, vpMat);
+      gl.uniform1f(progBolt.u.uBoltIntensity, clamp(sl0.intensity * 0.72, 0, 2.4));
+      gl.bindVertexArray(lightning.boltMeshVao);
+      gl.drawArrays(gl.TRIANGLES, 0, lightning.boltVertCount);
+      gl.disable(gl.BLEND);
+    }
+    gl.depthMask(true);
+    gl.enable(gl.DEPTH_TEST);
+  }
+
+  function renderShip(vpMat, camPos, isReflPass) {
+    gl.useProgram(progShip.program);
+    gl.uniformMatrix4fv(progShip.u.uVP, false, vpMat);
+    gl.uniform1f(progShip.u.uIsReflectionPass, isReflPass ? 1.0 : 0.0);
+    gl.uniform1f(progShip.u.uClipDeckY, DECK_Y + 0.02);
+    gl.uniform2f(progShip.u.uResolution, viewW, viewH);
+    const beaconPulse = 0.25 + 0.75 * Math.pow(0.5 + 0.5 * Math.sin(simTime * 3.1), 4.0);
+    gl.uniform1f(progShip.u.uBeaconPulse, beaconPulse);
+    uploadCommonLighting(progShip.u, camPos);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.uniform1i(progShip.u.uNoiseTex, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, waveNormalTex);
+    gl.uniform1i(progShip.u.uWaveNormalTex, 1);
+
+    // CRITICAL: Never leave rtRefl.tex bound to TEXTURE2 while rendering INTO rtRefl.fbo!
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, isReflPass ? noiseTex : rtRefl.tex);
+    gl.uniform1i(progShip.u.uReflTex, 2);
+
+    gl.uniformMatrix4fv(progShip.u.uModel, false, shipState.matrix);
+    gl.bindVertexArray(shipMeshes.ship.vao);
+    gl.drawElements(gl.TRIANGLES, shipMeshes.ship.count, gl.UNSIGNED_INT, 0);
+
+    gl.uniformMatrix4fv(progShip.u.uModel, false, matRadarModel);
+    gl.bindVertexArray(shipMeshes.radar.vao);
+    gl.drawElements(gl.TRIANGLES, shipMeshes.radar.count, gl.UNSIGNED_INT, 0);
+  }
+
+  function renderFrame(activeSprayCount) {
+    // PASS 1: PLANAR WET-DECK REFLECTION FBO (Feedback-loop free!)
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rtRefl.fbo);
+    gl.viewport(0, 0, rtRefl.w, rtRefl.h);
+    gl.clearColor(0.01, 0.02, 0.04, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.disable(gl.CULL_FACE);
+    renderSkyAndBolts(matReflVP, matReflInvVP, camWorldPos);
+
+    gl.enable(gl.CULL_FACE);
+    gl.frontFace(gl.CW);
+    renderShip(matReflVP, camWorldPos, true);
+    gl.frontFace(gl.CCW);
+
+    // PASS 2: MAIN HDR SCENE PASS
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rtScene.fbo);
+    gl.viewport(0, 0, rtScene.w, rtScene.h);
+    gl.clearColor(0.01, 0.02, 0.04, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // 2a. Volumetric Storm Sky & Lightning
+    gl.disable(gl.CULL_FACE);
+    renderSkyAndBolts(matVP, matInvVP, camWorldPos);
+
+    // 2b. Huge Gerstner Storm Ocean
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(progOcean.program);
+    gl.uniformMatrix4fv(progOcean.u.uVP, false, matVP);
+    gl.uniform4fv(progOcean.u.uWaveA, uWaveA);
+    gl.uniform4fv(progOcean.u.uWaveB, uWaveB);
+    gl.uniformMatrix4fv(progOcean.u.uShipInv, false, shipState.invMatrix);
+    gl.uniform1f(progOcean.u.uShipTravelZ, shipTravelZ);
+    uploadCommonLighting(progOcean.u, camWorldPos);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.uniform1i(progOcean.u.uNoiseTex, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, waveNormalTex);
+    gl.uniform1i(progOcean.u.uWaveNormalTex, 1);
+
+    gl.bindVertexArray(oceanMesh.vao);
+    gl.drawElements(gl.TRIANGLES, oceanMesh.count, gl.UNSIGNED_INT, 0);
+
+    // 2c. Full 360° Wet Ship & Mirror-Puddle Deck
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+    renderShip(matVP, camWorldPos, false);
+
+    // 2d. Volumetric Floodlight Cones
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(progCone.program);
+    gl.uniformMatrix4fv(progCone.u.uVP, false, matVP);
+    gl.uniform3fv(progCone.u.uCamPos, camWorldPos);
+    gl.uniform3f(progCone.u.uConeColor, 1.0, 0.70, 0.34);
+    gl.uniform1f(progCone.u.uTime, simTime);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.uniform1i(progCone.u.uNoiseTex, 0);
+    gl.bindVertexArray(lightConeMesh.vao);
+    gl.uniformMatrix4fv(progCone.u.uModel, false, matConeL);
+    gl.drawArrays(gl.TRIANGLES, 0, lightConeMesh.count);
+    gl.uniformMatrix4fv(progCone.u.uModel, false, matConeR);
+    gl.drawArrays(gl.TRIANGLES, 0, lightConeMesh.count);
+
+    // 2e. Photorealistic Bow Spray Plumes & Velocity-Aligned Ballistic Water Droplets
+    if (activeSprayCount > 0) {
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.useProgram(progSpray.program);
+      gl.uniformMatrix4fv(progSpray.u.uVP, false, matVP);
+      gl.uniform3fv(progSpray.u.uCamRight, camRight);
+      gl.uniform3fv(progSpray.u.uCamUp, camUp);
+      uploadCommonLighting(progSpray.u, camWorldPos);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+      gl.uniform1i(progSpray.u.uNoiseTex, 0);
+      gl.bindVertexArray(sprayVao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, activeSprayCount);
+    }
+
+    // 2f. 6,800 Crisp 3D Wind-Driven Sideways Rain Streaks
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(progRain.program);
+    gl.uniformMatrix4fv(progRain.u.uVP, false, matVP);
+    // Strong sideways gale cross-wind tilting rain unmistakably across the bow & deck!
+    const gust = 1.0 + 0.22 * Math.sin(simTime * 0.85) + 0.14 * Math.sin(simTime * 2.1);
+    const rainVX = WIND_DIR[0] * 31.0 * gust;
+    const rainVY = -16.8;
+    const rainVZ = WIND_DIR[1] * 17.5 * gust + SHIP_SPEED;
+    gl.uniform3f(progRain.u.uWindRainVel, rainVX, rainVY, rainVZ);
+    uploadCommonLighting(progRain.u, camWorldPos);
+    gl.bindVertexArray(rainVao);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, RAIN_COUNT);
+
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+
+    // PASS 3: QUARTER-RES HDR BLOOM
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindVertexArray(emptyVao);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rtBloomA.fbo);
+    gl.viewport(0, 0, rtBloomA.w, rtBloomA.h);
+    gl.useProgram(progBloomExtract.program);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, rtScene.tex);
+    gl.uniform1i(progBloomExtract.u.uTex, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.useProgram(progBlur.program);
+    gl.uniform1i(progBlur.u.uTex, 0);
+    for (let pass = 0; pass < 2; pass++) {
+      const spread = pass === 0 ? 1.0 : 2.1;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtBloomB.fbo);
+      gl.viewport(0, 0, rtBloomB.w, rtBloomB.h);
+      gl.bindTexture(gl.TEXTURE_2D, rtBloomA.tex);
+      gl.uniform2f(progBlur.u.uDir, spread / rtBloomA.w, 0.0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtBloomA.fbo);
+      gl.viewport(0, 0, rtBloomA.w, rtBloomA.h);
+      gl.bindTexture(gl.TEXTURE_2D, rtBloomB.tex);
+      gl.uniform2f(progBlur.u.uDir, 0.0, spread / rtBloomA.h);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    // PASS 4: FILMIC ACES COMPOSITE + OPTICAL LENS DROPLETS + FILM GRAIN
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewW, viewH);
+    gl.useProgram(progComposite.program);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, rtScene.tex);
+    gl.uniform1i(progComposite.u.uSceneTex, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, rtBloomA.tex);
+    gl.uniform1i(progComposite.u.uBloomTex, 1);
+    gl.uniform2f(progComposite.u.uResolution, viewW, viewH);
+    gl.uniform1f(progComposite.u.uTime, simTime);
+    gl.uniform1f(progComposite.u.uLensSpray, lensSprayImpulse);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // =========================================================================
+  // 18. MAIN ANIMATION LOOP
+  // =========================================================================
+  let lastTs = performance.now();
+
+  function tick(ts) {
+    requestAnimationFrame(tick);
+    const dt = Math.min((ts - lastTs) * 0.001, 0.05);
+    lastTs = ts;
+    simTime += dt;
+
+    updateWavePhases(simTime);
+    stepShipPhysics(dt, simTime);
+    updateLightning(dt);
+    const activeSpray = updateSpray(dt, simTime);
+    updateCamera(dt, ts * 0.001);
+    computeCameraMatrices();
+    updateWorldLights();
+    renderFrame(activeSpray);
+  }
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
